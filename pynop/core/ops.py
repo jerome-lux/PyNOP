@@ -176,7 +176,6 @@ class PixelUnshuffleChannelAveragingDownSampleLayer(nn.Module):
 
 class ConvPixelShuffleUpSampleLayer(nn.Module):
     """conv + pixel shuffling to upsample a tensor
-    The first conv can be used to reduce the number of channels before the unshuffling
     (*, Cin, H, W) -> (*, Cout, H, W) -> (*, Cout // r**2, H*r, W*r)
     """
 

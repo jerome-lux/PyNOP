@@ -549,8 +549,8 @@ class UBlock(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        filters: list,
-        nconv: list,
+        filters: Sequence,
+        nconv: Sequence,
         normalization: Callable = LayerNorm2d,
         activation: Callable = nn.GELU,
     ):
