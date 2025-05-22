@@ -259,7 +259,7 @@ class FNOBlock(nn.Module):
         activation: Callable = nn.GELU,
         normalization: Union[Callable, None] = LayerNorm2d,
         spectral_layer_type: str = "standard",
-        ranks: tuple[int, int, int] = None,
+        ranks: Union[tuple[int, int, int], None] = None,
     ):
         """
         Args:
@@ -302,7 +302,10 @@ class FNOBlock(nn.Module):
 
         # Activation & normalization
         self.activation = activation()
-        self.norm = normalization(out_channels)
+        if normalization is not None:
+            self.norm = normalization(out_channels)
+        else:
+            self.norm = None
 
         # mix channels
         self.linear = nn.Conv2d(self.hidden_channels, out_channels, kernel_size=1)
@@ -353,7 +356,7 @@ class FNOBlockv2(nn.Module):
         normalization: Union[Callable, None] = LayerNorm2d,
         spectral_layer_type: str = "standard",
         mlp_layers=2,
-        ranks: tuple[int, int, int] = None,
+        ranks: Union[tuple[int, int, int], None] = None,
     ):
         """
         Args:
@@ -455,7 +458,7 @@ class UFNOBlock(nn.Module):
         activation: Callable = nn.GELU,
         normalization: Union[Callable, None] = LayerNorm2d,
         spectral_layer_type: str = "standard",
-        ranks: tuple[int, int, int] = None,
+        ranks: Union[tuple[int, int, int], None] = None,
     ):
         """
         Args:
@@ -551,7 +554,7 @@ class UBlock(nn.Module):
         out_channels: int,
         filters: Sequence,
         nconv: Sequence,
-        normalization: Callable = LayerNorm2d,
+        normalization: Union[Callable, None] = LayerNorm2d,
         activation: Callable = nn.GELU,
     ):
         super().__init__()
@@ -564,7 +567,7 @@ class UBlock(nn.Module):
         self.decoder = nn.ModuleList()
         self.upblocks = nn.ModuleList()
         self.proj = nn.ModuleList()
-        self.shortcut_filters = filters[: len(nconv) - 2][::-1]
+        self.shortcut_filters = list(filters[: len(nconv) - 2])[::-1]
         self.shortcut_filters.append(in_channels)
         # Encoder
         for i, n in enumerate(nconv):
@@ -672,7 +675,7 @@ class CoDABlock2D(nn.Module):
 
     def __init__(
         self,
-        modes: Sequence,
+        modes: tuple[int, int],
         token_dim: int,
         n_heads: int = 1,
         activation: Callable = nn.GELU,
@@ -688,7 +691,7 @@ class CoDABlock2D(nn.Module):
         self.temperature = temperature
         self.n_dim = 2  # only 2d spatial dimensions
         self.ranks = [self.token_dim, n_heads * self.token_dim, np.prod(modes)]
-        self.ranks = np.ceil(np.divide(self.ranks, spectral_compression_factor)).astype(int)
+        self.ranks = tuple(np.ceil(np.divide(self.ranks, spectral_compression_factor)).astype(int))
 
         self.Q = FNOBlock(
             in_channels=self.token_dim,

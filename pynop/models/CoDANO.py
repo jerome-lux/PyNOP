@@ -27,7 +27,7 @@ class CoDANO(nn.Module):
         positional_encoding_dim: int = 8,
         positional_encoding_modes: Sequence = (16, 16),
         static_channel_dim: int = 0,
-        modes: Union[Sequence, int] = (16, 16),
+        modes: tuple[int, int] = (16, 16),
         n_layers: int = 4,
         n_heads: int = 1,
         per_channel_attention: bool = False,

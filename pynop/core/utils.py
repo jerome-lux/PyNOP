@@ -1,6 +1,6 @@
 # coding=utf-8
 from collections.abc import Iterable
-from typing import Optional, Any
+from typing import Optional, Any, Sequence
 import math
 import torch
 import torch.nn.functional as F
@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 def make_tuple(value, n):
     # should test if "value" is iterable instead?
-    if not isinstance(value, Iterable):
+    if not isinstance(value, Sequence) or isinstance(value, str):
         return (value,) * n
     elif len(value) < n:
         value.append(None)
