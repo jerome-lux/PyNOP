@@ -38,6 +38,7 @@ class SlicedTimeSeriesDataset(Dataset):
                 - If raw slices are [C,H,W] (ndim=3), can be used for validation.
                   If None, uses the raw channel count.
         """
+        super().__init__()
         self.data_dir = data_dir
         self.t_n = t_n
         self.time_first = time_first  # True for [t_n, H, W] output
