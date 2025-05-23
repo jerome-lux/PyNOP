@@ -74,3 +74,67 @@ def G_GANLoss(discriminator, fake_data, real_data, gan_type="GAN"):
         return nn.BCEWithLogitsLoss()(fake_critics - real_critics, valid)
     else:
         raise NotImplementedError(f"GAN type {gan_type} not implemented.")
+
+
+def diffusion_loss(c_pred, ct, dt, diffusivity, x_coords, y_coords):
+    """
+    Compute the diffusion loss for a given prediction and initial condition.
+    Parameters
+    ----------
+    c_pred : torch.Tensor
+        The predicted concentration field at time t+dt.
+    c0 : torch.Tensor
+        The initial concentration field at time t=t.
+    dt : float
+        The time step size.
+    diffusivity : float
+        The diffusivity constant.
+    x_coords : torch.Tensor
+        The x-coordinates of the grid points.
+    y_coords : torch.Tensor
+        The y-coordinates of the grid points.
+    Returns
+    -------
+    torch.Tensor
+        The diffusion loss.
+    """
+
+    if not x_coords.requires_grad:
+        x_coords.requires_grad_(True)
+    if not y_coords.requires_grad:
+        y_coords.requires_grad_(True)
+
+    dc_dt_approx = (c_pred - ct) / dt
+
+    grad_c_x = torch.autograd.grad(
+        outputs=c_pred, inputs=x_coords, grad_outputs=torch.ones_like(c_pred), create_graph=True, retain_graph=True
+    )[0]
+
+    grad_c_y = torch.autograd.grad(
+        outputs=c_pred, inputs=y_coords, grad_outputs=torch.ones_like(c_pred), create_graph=True, retain_graph=True
+    )[0]
+
+    D_grad_c_x = diffusivity * grad_c_x
+    D_grad_c_y = diffusivity * grad_c_y
+
+    div_D_grad_c_x = torch.autograd.grad(
+        outputs=D_grad_c_x,
+        inputs=x_coords,
+        grad_outputs=torch.ones_like(D_grad_c_x),
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+
+    div_D_grad_c_y = torch.autograd.grad(
+        outputs=D_grad_c_y,
+        inputs=y_coords,
+        grad_outputs=torch.ones_like(D_grad_c_y),
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+
+    div_D_grad_c = div_D_grad_c_x + div_D_grad_c_y
+
+    residual = dc_dt_approx - div_D_grad_c
+
+    return torch.mean(residual**2)
