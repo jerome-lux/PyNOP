@@ -76,7 +76,7 @@ def G_GANLoss(discriminator, fake_data, real_data, gan_type="GAN"):
         raise NotImplementedError(f"GAN type {gan_type} not implemented.")
 
 
-def diffusion_loss(c_pred, ct, dt, diffusivity, x_coords, y_coords):
+def diffusion_loss(c_pred, ct, dt, diffusivity, x_coords, y_coords, time_derivative="fd"):
     """
     Compute the diffusion loss for a given prediction and initial condition.
     Parameters
@@ -93,6 +93,8 @@ def diffusion_loss(c_pred, ct, dt, diffusivity, x_coords, y_coords):
         The x-coordinates of the grid points.
     y_coords : torch.Tensor
         The y-coordinates of the grid points.
+    time_derivative : str
+        Either 'fd' (finite differnce) or 'auto' (autograd). If auto, dt is not the timestep, bu the actual time point.
     Returns
     -------
     torch.Tensor
@@ -104,7 +106,14 @@ def diffusion_loss(c_pred, ct, dt, diffusivity, x_coords, y_coords):
     if not y_coords.requires_grad:
         y_coords.requires_grad_(True)
 
-    dc_dt_approx = (c_pred - ct) / dt
+    if time_derivative == "fd":
+        dc_dt_approx = (c_pred - ct) / dt
+    elif time_derivative == "auto":
+        dc_dt_approx = torch.autograd.grad(
+            outputs=c_pred, inputs=dt, grad_outputs=torch.ones_like(c_pred), create_graph=True, retain_graph=True
+        )[0]
+    else:
+        raise ValueError("time_derivative must be either 'fd' or 'auto'")
 
     grad_c_x = torch.autograd.grad(
         outputs=c_pred, inputs=x_coords, grad_outputs=torch.ones_like(c_pred), create_graph=True, retain_graph=True
