@@ -5,6 +5,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from pynop.core.blocks import CoDABlock2D
+from pynop.core.ops import CartesianEmbedding
 
 
 class CoDANO(nn.Module):
@@ -24,6 +25,7 @@ class CoDANO(nn.Module):
         variable_ids: Sequence,
         hidden_lifting_channels: int = 64,
         hidden_variable_codimension: int = 32,
+        fixed_pos_encoding: bool = True,
         positional_encoding_dim: int = 8,
         positional_encoding_modes: Sequence = (16, 16),
         static_channel_dim: int = 0,
@@ -44,6 +46,7 @@ class CoDANO(nn.Module):
         self.ndim = ndim
         self.variable_ids = variable_ids
         self.hidden_variable_codimension = hidden_variable_codimension
+        self.fixed_pos_encoding = fixed_pos_encoding
 
         # Create the params for positionnal encoding
         # Here we could also use a tucker decomposition to decrease the number of params
@@ -122,29 +125,72 @@ class CoDANO(nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            input tensor of shape (batch_size, num_inp_var, H, W, ...)
+            input tensor of shape (batch_size, num_inp_var, H, W
         static_channel : torch.Tensor
-            static channel tensor of shape (batch_size, static_channel_dim, H, W, ...)
+            static channel tensor of shape (batch_size, static_channel_dim, H, W
         input_variable_ids : list[str]
             The names of the variables corresponding to the channels of input 'x'.
+        Returns
+        -------
+        x : torch.Tensor
+            input tensor of shape (batch_size, num_inp_var, C, H, W)
+            where C is the number of channels after concatenation (1 + grid_pos_ch + enc_dim + static_channel_dim)
         """
-        x = x.unsqueeze(2)  # (batch_size, num_inp_var, 1, H, W)
+
+        if self.fixed_pos_encoding:
+            height, width = x.shape[-2:]
+            batch_size = x.shape[0]
+            # Generate 1D coordinate vectors normalized to [-1, 1]
+            x_lin = torch.linspace(-1, 1, steps=width, device=x.device)  # Shape (W,)
+            y_lin = torch.linspace(-1, 1, steps=height, device=x.device)  # Shape (H,)
+            grid_y, grid_x = torch.meshgrid(y_lin, x_lin, indexing="ij")
+            grid_encoding = torch.stack([grid_x, grid_y], dim=-1)  # Shape (H, W, 2)
+            grid_encoding = grid_encoding.permute(2, 0, 1).unsqueeze(0)  # Shape (1, 2, H, W)
+            grid_encoding = grid_encoding.expand(batch_size, -1, -1, -1)  # Shape (batch_size, 2, H, W)
+            grid_encoding.unsqueeze(1)  # (batch_size, 1, 2, H, W)
+            repeat_shape = [1 for _ in x.shape]
+            repeat_shape[1] = x.shape[1]  # repeat along the variable axis to match input
+            grid_encoding = grid_encoding.repeat(*repeat_shape)  # (batch_size, num_inp_var, 2, H, W)
+            x = x.unsqueeze(2)  # (batch_size, num_inp_var, 1, H, W)
+            x = torch.cat([x, grid_encoding], dim=2)  # (batch_size, num_inp_var, 1 + 2, H, W)
+        else:
+            x = x.unsqueeze(2)
+
+        # positional_encoding tensor has shape (1, num_inp_var, enc_dim, H, W)
+        # Note that the encodings are the same for each element in the batch
+        positional_encoding = self._get_positional_encoding(x)
+        repeat_shape = [1 for _ in x.shape]
+        repeat_shape[0] = x.shape[0]  # repeat along the batch size to match input
+        x = torch.cat(
+            [x, positional_encoding.repeat(*repeat_shape)], dim=2
+        )  # (batch_size, num_inp_var, 1 + static_field_dim + 2 + pos_encoding_ch, H, W)
+
         if static_channel is not None:
             # repeat the field for each variable
             repeat_shape = [1 for _ in x.shape]
             repeat_shape[1] = x.shape[1]
-            static_channel = static_channel.unsqueeze(1).repeat(*repeat_shape)
-            x = torch.cat([x, static_channel], dim=2)  # (batch_size, num_inp_var, 1 + static_field_dim, H, W)
+            static_channel = static_channel.unsqueeze(1).repeat(
+                *repeat_shape
+            )  # (batch_size, num_inp_var, static_channel_dim, H, W)
+            x = torch.cat([x, static_channel], dim=2)
 
-        # positional_encoding tensor has shape (1, num_inp_var, enc_dim, H, W)
-        # Note that the econding are the same for each element in the batch
-        positional_encoding = self._get_positional_encoding(x)
-        repeat_shape = [1 for _ in x.shape]
-        repeat_shape[0] = x.shape[0]  # repeat along the batch size to match input
-        x = torch.cat([x, positional_encoding.repeat(*repeat_shape)], dim=2)
         return x
 
-    def forward(self, x, static_channel=None):
+    def forward(self, x, static_channel=None, return_coords=False):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor
+            input tensor of shape (batch_size, num_inp_var, H, W)
+        static_channel : torch.Tensor
+            static channel tensor of shape (batch_size, static_channel_dim, H, W)
+        return_coords : bool
+            if True, the model outputs the grid encoding to allow  for the computation of the physical loss
+        Returns
+        -------
+        x : torch.Tensor
+            output tensor of shape (batch_size, num_inp_var, H, W)
+        """
 
         # concat input [B, n, H, W]
         # pos enc for each var n_enc channels (between each var)
@@ -156,6 +202,13 @@ class CoDANO(nn.Module):
         # concatenate  positional encodings and static fields for each variables
         # (batch_size, num_inp_var, extended_variable_codimemsion, H, W)
         x = self._extend_variables(x, static_channel)
+        if return_coords and self.fixed_pos_encoding:
+            coords = x[:, :, 1:2, :, :]  # (batch_size, num_inp_var, 2, H, W)
+        elif return_coords and not self.fixed_pos_encoding:
+            raise ValueError(
+                "return_coords is set to True, but fixed_pos_encoding is set to False. "
+                "This means that the model does not have a grid encoding to return."
+            )
 
         # Lifting each variable to higher dimensional space (hidden_variable_codimension)
         # As each variable is processed independantly, the tensor is reshaped before being sent to the the MLP
@@ -170,4 +223,8 @@ class CoDANO(nn.Module):
         x = x.reshape(batch * num_inp_var, self.hidden_variable_codimension, *spatial_shape)
         x = self.project(x)
         x = x.reshape(batch, num_inp_var, *spatial_shape)
-        return x
+
+        if return_coords and self.fixed_pos_encoding:
+            return x, coords
+        else:
+            return x

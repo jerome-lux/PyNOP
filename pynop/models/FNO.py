@@ -78,12 +78,20 @@ class FNO(nn.Module):
                 )
             )
 
-        self.projection = nn.Conv2d(channels, out_channels, 1, bias=True)
+        self.projection = nn.Conv2d(hidden_channels[-1], out_channels, 1, bias=True)
 
-    def forward(self, x):
+    def forward(self, x, return_coords=False):
+
+        if self.return_coords and not self.fixed_pos_encoding:
+            raise ValueError(
+                "return_coords is only available when fixed_pos_encoding or trainable_pos_encoding is True"
+            )
 
         if self.fixed_pos_encoding:
             x = self.grid_encoding(x)
+
+            if return_coords:
+                coords = x[:, -2:, :, :]
 
         if self.trainable_pos_encoding:
             pos_embeddings = torch.fft.irfftn(self.pos_embedding_weights, s=x.shape[-2:])
@@ -98,4 +106,7 @@ class FNO(nn.Module):
 
         x = self.projection(x)
 
-        return x
+        if self.fixed_pos_encoding and return_coords:
+            return x, coords
+        else:
+            return x
