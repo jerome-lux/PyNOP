@@ -203,7 +203,7 @@ class CoDANO(nn.Module):
         # (batch_size, num_inp_var, extended_variable_codimemsion, H, W)
         x = self._extend_variables(x, static_channel)
         if return_coords and self.fixed_pos_encoding:
-            coords = x[:, :, 1:2, :, :]  # (batch_size, num_inp_var, 2, H, W)
+            coords = x[:, :, 1:3, :, :]  # (batch_size, num_inp_var, 2, H, W)
         elif return_coords and not self.fixed_pos_encoding:
             raise ValueError(
                 "return_coords is set to True, but fixed_pos_encoding is set to False. "
