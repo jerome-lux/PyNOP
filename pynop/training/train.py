@@ -1,12 +1,12 @@
 import os
-from typing import Callable
+from typing import Callable, Sequence, Union
 from pathlib import Path
 import torch
 from torch import nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 from .metrics import AverageMeter
-from .loss import G_GANLoss, D_GANLoss, ZeroCenteredGradientPenalty
+from .loss import G_GANLoss, D_GANLoss, ZeroCenteredGradientPenalty, diffusion_loss
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -454,11 +454,14 @@ def train_unrolled(
                 progress_bar = tqdm(
                     test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test]", leave=True, total=len(test_loader)
                 )
+
                 for i, (inputs, targets) in enumerate(progress_bar):
                     inputs = inputs.to(device)
+                    T_unroll = inputs.shape[1]
                     valoss = 0.0
-                    for t in range(1, T_unroll + 1):
-                        preds = model(inputs[:, t - 1, ...])  # Predict u_{t}
+                    preds = inputs[:, 0, ...]
+                    for t in range(1, T_unroll):
+                        preds = model(preds)  # Predict u_{t}
                         # Ground truth
                         targets = inputs[:, t, ...]
 
@@ -479,3 +482,220 @@ def train_unrolled(
                 torch.save(model.state_dict(), Path(savepath) / Path("best_val_model.pth"))
 
             writer.add_scalar("val_loss", avg_valoss, epoch + 1)
+
+
+def CoDANO_training(
+    model: nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    epochs: int,
+    optimizer: torch.optim.Optimizer,
+    savepath: Union[str, Path],
+    loss_fn: Callable = F.mse_loss,
+    loss_method: str = "physical",
+    dt: Union[float, None] = None,
+    detach_every_k: int = 4,
+    test_loader: Union[None, torch.utils.data.DataLoader] = None,
+    device: Union[torch.device, None] = None,
+    lossweights: Union[Sequence[float], None] = None,
+    scheduler: Union[None,] = None,
+    iterations: Union[None, int] = None,
+):
+    """Train a model using the CoDANO method.
+    Parameters
+    ----------
+    model : torch.nn.Module
+        The model to train.
+    dataloader : torch.utils.data.DataLoader
+        The dataloader to use for training. It must return a tuple of (inputs, static_field).
+        The inputs are the sequence of tensors at different successive times: t_0, ..., t_n
+        -> shape b t_n c h w, where c is the number of variables (e.g. velocity, pressure, etc.) and h, w are the spatial dimensions.
+        The static_field is the static field to use for training. It must be the same spatial shape as the inputs.
+    epochs : int
+        The number of epochs to train for.
+    optimizer : torch.optim.Optimizer
+        The optimizer to use for training.
+    savepath : str
+        The path to save the model.
+    loss_fn : Callable
+        The loss function to use for training.
+    loss_method : str
+        The method to use for loss calculation. "physical", "data" or "both".
+    dt : float
+        The time step size. Must be set if loss_method == 'physical' or 'both'.
+    detach_every_k : int
+        The number of steps to detach the gradient.
+    test_loader : torch.utils.data.DataLoader
+        The dataloader to use for testing.
+    device : torch.device
+        The device to use for training. If None, will use the first available GPU or CPU.
+    lossweights : float
+        The weights to use for physical and data loss. If None, will use 1.0 for both.
+    scheduler : torch.optim.lr_scheduler
+        The scheduler to use for training.
+    iterations : int
+        The number of iterations to train for. If None, will use the length of the dataloader.
+    """
+
+    os.makedirs(savepath, exist_ok=True)
+
+    writer = SummaryWriter(savepath)
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") if device is None else device
+    model.to(device)
+
+    best_loss = float("inf")
+    best_val_loss = float("inf")
+
+    if iterations is None:
+        iterations = len(dataloader)
+
+    if lossweights is None:
+        lossweights = [1.0, 1.0]
+
+    for epoch in range(epochs):
+
+        model.train()
+        loss_meter = AverageMeter()
+        physical_loss_meter = AverageMeter()
+        data_loss_meter = AverageMeter()
+
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} [Training]", leave=True, total=iterations)
+
+        for i, (inputs, static_field) in enumerate(progress_bar):
+            inputs = inputs.to(device)
+            static_field = static_field.to(device)
+            T_unroll = inputs.shape[1]
+            loss = 0.0
+            physical_loss = 0.0
+            data_loss = 0.0
+            previous_preds = inputs[:, 0, ...]
+            for t in range(1, T_unroll):
+
+                preds, coords = model(
+                    previous_preds, static_channel=static_field, return_coords=True
+                )  # Predict u_{t} from u{t-1}
+                # Ground truth
+                targets = inputs[:, t, ...]
+
+                # Accumulate loss
+                if loss_method == "physical" or loss_method == "both":
+                    physical_loss += diffusion_loss(
+                        preds,
+                        previous_preds,
+                        dt=dt,
+                        diffusivity=static_field,
+                        x_coords=coords[0],
+                        y_coords=coords[1],
+                        time_derivative="fd",
+                    )
+                if loss_method == "data" or loss_method == "both":
+                    data_loss += loss_fn(preds, targets)
+
+                loss += lossweights[0] * data_loss + lossweights[1] * physical_loss
+
+                # Truncated gradient: detach every k steps
+                if (t % detach_every_k) == 0:
+                    preds = preds.detach()
+
+                previous_preds = preds
+
+            loss = loss / (T_unroll - 1)
+            physical_loss = physical_loss / (T_unroll - 1)
+            data_loss = data_loss / (T_unroll - 1)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # Update loss and accuracy
+            loss_meter.update(loss.item(), inputs.size(0))
+            physical_loss_meter.update(physical_loss.item(), inputs.size(0))
+            data_loss_meter.update(data_loss.item(), inputs.size(0))
+
+            progress_bar.set_postfix(
+                loss=loss_meter.avg,
+                data_loss=data_loss_meter.avg,
+                physical_loss=physical_loss_meter.avg,
+                lr=optimizer.param_groups[0]["lr"],
+            )
+
+            if i >= iterations:
+                break
+
+            if scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step()
+
+        avg_loss = loss_meter.avg
+
+        if scheduler is not None and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(avg_loss)
+
+        if avg_loss < best_loss or epoch == 0:
+            best_loss = avg_loss
+            torch.save(model.state_dict(), Path(savepath) / Path("best_model.pth"))
+
+        writer.add_scalar("loss", avg_loss, epoch + 1)
+        writer.add_scalar("data_loss", data_loss_meter.avg, epoch + 1)
+        writer.add_scalar("physical_loss", physical_loss_meter.avg, epoch + 1)
+        writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch + 1)
+
+        if test_loader is not None:
+
+            with torch.no_grad():
+                valoss_meter = AverageMeter()
+                physical_loss_meter = AverageMeter()
+                data_loss_meter = AverageMeter()
+                # Test step: set the model to inference mode
+                model.eval()
+                progress_bar = tqdm(
+                    test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test]", leave=True, total=len(test_loader)
+                )
+
+                for i, (inputs, static_field) in enumerate(progress_bar):
+                    inputs = inputs.to(device)
+                    static_field = static_field.to(device)
+                    T_unroll = inputs.shape[1]
+                    valoss = 0.0
+                    physical_loss = 0.0
+                    data_loss = 0.0
+                    previous_preds = inputs[:, 0, ...]
+                    for t in range(1, T_unroll):
+                        preds, coords = model(previous_preds, static_channel=static_field, return_coords=True)
+                        targets = inputs[:, t, ...]
+                        if loss_method == "physical" or loss_method == "both":
+                            physical_loss += diffusion_loss(
+                                preds,
+                                previous_preds,
+                                dt=dt,
+                                diffusivity=static_field,
+                                x_coords=coords[0],
+                                y_coords=coords[1],
+                                time_derivative="fd",
+                            )
+                        if loss_method == "data" or loss_method == "both":
+                            data_loss += loss_fn(preds, targets)
+                        valoss += lossweights[0] * data_loss + lossweights[1] * physical_loss
+                        previous_preds = preds
+
+                    valoss = valoss / (T_unroll - 1)
+                    physical_loss = physical_loss / (T_unroll - 1)
+                    data_loss = data_loss / (T_unroll - 1)
+
+                    valoss_meter.update(valoss.item(), inputs.size(0))
+                    physical_loss_meter.update(physical_loss.item(), inputs.size(0))
+                    data_loss_meter.update(data_loss.item(), inputs.size(0))
+
+                progress_bar.set_postfix(
+                    loss=valoss_meter.avg,
+                    data_loss=data_loss_meter.avg,
+                    physical_loss=physical_loss_meter.avg,
+                )
+
+                avg_valoss = valoss_meter.avg
+
+                if avg_valoss < best_val_loss or epoch == 0:
+                    best_val_loss = avg_valoss
+                    torch.save(model.state_dict(), Path(savepath) / Path("best_val_model.pth"))
+
+                writer.add_scalar("val_loss", avg_valoss, epoch + 1)
+                writer.add_scalar("val_data_loss", data_loss_meter.avg, epoch + 1)
+                writer.add_scalar("val_physical_loss", physical_loss_meter.avg, epoch + 1)
