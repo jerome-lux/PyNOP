@@ -1,6 +1,6 @@
 from typing import Sequence, Union
 import numpy as np
-from collections.abc import Iterable
+import collections.abc as abc
 import torch
 import torch.nn as nn
 from pynop.core.blocks import FNOBlock, FNOBlockv2, UFNOBlock
@@ -36,10 +36,11 @@ class FNO(nn.Module):
 
         if isinstance(blocks, str):
             blocks = [blocks] * len(hidden_channels)
-        elif isinstance(hidden_channels, Iterable):
-            assert len(blocks) == len(
-                hidden_channels
-            ), "Number of elements in hidden_channels must match the number of element in block list"
+        assert isinstance(hidden_channels, abc.Sequence), "hidden_channels must be a sequence"
+
+        assert len(blocks) == len(
+            hidden_channels
+        ), "Number of elements in hidden_channels must match the number of element in block list"
 
         if fixed_pos_encoding:
             in_channels += 2

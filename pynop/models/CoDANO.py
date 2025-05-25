@@ -11,6 +11,42 @@ from pynop.core.ops import CartesianEmbedding
 class CoDANO(nn.Module):
     """Implementation of Co-domain attention model as described in [1]_.
     This code is a simplified version of that found in https://github.com/neuraloperator/neuraloperator
+    Parameters
+    ----------
+    variable_ids : Sequence
+        List of variable names corresponding to the channels of the input tensor.
+    hidden_lifting_channels : int
+        Number of channels in the lifting MLP.  Default is 64.
+    hidden_variable_codimension : int
+        Number of channels in the hidden codimension space. Default is 32.
+    fixed_pos_encoding : bool
+        If True, the model uses a fixed positional encoding based on the grid coordinates.
+        If False, the model does not use positional encoding.
+    positional_encoding_dim : int
+        Dimension of the trainable positional encoding. Default is 8.
+        A different positional embedding is generated with a Fourier Layer for each variables.
+    positional_encoding_modes : Sequence
+        Modes of the positional encoding. Default is (16, 16).
+    static_channel_dim : int
+        Number of static channels to be concatenated to each variable. Default is 0.
+    modes : tuple[int, int]
+        Modes for the Fourier layers. Default is (16, 16).
+    n_layers : int
+        Number of CoDA blocks in the model. Default is 4.
+    n_heads : int
+        Number of attention heads in each CoDA block. Default is 1.
+    per_channel_attention : bool
+        If True, the attention is computed per channel. Default is False.
+    activation : Callable
+        Activation function to be used in the model. Default is nn.GELU.
+    norm : Callable
+        Normalization function to be used in the model. Default is nn.InstanceNorm2d with affine=True.
+    ndim : int
+        Number of spatial dimensions of the input tensor. Default is 2.
+    spectral_compression_factor : Sequence
+        Compression factor for the spectral layers. Default is (2, 2, 2).
+
+    -----
 
     References
     ----------

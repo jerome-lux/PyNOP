@@ -699,3 +699,5 @@ def CoDANO_training(
                 writer.add_scalar("val_loss", avg_valoss, epoch + 1)
                 writer.add_scalar("val_data_loss", data_loss_meter.avg, epoch + 1)
                 writer.add_scalar("val_physical_loss", physical_loss_meter.avg, epoch + 1)
+
+    writer.close()

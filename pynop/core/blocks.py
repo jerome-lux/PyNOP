@@ -664,6 +664,7 @@ class CoDABlock2D(nn.Module):
     It is a simplified version of the implementation found in https://github.com/neuraloperator
 
     We also use and equivariant mixing after the attention layer.
+    TODO: add BCs to the attention layer (how to do it?)
 
     References
     ----------
@@ -815,7 +816,7 @@ class CoDABlock2D(nn.Module):
         # if the token_dim is different than the hidden dim,  it means that each token does not represent the full latent embedding of a variable
 
         batch_size = x.shape[0]
-        spatial_shape = x.shape[-self.n_dim :]
+        # spatial_shape = x.shape[-self.n_dim :]
 
         assert x.shape[1] % self.token_dim == 0, "Number of channels in x should be divisible by token_codimension"
 
