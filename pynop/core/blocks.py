@@ -259,7 +259,8 @@ class FNOBlock(nn.Module):
         activation: Callable = nn.GELU,
         normalization: Union[Callable, None] = LayerNorm2d,
         spectral_layer_type: str = "standard",
-        ranks: Union[tuple[int, int, int], None] = None,
+        ranks: Union[tuple[int, int, int], np.ndarray, None] = None,
+        scaling: Union[int, float] = 1,
     ):
         """
         Args:
@@ -289,14 +290,15 @@ class FNOBlock(nn.Module):
         self.modes = modes
         self.spectral_layer_type = spectral_layer_type
         self.ranks = ranks
+        self.scaling = scaling
 
         # Core Spectral Convolution Layer
         if spectral_layer_type == "standard":
-            self.spectral_conv = SpectralConv2d(in_channels, self.hidden_channels, modes)
+            self.spectral_conv = SpectralConv2d(in_channels, self.hidden_channels, modes, scaling=scaling)
         elif spectral_layer_type == "tucker":
             if ranks is None:
                 raise ValueError("Ranks must be provided for TuckerSpectralConv2d.")
-            self.spectral_conv = TuckerSpectralConv2d(in_channels, self.hidden_channels, modes, ranks)
+            self.spectral_conv = TuckerSpectralConv2d(in_channels, self.hidden_channels, modes, ranks, scaling=scaling)
         else:
             raise ValueError(f"Unknown spectral_layer_type: {spectral_layer_type}. Choose 'standard' or 'tucker'.")
 
@@ -319,6 +321,8 @@ class FNOBlock(nn.Module):
 
         # Shortcut branch computation
         x_shortcut = self.shortcut(x)  # (B, out_channels, H, W)
+        if self.scaling != 1:
+            x_shortcut = F.interpolate(x_shortcut, scale_factor=self.scaling, mode="bilinear", align_corners=False)
 
         # Main branch computation
         x = self.spectral_conv(x)  # (B, hidden_channels, H, W)
@@ -356,7 +360,8 @@ class FNOBlockv2(nn.Module):
         normalization: Union[Callable, None] = LayerNorm2d,
         spectral_layer_type: str = "standard",
         mlp_layers=2,
-        ranks: Union[tuple[int, int, int], None] = None,
+        ranks: Union[tuple[int, int, int], np.ndarray, None] = None,
+        scaling: Union[int, float] = 1,
     ):
         """
         Args:
@@ -381,14 +386,15 @@ class FNOBlockv2(nn.Module):
         self.modes = modes
         self.spectral_layer_type = spectral_layer_type
         self.ranks = ranks
+        self.scaling = scaling
 
         # Core Spectral Convolution Layer
         if spectral_layer_type == "standard":
-            self.spectral_conv = SpectralConv2d(in_channels, out_channels, modes)
+            self.spectral_conv = SpectralConv2d(in_channels, out_channels, modes, scaling=scaling)
         elif spectral_layer_type == "tucker":
             if ranks is None:
                 raise ValueError("Ranks must be provided for TuckerSpectralConv2d.")
-            self.spectral_conv = TuckerSpectralConv2d(in_channels, out_channels, modes, ranks)
+            self.spectral_conv = TuckerSpectralConv2d(in_channels, out_channels, modes, ranks, scaling=scaling)
         else:
             raise ValueError(f"Unknown spectral_layer_type: {spectral_layer_type}. Choose 'standard' or 'tucker'.")
 
@@ -419,6 +425,8 @@ class FNOBlockv2(nn.Module):
 
         # Shortcut branch computation
         x_shortcut = self.shortcut(x)  # (B, out_channels, H, W)
+        if self.scaling != 1:
+            x_shortcut = F.interpolate(x_shortcut, scale_factor=self.scaling, mode="bilinear", align_corners=False)
 
         x = self.spectral_conv(x)
 
@@ -458,7 +466,7 @@ class UFNOBlock(nn.Module):
         activation: Callable = nn.GELU,
         normalization: Union[Callable, None] = LayerNorm2d,
         spectral_layer_type: str = "standard",
-        ranks: Union[tuple[int, int, int], None] = None,
+        ranks: Union[tuple[int, int, int], np.ndarray, None] = None,
     ):
         """
         Args:
@@ -683,6 +691,7 @@ class CoDABlock2D(nn.Module):
         temperature: float = 1.0,
         norm: Callable = partial(nn.InstanceNorm2d, affine=True),
         spectral_compression_factor: Sequence = (1, 1, 1),
+        scaling: Union[float, int] = 1,
     ):
 
         super().__init__()
@@ -693,6 +702,195 @@ class CoDABlock2D(nn.Module):
         self.n_dim = 2  # only 2d spatial dimensions
         self.ranks = [self.token_dim, n_heads * self.token_dim, np.prod(modes)]
         self.ranks = tuple(np.ceil(np.divide(self.ranks, spectral_compression_factor)).astype(int))
+
+        self.Q = FNOBlock(
+            in_channels=self.token_dim,
+            hidden_channels=n_heads * self.token_dim,
+            out_channels=n_heads * self.token_dim,
+            modes=modes,
+            activation=activation,
+            spectral_layer_type="tucker",
+            ranks=self.ranks,
+            scaling=scaling,
+        )
+
+        self.V = FNOBlock(
+            in_channels=self.token_dim,
+            hidden_channels=n_heads * self.token_dim,
+            out_channels=n_heads * self.token_dim,
+            modes=modes,
+            activation=activation,
+            spectral_layer_type="tucker",
+            ranks=self.ranks,
+            scaling=scaling,
+        )
+
+        self.K = FNOBlock(
+            in_channels=self.token_dim,
+            hidden_channels=n_heads * self.token_dim,
+            out_channels=n_heads * self.token_dim,
+            modes=modes,
+            activation=activation,
+            spectral_layer_type="tucker",
+            ranks=self.ranks,
+            scaling=scaling,
+        )
+
+        # To project back each token from the n heads to token_dim
+
+        self.projection = FNOBlock(
+            in_channels=self.n_heads * self.token_dim,
+            hidden_channels=self.token_dim,
+            out_channels=self.token_dim,
+            modes=modes,
+            activation=nn.Identity,
+            spectral_layer_type="tucker",
+            ranks=self.ranks,
+            scaling=1 / scaling,
+        )
+        mixer_ranks = [self.token_dim, self.token_dim, np.prod(modes)]
+        mixer_ranks = np.ceil(np.divide(mixer_ranks, spectral_compression_factor)).astype(int)
+        self.mixer = FNOBlock(
+            in_channels=self.token_dim,
+            hidden_channels=self.token_dim,
+            out_channels=self.token_dim,
+            modes=modes,
+            activation=activation,
+            spectral_layer_type="tucker",
+            ranks=mixer_ranks,
+        )
+        self.norm1 = norm(self.token_dim)
+        self.norm2 = norm(self.token_dim)
+        self.norm3 = norm(self.token_dim)
+
+    def MultiHeadAttention(self, tokens, batch_size):
+        """Compute multi-head Attention where each variable latent representation is a token
+
+        input tensor shape (b*t), d, h, w
+        The tensor is first transformed into k, q and v with shape (b*t),(n*d), h, w
+        where
+        b: batch size
+        t: number of tokens
+        n: number of heads
+        d: token dimension (the latent dimension of each variable)
+        h, w: spatial dimensions
+
+        Note taht when using per_channel attention, the token dimension is 1, so d=1
+
+        Then k, q and v are reshaped to b, n, t, (d h w)
+        as torch.matul multiplies the two last dimensions
+        Finally the output is reshaped to b, n, (t*d), h, w
+
+        """
+        # k, q, v (b*t, n*d, h, w)
+        k = self.K(tokens)
+        q = self.Q(tokens)
+        v = self.V(tokens)
+
+        spatial_shape = k.shape[-self.n_dim :]
+
+        assert k.size(1) % self.n_heads == 0, "Number of channels in k, q, and v should be divisible by number of heads"
+
+        # reshape from (b*t) (n*d) h w -> b n t (d*h*w ...)
+        t = k.size(0) // batch_size  # Compute the number of tokens `t` (each token is a variable here)
+        # n heads with token codimension `d` (in the case of per layer attention, d=1)
+        d = k.size(1) // self.n_heads
+
+        # reshape from (b*t) (n*d) h w ... to b n t d h w ...
+        k = k.view(batch_size, t, self.n_heads, d, *k.shape[-self.n_dim :])
+        q = q.view(batch_size, t, self.n_heads, d, *q.shape[-self.n_dim :])
+        v = v.view(batch_size, t, self.n_heads, d, *v.shape[-self.n_dim :])
+
+        k = torch.transpose(k, 1, 2)
+        q = torch.transpose(q, 1, 2)
+        v = torch.transpose(v, 1, 2)
+
+        # reshape to flatten the d, h and w dimensions
+        k = k.reshape(batch_size, self.n_heads, t, -1)
+        q = q.reshape(batch_size, self.n_heads, t, -1)
+        v = v.reshape(batch_size, self.n_heads, t, -1)
+
+        print(q.shape, k.shape, v.shape)
+
+        # attention mechanism
+        dprod = torch.matmul(q, k.transpose(-1, -2)) / (np.sqrt(k.shape[-1]) * self.temperature)
+        dprod = F.softmax(dprod, dim=-1)
+
+        attention = torch.matmul(dprod, v)
+
+        # Reshape from (b, n, t, d * h * w) to (b, n, t, d, h, w, ...)
+        attention = attention.view(attention.size(0), attention.size(1), attention.size(2), d, *spatial_shape)
+        attention = torch.transpose(attention, 1, 2)  # b t n d h w
+        attention = attention.reshape(
+            attention.size(0) * attention.size(1), attention.size(2) * d, *spatial_shape
+        )  # (b * t) (n * d) h w
+
+        return attention
+
+    def forward(self, x):
+
+        # the input tensor must have a shape b (n_var * hidden_dim) h w
+        # if the token_dim is different than the hidden dim,  it means that each token does not represent the full latent embedding of a variable
+
+        batch_size = x.shape[0]
+        # spatial_shape = x.shape[-self.n_dim :]
+
+        assert x.shape[1] % self.token_dim == 0, "Number of channels in x should be divisible by token_codimension"
+
+        n_tokens = x.shape[1] // self.token_dim
+        # Reshape from shape b (t*d) h w ... to (b*t) d h w
+        x = x.view(x.size(0) * n_tokens, self.token_dim, *x.shape[-self.n_dim :])
+
+        attention = self.norm1(x)
+        attention = self.MultiHeadAttention(attention, batch_size)
+        attention = self.projection(attention)
+        attention = self.norm2(attention + x)  # shortcut
+        attention = self.mixer(attention)
+        attention = self.norm3(attention)
+
+        # reshape to b (n_var * hidden_var_dim // token_dim) h w
+        attention = attention.view(batch_size, n_tokens * attention.shape[1], *attention.shape[-self.n_dim :])
+
+        return attention
+
+
+class CoDABlock2Dv2(nn.Module):
+    """Co-domain Attention Block (CODABlock) implement the transformer
+    architecture in the operator learning framework, as described in [1]_.
+    It is a simplified version of the implementation found in https://github.com/neuraloperator
+    A Cross Attention module between the tokens representing the variables and the tokens representing the boundary conditions is
+    added after the Self-Attention module
+
+
+    References
+    ----------
+    .. [1]: M. Rahman, R. George, M. Elleithy, D. Leibovici, Z. Li, B. Bonev,
+        C. White, J. Berner, R. Yeh, J. Kossaifi, K. Azizzadenesheli, A. Anandkumar (2024).
+        "Pretraining Codomain Attention Neural Operators for Solving Multiphysics PDEs."
+        arxiv:2403.12553
+    """
+
+    def __init__(
+        self,
+        modes: tuple[int, int],
+        token_dim: int,
+        bc_dim: int,
+        n_heads: int = 1,
+        activation: Callable = nn.GELU,
+        temperature: float = 1.0,
+        norm: Callable = partial(nn.InstanceNorm2d, affine=True),
+        spectral_compression_factor: Sequence = (1, 1, 1),
+    ):
+
+        super().__init__()
+
+        self.token_dim = token_dim
+        self.n_heads = n_heads
+        self.temperature = temperature
+        self.n_dim = 2  # only 2d spatial dimensions
+        self.ranks = [self.token_dim, n_heads * self.token_dim, np.prod(modes)]
+        self.ranks = tuple(np.ceil(np.divide(self.ranks, spectral_compression_factor)).astype(int))
+        self.bc_dim = bc_dim
 
         self.Q = FNOBlock(
             in_channels=self.token_dim,
@@ -725,7 +923,6 @@ class CoDABlock2D(nn.Module):
         )
 
         # To project back each token from the n heads to token_dim
-
         self.projection = FNOBlock(
             in_channels=self.n_heads * self.token_dim,
             hidden_channels=self.token_dim,
@@ -735,6 +932,50 @@ class CoDABlock2D(nn.Module):
             spectral_layer_type="tucker",
             ranks=self.ranks,
         )
+
+        # Cross Attention with the boundary conditions
+
+        self.Q2 = FNOBlock(
+            in_channels=self.token_dim,
+            hidden_channels=n_heads * self.token_dim,
+            out_channels=n_heads * self.token_dim,
+            modes=modes,
+            activation=activation,
+            spectral_layer_type="tucker",
+            ranks=self.ranks,
+        )
+
+        self.V2 = FNOBlock(
+            in_channels=self.bc_dim,
+            hidden_channels=n_heads * self.token_dim,
+            out_channels=n_heads * self.token_dim,
+            modes=modes,
+            activation=activation,
+            spectral_layer_type="tucker",
+            ranks=self.ranks,
+        )
+
+        self.K2 = FNOBlock(
+            in_channels=self.bc_dim,
+            hidden_channels=n_heads * self.token_dim,
+            out_channels=n_heads * self.token_dim,
+            modes=modes,
+            activation=activation,
+            spectral_layer_type="tucker",
+            ranks=self.ranks,
+        )
+
+        # To project back each token from the n heads to token_dim
+        self.projection2 = FNOBlock(
+            in_channels=self.n_heads * self.token_dim,
+            hidden_channels=self.token_dim,
+            out_channels=self.token_dim,
+            modes=modes,
+            activation=nn.Identity,
+            spectral_layer_type="tucker",
+            ranks=self.ranks,
+        )
+
         mixer_ranks = [self.token_dim, self.token_dim, np.prod(modes)]
         mixer_ranks = np.ceil(np.divide(mixer_ranks, spectral_compression_factor)).astype(int)
         self.mixer = FNOBlock(
@@ -749,6 +990,7 @@ class CoDABlock2D(nn.Module):
         self.norm1 = norm(self.token_dim)
         self.norm2 = norm(self.token_dim)
         self.norm3 = norm(self.token_dim)
+        self.norm4 = norm(self.token_dim)
 
     def MultiHeadAttention(self, tokens, batch_size):
         """Compute multi-head Attention where each variable latent representation is a token
@@ -803,10 +1045,70 @@ class CoDABlock2D(nn.Module):
         attention = attention.view(
             attention.size(0), attention.size(1), attention.size(2), d, *tokens.shape[-self.n_dim :]
         )
-        attention = torch.transpose(attention, 1, 2)
+        attention = torch.transpose(attention, 1, 2)  # b t n d h w
         attention = attention.reshape(
             attention.size(0) * attention.size(1), attention.size(2) * d, *tokens.shape[-self.n_dim :]
+        )  # (b * t) (n * d) h w
+
+        return attention
+
+    def MultiHeadCrossAttention(self, tokens, bc_tokens, batch_size):
+        """Compute multi-head Attention where each variable latent representation is a token
+
+        input tensor shape (b*t), d, h, w
+        The tensor is first transformed into k, q and v with shape (b*t),(n*d), h, w
+        where
+        b: batch size
+        t: number of tokens
+        n: number of heads
+        d: token dimension (the latent dimension of each variable)
+        h, w: spatial dimensions
+
+        Then k, q and v are reshaped to b, n, t, (d h w)
+        as torch.matul multiplies the two last dimensions
+        Finally the output is reshaped to b, n, (t*d), h, w
+
+        """
+        # k, q, v (b*t, n*d, h, w)
+        q = self.Q2(tokens)
+        k = self.K2(bc_tokens)
+        v = self.V2(bc_tokens)
+
+        assert k.size(1) % self.n_heads == 0, "Number of channels in k, q, and v should be divisible by number of heads"
+
+        # reshape from (b*t) (n*d) h w -> b n t (d*h*w ...)
+        t = k.size(0) // batch_size  # Compute the number of tokens `t` (each token is a variable here)
+        # n heads with token codimension `d` (in the case of per layer attention, d=1)
+        d = k.size(1) // self.n_heads
+
+        # reshape from (b*t) (n*d) h w ... to b n t d h w ...
+        k = k.view(batch_size, t, self.n_heads, d, *k.shape[-self.n_dim :])
+        q = q.view(batch_size, t, self.n_heads, d, *q.shape[-self.n_dim :])
+        v = v.view(batch_size, t, self.n_heads, d, *v.shape[-self.n_dim :])
+
+        k = torch.transpose(k, 1, 2)
+        q = torch.transpose(q, 1, 2)
+        v = torch.transpose(v, 1, 2)
+
+        # reshape to flatten the d, h and w dimensions
+        k = k.reshape(batch_size, self.n_heads, t, -1)
+        q = q.reshape(batch_size, self.n_heads, t, -1)
+        v = v.reshape(batch_size, self.n_heads, t, -1)
+
+        # attention mechanism
+        dprod = torch.matmul(q, k.transpose(-1, -2)) / (np.sqrt(k.shape[-1]) * self.temperature)
+        dprod = F.softmax(dprod, dim=-1)
+
+        attention = torch.matmul(dprod, v)
+
+        # Reshape from (b, n, t, d * h * w) to (b, n, t, d, h, w, ...)
+        attention = attention.view(
+            attention.size(0), attention.size(1), attention.size(2), d, *tokens.shape[-self.n_dim :]
         )
+        attention = torch.transpose(attention, 1, 2)  # b t n d h w
+        attention = attention.reshape(
+            attention.size(0) * attention.size(1), attention.size(2) * d, *tokens.shape[-self.n_dim :]
+        )  # (b * t) (n * d) h w
 
         return attention
 
@@ -821,16 +1123,21 @@ class CoDABlock2D(nn.Module):
         assert x.shape[1] % self.token_dim == 0, "Number of channels in x should be divisible by token_codimension"
 
         n_tokens = x.shape[1] // self.token_dim
-
         # Reshape from shape b (t*d) h w ... to (b*t) d h w
         x = x.view(x.size(0) * n_tokens, self.token_dim, *x.shape[-self.n_dim :])
 
         attention = self.norm1(x)
-        attention = self.MultiHeadAttention(attention, batch_size)
-        attention = self.projection(attention)
+        attention = self.MultiHeadAttention(attention, batch_size)  # it ouptputs (b * t) (n * d) h w
+        attention = self.projection(attention)  # now it's projected to (b * t) d h w
         attention = self.norm2(attention + x)  # shortcut
+        shortcut = attention
+
+        attention = self.MultiHeadCrossAttention(attention, bc_tokens=x, batch_size=batch_size)
+        attention = self.projection2(attention)
+        attention = self.norm3(attention + shortcut)
+
         attention = self.mixer(attention)
-        attention = self.norm3(attention)
+        attention = self.norm4(attention)
 
         # reshape to b (n_var * hidden_var_dim // token_dim) h w
         attention = attention.view(batch_size, n_tokens * attention.shape[1], *attention.shape[-self.n_dim :])
