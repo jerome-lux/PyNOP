@@ -3,17 +3,46 @@ import numpy as np
 import collections.abc as abc
 import torch
 import torch.nn as nn
-from pynop.core.blocks import FNOBlock, FNOBlockv2, UFNOBlock
+from pynop.core.blocks import FNOBlock, FNOBlockv2, UFNOBlock, ConvFNOBlock
 from pynop.core.ops import CartesianEmbedding
 from pynop.core.ops import ConvLayer
 from pynop.core.norm import LayerNorm2d
 from pynop.core.utils import make_tuple
 
-REGISTERED_FNO = {"FNO": FNOBlock, "FNOv2": FNOBlockv2, "UFNO": UFNOBlock}
+REGISTERED_FNO = {"FNO": FNOBlock, "FNOv2": FNOBlockv2, "UFNO": UFNOBlock, "ConvFNO": ConvFNOBlock}
 
 
 class FNO(nn.Module):
-    """Implementation of Fourier Neural Operator"""
+    """Implementation of Fourier Neural Operator
+    Parameters
+    ----------
+    in_channels: int
+        Number of input channels
+    out_channels: int
+        Number of output channels
+    modes: Union[int, Sequence[int]]
+        Number of Fourier modes to use in each dimension. If a single integer is given, it is used for all dimensions.
+    hidden_channels: Sequence[int]
+        Number of hidden channels in each block. If a single integer is given, it is used for all blocks.
+    blocks: Union[str, Sequence[str]]
+        Type of blocks to use in the network. If a single string is given, it is used for all blocks. Supported values are 'FNO', 'FNOv2', 'UFNO'.
+    spectral_compression_factor: Sequence
+        Factor to compress the spectral layer. If a single integer is given, it is used for all blocks.
+    activation: nn.module
+        Activation function to use in the network. Default is nn.GELU.
+    norm: nn.module
+        Normalization layer to use in the network. Default is LayerNorm2d.
+    fixed_pos_encoding: bool
+        Whether to use fixed positional encoding based on the grid coordinates. Default is True.
+    trainable_pos_encoding: bool
+        Whether to use trainable positional encoding. Default is False.
+    trainable_pos_encoding_modes: tuple
+        Modes to use for the trainable positional encoding. Only useful if `trainable_pos_encoding` is True. Default is (16, 16).
+    trainable_pos_encoding_dims: int
+        Number of dimensions for the trainable positional encoding. Only useful if `trainable_pos_encoding` is True. Default is 8.
+    block_kwargs: dict
+        Additional keyword arguments to pass to the block constructor. Default is an empty dictionary.
+    """
 
     def __init__(
         self,
@@ -29,14 +58,16 @@ class FNO(nn.Module):
         trainable_pos_encoding: bool = False,
         trainable_pos_encoding_modes=(16, 16),  # Only useful if pos_encoding == 'trainable'
         trainable_pos_encoding_dims=8,
+        block_kwargs: dict = {},
     ):
         super().__init__()
         self.fixed_pos_encoding = fixed_pos_encoding
         self.trainable_pos_encoding = trainable_pos_encoding
 
+        assert isinstance(hidden_channels, abc.Sequence), "hidden_channels must be a sequence"
+
         if isinstance(blocks, str):
             blocks = [blocks] * len(hidden_channels)
-        assert isinstance(hidden_channels, abc.Sequence), "hidden_channels must be a sequence"
 
         assert len(blocks) == len(
             hidden_channels
@@ -76,6 +107,7 @@ class FNO(nn.Module):
                     normalization=norm,
                     spectral_layer_type="tucker",
                     ranks=ranks,
+                    **block_kwargs,  # Additional keyword arguments for the block
                 )
             )
 
@@ -83,7 +115,7 @@ class FNO(nn.Module):
 
     def forward(self, x, return_coords=False):
 
-        if self.return_coords and not self.fixed_pos_encoding:
+        if return_coords and not self.fixed_pos_encoding:
             raise ValueError(
                 "return_coords is only available when fixed_pos_encoding or trainable_pos_encoding is True"
             )
