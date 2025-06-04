@@ -35,8 +35,11 @@ class CoDANO(nn.Module):
         Number of CoDA blocks in the model. Default is 4.
     n_heads : int
         Number of attention heads in each CoDA block. Default is 1.
+    spatial_scaling: float, int.
+        The scaling factor applied to the spatial dimensions of each token when projecting the token to Q, V and K matrixes
     per_channel_attention : bool
-        If True, the attention is computed per channel. Default is False.
+        If True, the attention is computed per channel. If there is only one variable, this parameter should be True
+        Default is True.
     activation : Callable
         Activation function to be used in the model. Default is nn.GELU.
     norm : Callable
@@ -68,7 +71,9 @@ class CoDANO(nn.Module):
         modes: tuple[int, int] = (16, 16),
         n_layers: int = 4,
         n_heads: int = 1,
-        per_channel_attention: bool = False,
+        spatial_scaling: Union[float, int] = 1,
+        attention_dim: Union[None, int] = None,
+        per_channel_attention: bool = True,
         activation: Callable = nn.GELU,
         norm: Callable = partial(nn.InstanceNorm2d, affine=True),
         ndim: int = 2,
@@ -99,7 +104,11 @@ class CoDANO(nn.Module):
 
         # each variable is represented by 1 channel + its positionnal encoding + the static field(s)
         # Note that the static field(s) are concatenated to each variable and are not considered as a separate token
-        self.extended_variable_codimemsion = 1 + static_channel_dim + positional_encoding_dim
+        if self.fixed_pos_encoding:
+            fixed_pos_encoding_dim = 2
+        else:
+            fixed_pos_encoding_dim = 0
+        self.extended_variable_codimemsion = 1 + static_channel_dim + positional_encoding_dim + fixed_pos_encoding_dim
 
         # channel MLP to lift the input codimension to hidden_variable_codimension
         self.lifting = nn.Sequential(
@@ -114,16 +123,21 @@ class CoDANO(nn.Module):
         else:
             token_dim = hidden_variable_codimension
 
+        if attention_dim is None:
+            attention_dim = token_dim
+
         self.blocks = nn.ModuleList()
         for i in range(n_layers):
             self.blocks.append(
                 CoDABlock2D(
                     modes=modes,
                     token_dim=token_dim,
+                    attention_dim=attention_dim,
                     n_heads=n_heads,
                     activation=activation,
                     norm=norm,
                     spectral_compression_factor=spectral_compression_factor,
+                    scaling=spatial_scaling,
                 )
             )
 
@@ -183,8 +197,8 @@ class CoDANO(nn.Module):
             grid_encoding = torch.stack([grid_x, grid_y], dim=-1)  # Shape (H, W, 2)
             grid_encoding = grid_encoding.permute(2, 0, 1).unsqueeze(0)  # Shape (1, 2, H, W)
             grid_encoding = grid_encoding.expand(batch_size, -1, -1, -1)  # Shape (batch_size, 2, H, W)
-            grid_encoding.unsqueeze(1)  # (batch_size, 1, 2, H, W)
-            repeat_shape = [1 for _ in x.shape]
+            grid_encoding = grid_encoding.unsqueeze(1)  # (batch_size, 1, 2, H, W)
+            repeat_shape = [1 for _ in grid_encoding.shape]
             repeat_shape[1] = x.shape[1]  # repeat along the variable axis to match input
             grid_encoding = grid_encoding.repeat(*repeat_shape)  # (batch_size, num_inp_var, 2, H, W)
             x = x.unsqueeze(2)  # (batch_size, num_inp_var, 1, H, W)
