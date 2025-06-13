@@ -27,7 +27,7 @@ class DeepONet(nn.Module):
         - decoder: None or an existing model. It decodes the ouput of the DON
         - activation: a valid activation function
         - normalization: a valid normalization layer or None (default DON has no normalization)
-        - scale: the scaling factor applied to the output (can be 1/n or $1/ \sqrt(n) $ where n is the dimension of the output)
+        - scale: the scaling factor applied to the output (can be 1/n or $1/ \\sqrt(n) $ where n is the dimension of the output)
 
         Notes:
         The dimension of the input of the trunk net is the dimensionality N of the coordinates: [Bt, N]./ Bt is the number of query points.

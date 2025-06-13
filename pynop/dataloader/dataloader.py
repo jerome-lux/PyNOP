@@ -226,4 +226,4 @@ class PairedTimeSeriesDataset(Dataset):
         if self.transform:
             sequence_tensor, static_field_tensor = self.transform((sequence_tensor, static_field_tensor))
 
-        return sequence_tensor, static_field_tensor
+        return static_field_tensor, sequence_tensor

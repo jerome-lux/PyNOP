@@ -29,10 +29,14 @@ class FNO(nn.Module):
         trainable_pos_encoding: bool = False,
         trainable_pos_encoding_modes=(16, 16),  # Only useful if pos_encoding == 'trainable'
         trainable_pos_encoding_dims=8,
+        return_coords: bool = False,
+        time_steps=64,
     ):
         super().__init__()
         self.fixed_pos_encoding = fixed_pos_encoding
         self.trainable_pos_encoding = trainable_pos_encoding
+        self.return_coords = return_coords
+        self.time_steps = time_steps
 
         if isinstance(blocks, str):
             blocks = [blocks] * len(hidden_channels)
@@ -79,10 +83,47 @@ class FNO(nn.Module):
                 )
             )
 
-        self.projection = nn.Conv2d(hidden_channels[-1], out_channels, 1, bias=True)
+        # self.projection = nn.Conv2d(hidden_channels[-1], out_channels, 1, bias=True)
+        self.projection = nn.Conv2d(hidden_channels[-1], out_channels * time_steps, 1, bias=True)
 
+    # def forward(self, x, return_coords=False):
+
+    #     if self.return_coords and not self.fixed_pos_encoding:
+    #         raise ValueError(
+    #             "return_coords is only available when fixed_pos_encoding or trainable_pos_encoding is True"
+    #         )
+
+    #     if self.fixed_pos_encoding:
+    #         x = self.grid_encoding(x)
+
+    #         if return_coords:
+    #             coords = x[:, -2:, :, :]
+
+    #     if self.trainable_pos_encoding:
+    #         pos_embeddings = torch.fft.irfftn(self.pos_embedding_weights, s=x.shape[-2:])
+    #         repeat_shape = [1 for _ in x.shape]
+    #         repeat_shape[0] = x.shape[0]  # repeat along the batch size to match input
+    #         x = torch.cat([x, pos_embeddings.repeat(*repeat_shape)], dim=1)  # cat along the channel axis
+
+    #     x = self.lifting(x)
+    #     for op in self.ops:
+    #         x = op(x)
+    #     x = self.projection(x)  
+
+    #     B, C_times_T, H, W = x.shape
+    #     if x.ndim == 5:  # [B, T, C, H, W]
+    #         B, T, C, H, W = x.shape
+    #         x = x.view(B, T * C, H, W)
+    #     elif x.ndim == 4:  # already flattened
+    #         B, C_times_T, H, W = x.shape
+    #     else:
+    #         raise ValueError(f"Expected input shape [B, T, C, H, W] or [B, C, H, W], got {x.shape}")
+    #     x = x.view(B, self.time_steps, -1, H, W)
+    #     if self.fixed_pos_encoding and return_coords:
+    #         return x, coords
+    #     else:
+    #         return x
     def forward(self, x, return_coords=False):
-
         if self.return_coords and not self.fixed_pos_encoding:
             raise ValueError(
                 "return_coords is only available when fixed_pos_encoding or trainable_pos_encoding is True"
@@ -90,24 +131,31 @@ class FNO(nn.Module):
 
         if self.fixed_pos_encoding:
             x = self.grid_encoding(x)
-
             if return_coords:
                 coords = x[:, -2:, :, :]
 
         if self.trainable_pos_encoding:
             pos_embeddings = torch.fft.irfftn(self.pos_embedding_weights, s=x.shape[-2:])
             repeat_shape = [1 for _ in x.shape]
-            repeat_shape[0] = x.shape[0]  # repeat along the batch size to match input
-            x = torch.cat([x, pos_embeddings.repeat(*repeat_shape)], dim=1)  # cat along the channel axis
+            repeat_shape[0] = x.shape[0]
+            x = torch.cat([x, pos_embeddings.repeat(*repeat_shape)], dim=1)
 
         x = self.lifting(x)
 
         for op in self.ops:
             x = op(x)
 
-        x = self.projection(x)
+        x = self.projection(x)  # [B, T*out_channels, H, W]
+
+        B, C_times_T, H, W = x.shape
+        if C_times_T % self.time_steps != 0:
+            raise ValueError(f"Cannot reshape output with shape {x.shape} into [B, T={self.time_steps}, C, H, W]")
+
+        C = C_times_T // self.time_steps
+        x = x.view(B, self.time_steps, C, H, W)
 
         if self.fixed_pos_encoding and return_coords:
             return x, coords
         else:
             return x
+

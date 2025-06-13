@@ -82,6 +82,7 @@ def train(
 
         for i, (inputs, targets) in enumerate(progress_bar):
             inputs = inputs.to(device)
+            targets = targets.to(device)
 
             loss = train_step(model, inputs, targets, loss_fn, optimizer, lossweights=lossweights)
 
@@ -119,6 +120,7 @@ def train(
                 )
                 for i, (inputs, targets) in enumerate(progress_bar):
                     inputs = inputs.to(device)
+                    targets = targets.to(device)
 
                     valoss = test_step(model, inputs, targets, loss_fn, lossweights=lossweights)
 
@@ -561,7 +563,7 @@ def CoDANO_training(
 
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} [Training]", leave=True, total=iterations)
 
-        for i, (inputs, static_field) in enumerate(progress_bar):
+        for i, (static_field, inputs) in enumerate(progress_bar):
             inputs = inputs.to(device)
             static_field = static_field.to(device)
             T_unroll = inputs.shape[1]
@@ -650,7 +652,7 @@ def CoDANO_training(
                     test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test]", leave=True, total=len(test_loader)
                 )
 
-                for i, (inputs, static_field) in enumerate(progress_bar):
+                for i, (static_field, inputs) in enumerate(progress_bar):
                     inputs = inputs.to(device)
                     static_field = static_field.to(device)
                     T_unroll = inputs.shape[1]
