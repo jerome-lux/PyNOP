@@ -24,6 +24,7 @@ class PairedTimeSeriesDataset(Dataset):
         static_field_dir,
         t_n,
         series_file_pattern="*.npy",
+        static_file_pattern="*.npy",
         transform=None,
         expected_channels_from_user=None,
         time_first=False,
@@ -54,6 +55,10 @@ class PairedTimeSeriesDataset(Dataset):
         # --- Stage 1: Discover series files and match with static fields ---
         series_search_path = os.path.join(self.series_data_dir, series_file_pattern)
         all_series_files_paths = glob.glob(series_search_path)
+        self.series_prefix = series_file_pattern.split("*")[0]  # Extract prefix before the wildcard
+        self.series_suffix = series_file_pattern.split("*")[-1]
+        self.static_prefix = static_file_pattern.split("*")[0]  # Extract prefix before the wildcard
+        self.static_suffix = static_file_pattern.split("*")[-1]  # Extract suffix after the wildcard
 
         if not all_series_files_paths:
             raise FileNotFoundError(
@@ -70,12 +75,9 @@ class PairedTimeSeriesDataset(Dataset):
 
         for series_filepath in all_series_files_paths:
             series_filename = os.path.basename(series_filepath)
-            # Assume static field has the same base name (XXXX) but could be in a different dir
-            # Construct expected static field path. This might need adjustment based on naming conventions.
-            # If static_file_pattern is just "*.npy", this effectively looks for the same filename.
-            # If static_file_pattern includes a prefix/suffix, this logic needs to be more robust.
-            # For now, assume filename base (XXXX) is the key.
-            static_field_filepath = os.path.join(self.static_field_dir, series_filename)
+
+            idx = series_filename[len(self.series_prefix) : -len(self.series_suffix)]
+            static_field_filepath = os.path.join(self.static_field_dir, self.static_prefix + idx + self.static_suffix)
 
             if not os.path.exists(static_field_filepath):
                 print(

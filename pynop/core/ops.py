@@ -1,5 +1,5 @@
 import math
-
+from typing import Union
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -350,13 +350,23 @@ class TuckerSpectralConv2d(nn.Module):
     r2 = Cout / k
     r3 = modes_x * modes_y / k'
     avec k & k' les facteurs de réduction souhaités (2, 4 etc)
+    Parameters:
+    in_channels (int): Nombre de canaux d'entrée.
+    out_channels (int): Nombre de canaux de sortie.
+    modes (tuple): Tuple (modes_x, modes_y) pour le nombre de modes de basse fréquence à conserver dans x et y.
+                   modes_x correspond à la dimension de hauteur (H) dans le domaine spatial.
+                   modes_y correspond à la dimension de largeur (W) dans le domaine spatial.
+    ranks (tuple): Tuple (r1, r2, r3) pour les rangs de la factorisation de Tucker.
+    scaling: Facteur d'échelle pour la taille de sortie. The output shape is (H*scaling, W*scaling).
+
     """
 
-    def __init__(self, in_channels, out_channels, modes, ranks):
+    def __init__(self, in_channels, out_channels, modes, ranks, scaling=1):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.modes_x, self.modes_y = modes
+        self.scaling = scaling
 
         self.r1, self.r2, self.r3 = ranks
 
@@ -427,14 +437,16 @@ class TuckerSpectralConv2d(nn.Module):
         out_ft[:, :, : self.modes_x, : self.modes_y] = y_ft_low_modes  # Copie de tenseurs complexes
 
         # 6. Retour au domaine spatial
-        y = torch.fft.irfft2(out_ft, s=(H, W), dim=(-2, -1), norm="ortho")  # (B, C_out, H, W), float
+        y = torch.fft.irfft2(
+            out_ft, s=(int(H * self.scaling), int(W * self.scaling)), dim=(-2, -1), norm="ortho"
+        )  # (B, C_out, H, W), float
 
         return y
 
 
 class SpectralConv2d(nn.Module):
 
-    def __init__(self, in_channels: int, out_channels: int, modes: tuple[int, int]):
+    def __init__(self, in_channels: int, out_channels: int, modes: tuple[int, int], scaling: Union[int, float] = 1):
         """
         Args:
             in_channels (int): Number of input channels.
@@ -442,11 +454,13 @@ class SpectralConv2d(nn.Module):
             modes (tuple): Tuple (modes_x, modes_y) for the number of low-frequency modes to retain in x and y.
                            modes_x corresponds to the height dimension (H) in the spatial domain.
                            modes_y corresponds to the width dimension (W) in the spatial domain.
+            scaling (int): Scaling factor for the output shape. Default is 1, which means no scaling.
         """
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.modes_x, self.modes_y = modes
+        self.scaling = scaling
 
         # Spectral convolution kernel (learned parameter)
         # Its shape is (out_channels, in_channels, modes_x, modes_y)
@@ -512,7 +526,9 @@ class SpectralConv2d(nn.Module):
 
         # 5. Return to spatial domain
         # irfft2 to get a real output of size (H, W)
-        y = torch.fft.irfft2(out_ft, s=(H, W), dim=(-2, -1), norm="ortho")  # (B, C_out, H, W), float
+        y = torch.fft.irfft2(
+            out_ft, s=(int(H * self.scaling), int(W * self.scaling)), dim=(-2, -1), norm="ortho"
+        )  # (B, C_out, H, W), float
 
         return y
 
