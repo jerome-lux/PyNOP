@@ -1373,9 +1373,9 @@ class LITBlock(nn.Module):
         return output
 
 
-class SNLITBlock(nn.Module):
+class NLITBlock(nn.Module):
     """
-    Symetric Non Linear Integral Transform Block (SNLITBlock) is a
+    Non Linear Integral Transform Block (SNLITBlock) is a
     PyTorch module for a learned 2D non linear integral transform that is resolution-invariant.
     The kernel is learned as a function of the input coordinates and values.
     The transform bases are learned as continuous functions via MLPs.
@@ -1580,9 +1580,9 @@ class SNLITBlock(nn.Module):
         return output
 
 
-class ANLITBlock(nn.Module):
+class NRNLITBlock(nn.Module):
     """
-    Asymetric Non Linear Integral Transform Block (ANLITBlock) is a
+    Non Reversible Non Linear Integral Transform Block (ANLITBlock) is a
     PyTorch module for a learned 2D non linear integral transform that is resolution-invariant.
     The transform bases are learned as continuous functions via MLPs.
     In this implementation the inverse transform is also learnt.
