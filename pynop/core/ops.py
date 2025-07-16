@@ -361,7 +361,7 @@ class TuckerSpectralConv2d(nn.Module):
 
     """
 
-    def __init__(self, in_channels, out_channels, modes, ranks, scaling=1):
+    def __init__(self, in_channels, out_channels, modes, ranks, scaling: Union[int, float] = 1):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -370,7 +370,7 @@ class TuckerSpectralConv2d(nn.Module):
 
         self.r1, self.r2, self.r3 = ranks
 
-        # Facteurs de la décomposition de Tucker (maintenant Complexes)
+        # Facteurs de la décomposition de Tucker
         self.U = nn.Parameter(torch.empty(in_channels, self.r1, dtype=torch.cfloat))  # (C_in, r1)
         self.V = nn.Parameter(torch.empty(out_channels, self.r2, dtype=torch.cfloat))  # (C_out, r2)
         self.S = nn.Parameter(torch.empty(self.modes_x, self.modes_y, self.r3, dtype=torch.cfloat))  # (mx, my, r3)
@@ -703,7 +703,16 @@ class FiniteDifferenceConvolution(nn.Module):
 
     """
 
-    def __init__(self, in_channels, out_channels, n_dim=2, kernel_size=3, groups=1, padding="same"):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        n_dim=2,
+        kernel_size=3,
+        groups=1,
+        stride=1,
+        padding="same",
+    ):
 
         super().__init__()
 
@@ -715,12 +724,14 @@ class FiniteDifferenceConvolution(nn.Module):
         self.groups = groups
         self.n_dim = n_dim
         self.padding = padding
+        self.stride = stride
 
+        # init kernel weigths
         self.weights = torch.rand((out_channels, in_channels // groups, kernel_size, kernel_size))
-        k = torch.sqrt(groups / (in_channels * kernel_size**2))
+        k = torch.sqrt(torch.tensor(groups / (in_channels * kernel_size**2)))
         self.weights = self.weights * 2 * k - k
 
-    def forward(self, x, grid_width):
+    def forward(self, x, grid_width: float = 1.0) -> torch.Tensor:
         """FiniteDifferenceConvolution's forward pass.
 
         Parameters
@@ -731,7 +742,83 @@ class FiniteDifferenceConvolution(nn.Module):
             discretization size of input grid
         """
 
-        x = self.conv_function(
-            x, (self.weights - torch.mean(self.weights)) / grid_width, groups=self.groups, padding=self.padding
+        self.weights = self.weights.to(x.device)
+        x = (
+            self.conv_function(
+                x,
+                (self.weights - torch.mean(self.weights)),
+                groups=self.groups,
+                stride=self.stride,
+                padding=self.padding,
+            )
+            / grid_width
         )
+        return x
+
+
+class FiniteDifferenceLayer(nn.Module):
+    """Finite Difference Layer introduced in [1]_.
+    "Neural Operators with Localized Integral and Differential Kernels" (ICML 2024)
+        https://arxiv.org/abs/2402.16845
+
+    Computes a finite difference convolution on a regular grid,
+    which converges to a directional derivative as the grid is refined.
+
+    Parameters
+    ----------
+    in_channels : int
+        number of in_channels
+    out_channels : int
+        number of out_channels
+    n_dim : int
+        number of dimensions in the input domain
+    kernel_size : int
+        odd kernel size used for convolutional finite difference stencil
+    groups : int
+        splitting number of channels
+    padding : literal {'periodic', 'replicate', 'reflect', 'zeros'}
+        mode of padding to use on input.
+        See `torch.nn.functional.padding`.
+
+    References
+    ----------
+    .. [1] : Liu-Schiaffini, M., et al. (2024). "Neural Operators with
+        Localized Integral and Differential Kernels".
+        ICML 2024, https://arxiv.org/abs/2402.16845.
+
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        n_dim=2,
+        kernel_size=3,
+        groups=1,
+        stride=1,
+        padding="same",
+        norm=None,
+        activation=None,
+        grid_width: float = 1.0,
+    ):
+        super().__init__()
+        self.fdc = FiniteDifferenceConvolution(
+            in_channels,
+            out_channels,
+            n_dim=n_dim,
+            kernel_size=kernel_size,
+            groups=groups,
+            stride=stride,
+            padding=padding,
+        )
+        self.normalization = norm(out_channels) if norm is not None else None
+        self.activation = activation() if activation is not None else None
+        self.grid_width = grid_width
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fdc(x, self.grid_width)
+        if self.normalization is not None:
+            x = self.normalization(x)
+        if self.activation is not None:
+            x = self.activation(x)
         return x
