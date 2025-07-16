@@ -146,6 +146,7 @@ class unet(nn.Module):
                 x = self.encoder[counter](x)
 
             if i < len(self.repeats) - 1 and j == n - 1:
+                # shortcut before downsampling
                 shortcuts.append(x)
                 x = self.downblocks[i](x)
 
