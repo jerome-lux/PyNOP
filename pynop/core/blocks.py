@@ -1315,7 +1315,7 @@ class LITBlock(nn.Module):
         base_values_w = self.basis_w_fn(w_coords)
 
         # Transpose the generated bases so they have shape (m1, H) and (m2, W)
-        # for matrix multiplication as in the previous approach.
+        # for matrix multiplication
         # transform_h_basis_runtime: (m1, H)
         # transform_w_basis_runtime: (m2, W)
         transform_h_basis_runtime = base_values_h.T
@@ -1582,7 +1582,7 @@ class NLITBlock(nn.Module):
 
 class NRNLITBlock(nn.Module):
     """
-    Non Reversible Non Linear Integral Transform Block (ANLITBlock) is a
+    Non Reversible Non Linear Integral Transform Block is a
     PyTorch module for a learned 2D non linear integral transform that is resolution-invariant.
     The transform bases are learned as continuous functions via MLPs.
     In this implementation the inverse transform is also learnt.
@@ -1639,8 +1639,8 @@ class NRNLITBlock(nn.Module):
             num_layers=mlp_num_layers,
             activation=activation,
         )
-        # Decoder MLPs: bases conditionnées par les valeurs des modes spectraux (fréquentiel)
-        # Pour la transformation inverse H (m1 -> H), conditionné par (C_out, m2) modes
+        # Decoder MLPs: bases conditionnées par les valeurs des modes spectraux (fréquentiels)
+        # Pour la transformation inverse H (m1 -> H), conditionnée par (C_out, m2) modes
         self.mlp_h_inv = MLPBlock(
             in_ch=1 + 2 * out_channels,
             out_ch=m1,
