@@ -419,14 +419,11 @@ class TuckerSpectralConv2d(nn.Module):
         # 2. Sélection des modes bas (garde les dimensions mx, my)
         x_ft_low_modes = x_ft[:, :, : self.modes_x, : self.modes_y]  # (B, C_in, mx, my), cfloat
 
-        # 3. Reconstruire les poids spectraux W_hat (maintenant directement complexe)
+        # 3. Reconstruire les poids spectraux W_hat
         G1 = torch.einsum("ij,jkl->ikl", self.U, self.G)  # (C_in, r2, r3), cfloat
         G2 = torch.einsum("ok,ikl->iol", self.V, G1)  # (C_in, C_out, r3), cfloat
-        # Correction: einsum adaptée pour S(mx, my, r3) et G2(i, o, r3)
+        # S(mx, my, r3) et G2(i, o, r3)
         W_hat = torch.einsum("iol,xyl->ioxy", G2, self.S)  # (C_in, C_out, modes_x, modes_y), cfloat
-
-        # Plus besoin de caster W_hat
-        # W_hat = W_hat.to(dtype=torch.cfloat)
 
         # 4. Appliquer la convolution spectrale (multiplication de tenseurs complexes)
         # y_ft_low_modes[b, o, mx, my] = sum_i (x_ft_low_modes[b, i, mx, my] * W_hat[i, o, mx, my])
