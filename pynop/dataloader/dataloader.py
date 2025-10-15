@@ -6,6 +6,8 @@ import pandas
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import ToTensor
+import torchvision.transforms as T
+import re
 import glob
 from collections import defaultdict
 
@@ -229,3 +231,298 @@ class PairedTimeSeriesDataset(Dataset):
             sequence_tensor, static_field_tensor = self.transform((sequence_tensor, static_field_tensor))
 
         return static_field_tensor, sequence_tensor
+
+
+# ---------------------------------------------------------
+# Implemented by Fatima, July 2025
+# Custom dataset for unrolled time evolution
+# ---------------------------------------------------------
+
+class UnrolledTimeVaryingDataset(Dataset):
+    def __init__(self, porosity_dir, concentration_dir, T_unroll=10):
+        """
+        PyTorch Dataset for unrolled multi-step time evolution.
+
+        This dataset provides sequences of consecutive time steps for learning temporal dependencies in reactive transport simulations.
+        Each sample contains an unrolled sequence of porosity and concentration fields over a specified time window `T_unroll`.
+
+        Each sample consists of:
+        - Input tensor: `[T-1, 3, H, W]` representing states from `t` to `t+T_unroll-2`
+        - Target tensor: `[T-1, 3, H, W]` representing the next-step states from `t+1` to `t+T_unroll-1`
+            where 3 channels correspond to porosity and two species fields.
+
+        Args:
+            porosity_dir (str): Directory containing porosity `.npy` files of shape `[T, H, W]`.
+            concentration_dir (str): Directory containing species concentration `.npy` files of shape `[T, H, W, 2]`.
+            T_unroll (int, optional): Number of time steps in each unrolled window (default: 10).
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: 
+                - `input_tensor`: `[T-1, 3, H, W]`
+                - `target_tensor`: `[T-1, 3, H, W]`
+                ready for sequence-to-sequence model training.
+        """
+        self.porosity_files = sorted(glob.glob(os.path.join(porosity_dir, "*.npy")))
+        self.concentration_files = sorted(glob.glob(os.path.join(concentration_dir, "*.npy")))
+
+        print(f"Found {len(self.porosity_files)} porosity files.")
+        print(f"Found {len(self.concentration_files)} concentration files.")
+
+        assert len(self.porosity_files) == len(self.concentration_files), \
+            "Mismatch between number of porosity and concentration files."
+
+        self.T_unroll = T_unroll
+        self.samples = []
+
+        for p_path, c_path in zip(self.porosity_files, self.concentration_files):
+            p_data = np.load(p_path, mmap_mode="r")
+            c_data = np.load(c_path, mmap_mode="r")
+
+            if p_data.shape[0] < T_unroll:
+                print(f"Skipping {p_path} due to insufficient timesteps ({p_data.shape[0]})")
+                continue
+
+            T = p_data.shape[0]
+            for t in range(T - T_unroll):
+                self.samples.append((p_path, c_path, t))
+
+        print(f"Total samples: {len(self.samples)}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        p_path, c_path, t = self.samples[idx]
+        p = np.load(p_path)[t:t + self.T_unroll]        
+        c = np.load(c_path)[t:t + self.T_unroll]       
+
+        p = np.expand_dims(p, -1)                       
+        x = np.concatenate([p, c], axis=-1)             
+        x = np.moveaxis(x, -1, 1)                        
+
+        input_tensor = torch.from_numpy(x[:-1]).float() 
+        target_tensor = torch.from_numpy(x[1:]).float()  
+
+        return input_tensor, target_tensor
+
+# ---------------------------------------------------------
+# [Mod] Implemented by Fatima, July 2025
+# Dataset for one-step evolution using porosity + concentrations
+# Predicts (p_{t+1}, c_{t+1}) from (p_t, c_t)
+# ---------------------------------------------------------
+
+class FNOTimestepDataset(Dataset):
+    def __init__(self, series_dir, porosity_dir, time_first=True, transform=None):
+        """
+        PyTorch Dataset for one-step time evolution (porosity + species).
+
+        Loads paired `.npy` files:
+        - concentration series (e.g., 2 species) shaped `[T, H, W, C]` if `time_first=True`
+            or `[H, W, C, T]` if `time_first=False`;
+        - porosity series shaped `[T, H, W]`.
+        Args:
+            series_dir (str): Directory with concentration time-series `.npy` files.
+                Expected per-file shape `[T, H, W, C]` (time-first) or `[H, W, C, T]` (time-last).
+            porosity_dir (str): Directory with porosity time-series `.npy` files, shape `[T, H, W]`.
+            time_first (bool, optional): Whether time is the first dimension in `series` files. Default: True.
+            transform (callable, optional): Optional transform applied to `(input_tensor, target_tensor)`.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - input_tensor:  float32 tensor `[1 + C, H, W]` at time `t`
+                - target_tensor: float32 tensor `[1 + C, H, W]` at time `t+1`
+        """
+       
+        self.series_paths = sorted(glob.glob(os.path.join(series_dir, "*.npy")))
+        self.porosity_paths = sorted(glob.glob(os.path.join(porosity_dir, "*.npy")))
+        self.transform = transform
+        self.time_first = time_first
+
+        assert len(self.series_paths) == len(self.porosity_paths), "Mismatch in sample counts"
+
+        self.samples = []
+        for s_path, p_path in zip(self.series_paths, self.porosity_paths):
+            series = np.load(s_path, mmap_mode="r")
+            porosity = np.load(p_path, mmap_mode="r")
+            assert series.shape[0] == porosity.shape[0], "Time mismatch between concentration and porosity"
+            T = series.shape[0] if time_first else series.shape[-1]
+            for t in range(T - 1):
+                self.samples.append((s_path, p_path, t))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        s_path, p_path, t = self.samples[idx]
+
+        series = np.load(s_path)      
+        porosity = np.load(p_path) 
+
+        if not self.time_first:
+            series = np.moveaxis(series, -1, 0)  
+
+        p_t = porosity[t]     
+        p_t1 = porosity[t+1]
+
+        c_t = series[t]       
+        c_t1 = series[t+1]
+
+        p_t = p_t[np.newaxis, ...]
+        p_t1 = p_t1[np.newaxis, ...]
+        c_t = np.transpose(c_t, (2, 0, 1))
+        c_t1 = np.transpose(c_t1, (2, 0, 1))
+
+        input_tensor = np.concatenate([p_t, c_t], axis=0)     
+        target_tensor = np.concatenate([p_t1, c_t1], axis=0) 
+
+        input_tensor = torch.from_numpy(input_tensor).float()
+        target_tensor = torch.from_numpy(target_tensor).float()
+
+        if self.transform:
+            input_tensor, target_tensor = self.transform((input_tensor, target_tensor))
+
+        return input_tensor, target_tensor
+
+
+# ---------------------------------------------------------
+# Implemented by Fatima, July 2025
+# Custom dataset for paired image-based time evolution
+# Loads PNG slices of porosity and species fields to train models
+# for one-step temporal prediction from images.
+# ---------------------------------------------------------
+class PairedImageTimeDataset(Dataset):
+    def __init__(self, p_dir, c_dir, transform=None):
+        """
+        PyTorch Dataset for paired image-based time evolution.
+
+        This dataset loads consecutive PNG image slices representing
+        porosity and species concentration fields at two consecutive
+        time steps `(t, t+1)` from simulation outputs.
+        
+        Args:
+            p_dir (str): Directory containing porosity PNG files named as `p_evol_<sim_id>_slice_<n>.png`.
+            c_dir (str): Directory containing species concentration PNG files named as 
+                `c_evol_<sim_id>_slice_<n>_species_<id>.png`.
+            transform (callable, optional): Transform to apply to loaded images (default: `torchvision.transforms.ToTensor()`).
+
+        Notes:
+            - Pairs slices belonging to the same simulation ID where `slice_tp1 = slice_t + 1`.
+            - Filters out incomplete or non-consecutive image pairs.
+        """
+        self.p_dir = p_dir
+        self.c_dir = c_dir
+        self.transform = transform if transform else T.ToTensor()
+
+        self.slice_keys = []
+        pattern = r"p_evol_(\d+)_slice_(\d+)\.png"
+        for fname in sorted(os.listdir(p_dir)):
+            match = re.match(pattern, fname)
+            if match:
+                sim_id = match.group(1)
+                slice_id = int(match.group(2))
+                self.slice_keys.append((sim_id, slice_id))
+
+        self.slice_pairs = []
+        for i in range(len(self.slice_keys) - 1):
+            sim_id_1, slice_1 = self.slice_keys[i]
+            sim_id_2, slice_2 = self.slice_keys[i + 1]
+            if sim_id_1 == sim_id_2 and slice_2 == slice_1 + 1:
+                self.slice_pairs.append((self.slice_keys[i], self.slice_keys[i + 1]))
+
+    def __len__(self):
+        return len(self.slice_pairs)
+
+    def __getitem__(self, idx):
+        (sim_id_t, slice_t), (sim_id_tp1, slice_tp1) = self.slice_pairs[idx]
+
+        def load_full(sim_id, slice_id):
+            p = self.transform(Image.open(os.path.join(self.p_dir, f"p_evol_{sim_id}_slice_{slice_id}.png")).convert("L"))
+            c0 = self.transform(Image.open(os.path.join(self.c_dir, f"c_evol_{sim_id}_slice_{slice_id}_species_0.png")).convert("L"))
+            c1 = self.transform(Image.open(os.path.join(self.c_dir, f"c_evol_{sim_id}_slice_{slice_id}_species_1.png")).convert("L"))
+            return torch.cat([p, c0, c1], dim=0)  # [3, H, W]
+
+        input_tensor = load_full(sim_id_t, slice_t)
+        target_tensor = load_full(sim_id_tp1, slice_tp1)
+
+        return input_tensor, target_tensor
+    
+
+# ---------------------------------------------------------
+# [Mod] Implemented by Fatima, August 2025
+# Custom dataset for unrolled time evolution from PNG images
+# ---------------------------------------------------------
+class ImageUnrolledTimeVaryingDataset(Dataset):
+    def __init__(self, p_dir, c_dir, T_unroll=10, transform=None):
+        """
+        PyTorch Dataset for unrolled multi-step time evolution from image data.
+
+        This dataset loads sequences of PNG image slices representing porosity 
+        and species concentration fields from reactive transport simulations.
+        It constructs consecutive time windows of length `T_unroll` for training
+        sequence-based models to predict temporal dynamics from visual data.
+
+        Each sample consists of:
+        - Input tensor: `[T_unroll-1, 3, H, W]` = sequence from time `t` to `t+T_unroll-2`
+        - Target tensor: `[1, 3, H, W]` = next-step frame at time `t+T_unroll-1`
+
+        Args:
+            p_dir (str): Directory containing porosity PNG files named as 
+                `p_evol_<sim_id>_slice_<n>.png`.
+            c_dir (str): Directory containing species PNG files named as 
+                `c_evol_<sim_id>_slice_<n>_species_<id>.png`, where `id ? {0,1}`.
+            T_unroll (int, optional): Number of consecutive time steps in each sequence (default: 10).
+            transform (callable, optional): Transform applied to each image 
+                (default: `torchvision.transforms.ToTensor()`).
+        """
+        self.p_dir = p_dir
+        self.c_dir = c_dir
+        self.T_unroll = T_unroll
+        self.transform = transform if transform else T.ToTensor()
+
+        self.sim_dict = {}
+        pattern = r"p_evol_(\d+)_slice_(\d+)\.png"
+
+        for fname in sorted(os.listdir(p_dir)):
+            match = re.match(pattern, fname)
+            if match:
+                sim_id, t_str = match.groups()
+                t = int(t_str)
+                self.sim_dict.setdefault(sim_id, []).append(t)
+
+        self.samples = []
+        for sim_id, timesteps in self.sim_dict.items():
+            timesteps = sorted(timesteps)
+            for i in range(len(timesteps) - T_unroll):
+                self.samples.append((sim_id, timesteps[i]))
+
+        print(f"Total unrolled samples: {len(self.samples)}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sim_id, start_t = self.samples[idx]
+        input_seq = []
+        target_seq = []
+
+        for dt in range(self.T_unroll):
+            t = start_t + dt
+
+            p_img = Image.open(os.path.join(self.p_dir, f"p_evol_{sim_id}_slice_{t}.png")).convert("L")
+            c0_img = Image.open(os.path.join(self.c_dir, f"c_evol_{sim_id}_slice_{t}_species_0.png")).convert("L")
+            c1_img = Image.open(os.path.join(self.c_dir, f"c_evol_{sim_id}_slice_{t}_species_1.png")).convert("L")
+
+            p = self.transform(p_img)     
+            c0 = self.transform(c0_img)   
+            c1 = self.transform(c1_img)   
+            full = torch.cat([p, c0, c1], dim=0) 
+
+            if dt < self.T_unroll - 1:
+                input_seq.append(full)
+            else:
+                target_seq.append(full)
+
+        input_tensor = torch.stack(input_seq, dim=0)  
+        target_tensor = torch.stack(target_seq, dim=0)
+
+        return input_tensor, target_tensor

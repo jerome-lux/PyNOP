@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from pynop.core.ops import CartesianEmbedding, SinusoidalEmbedding
 from typing import Callable, Union
 
-
+# [Modified] Forward path: encode -> branch/trunk -> combine (elementwise) -> optional decode (Aug 2025)
 class DeepONet(nn.Module):
 
     def __init__(
@@ -43,8 +43,11 @@ class DeepONet(nn.Module):
 
         super(DeepONet, self).__init__()
 
+        self.activation = activation
+        self.normalization = normalization
         self.scale = 1 if scale is None else nn.Parameter(torch.tensor(scale))
-
+       
+        
         use_bias = True if normalization is None else False
 
         if not callable(branchnet):
@@ -61,19 +64,27 @@ class DeepONet(nn.Module):
         else:
             self.branchnet = branchnet
 
-        self.trunknet = nn.ModuleList()
+        # self.trunknet = nn.ModuleList()
         if not callable(trunknet):
             # If not given, the branchnet is just a MLP
-            self.trunknet = nn.ModuleList()
-            for i, n in enumerate(trunknet[1:]):
-                self.trunknet.append(nn.Linear(trunknet[i], n, bias=use_bias))
-                if normalization is not None:
-                    self.trunknet.append(self.normalization(n))
-                if activation is not None:
-                    self.trunknet.append(self.activation())
-            # Last layer without activation
-            self.trunknet.append(nn.Linear(trunknet[i + 1], trunknet[i + 2]))
+            for i in range(len(trunknet) - 1):
+                self.trunknet.append(nn.Linear(trunknet[i], trunknet[i + 1], bias=use_bias))
+                if i < len(trunknet) - 2:
+                    if normalization is not None:
+                        self.trunknet.append(normalization(trunknet[i + 1]))
+                    if activation is not None:
+                        self.trunknet.append(activation())
 
+
+                #---------------------------------------OLD VERSION---------------------------------#
+            # for i, n in enumerate(trunknet[1:]):
+            #     self.trunknet.append(nn.Linear(trunknet[i], n, bias=use_bias))
+            #     if normalization is not None:
+            #         self.trunknet.append(self.normalization(n))
+            #     if activation is not None:
+            #         self.trunknet.append(self.activation())
+            # Last layer without activation
+            # self.trunknet.append(nn.Linear(trunknet[i + 1], trunknet[i + 2]))
         else:
             self.trunknet = trunknet
 
@@ -85,15 +96,20 @@ class DeepONet(nn.Module):
         if self.encoder is not None:
             u = self.encoder(u)
 
-        u = self.branch(u)
-        y = self.trunk(y)
-        # The output of the branchnet can have a different shape to that of the trunknet,
-        # but it **must** have the same number of channels
-        x = torch.einsum("ji, ki...-> kj...", y, u) * self.scale
+        u = self.branchnet(u)
+        y = self.trunknet(y)
+
+        # x = torch.einsum("bi, tj -> bt", u, y) * self.scale
+        # x = torch.einsum("ji, ki...-> kj...", y, u) * self.scale
+        # x = torch.einsum("bi, bi -> b", u, y) 
+        # x = x * self.scale
+        latent = u * y
 
         if self.decoder is not None:
             # merge the two batch dimensions before decoding
-            x = torch.flatten(x, start_dim=0, end_dim=1)
+            # x = torch.flatten(x, start_dim=0, end_dim=1)
+            # x = x.view(-1, 1)                                   
+            # x = x.expand(-1, 2048)                        
+            x = latent.view(-1, 32, 8, 8)         
             x = self.decoder(x)
-
         return x

@@ -15,8 +15,12 @@ import torch.nn.functional as F
 
 
 def train_step(model, inputs, targets, loss_fn, optimizer, lossweights=1.0):
+
     preds = model(inputs)
     # residual = targets - preds
+    if preds.dim() == 5 and preds.shape[1] == 1:
+        preds = preds.squeeze(1)
+
     loss = 0.0
     if not (isinstance(lossweights, tuple) or isinstance(lossweights, list)):
         lossweights = [lossweights] * len(loss_fn)
@@ -29,19 +33,24 @@ def train_step(model, inputs, targets, loss_fn, optimizer, lossweights=1.0):
     optimizer.step()
     return loss
 
-
 def test_step(model, inputs, targets, loss_fn, lossweights=1.0):
 
     preds = model(inputs)
-    # residual = targets - preds
-    loss = 0.0
-    if not (isinstance(lossweights, tuple) or isinstance(lossweights, list)):
-        lossweights = [lossweights] * len(loss_fn)
-    for i, loss_function in enumerate(loss_fn):
-        # loss += loss_function(residual, torch.zeros_like(residual)) * lossweights[i]
-        loss += loss_function(preds, targets) * lossweights[i]
-    return loss
+    if preds.dim() == 5 and preds.shape[1] == 1:
+        preds = preds.squeeze(1)  
 
+    loss = 0.0
+
+    if isinstance(loss_fn, (list, tuple)):
+        if not isinstance(lossweights, (list, tuple)):
+            lossweights = [lossweights] * len(loss_fn)
+
+        for i, loss_function in enumerate(loss_fn):
+            loss += loss_function(preds, targets) * lossweights[i]
+    else:
+        loss = loss_fn(preds, targets) * lossweights
+
+    return loss
 
 # 3 TODO: implemmmment one stage GAN https://github.com/zju-vipa/OSGAN
 
@@ -83,37 +92,45 @@ def train(
         for i, (inputs, targets) in enumerate(progress_bar):
             inputs = inputs.to(device)
             targets = targets.to(device)
-
+       
             loss = train_step(model, inputs, targets, loss_fn, optimizer, lossweights=lossweights)
 
-            # Update loss and accuracy
             loss_meter.update(loss.item(), inputs.size(0))
 
-            progress_bar.set_postfix(loss=loss_meter.avg, lr=optimizer.param_groups[0]["lr"])
+            current_lr = (scheduler.get_last_lr()[0]
+                      if scheduler is not None and hasattr(scheduler, "get_last_lr")
+                      else optimizer.param_groups[0]["lr"])
+            
+            progress_bar.set_postfix(loss=loss_meter.avg, lr=current_lr)
 
             if i >= iterations:
                 break
 
-            if scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step()
-
         avg_loss = loss_meter.avg
 
-        if scheduler is not None and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step(avg_loss)
+        if scheduler is not None: 
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(avg_loss)
+            else:
+                scheduler.step()
+        
 
         if avg_loss < best_loss or epoch == 0:
             best_loss = avg_loss
             torch.save(model.state_dict(), Path(savepath) / Path("best_model.pth"))
 
+        log_lr = (scheduler.get_last_lr()[0]
+              if scheduler is not None and hasattr(scheduler, "get_last_lr")
+              else optimizer.param_groups[0]["lr"])
+        
         writer.add_scalar("loss", avg_loss, epoch + 1)
-        writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch + 1)
+
+        writer.add_scalar("lr",   log_lr,   epoch + 1)
 
         if test_loader is not None:
 
             with torch.no_grad():
                 valoss_meter = AverageMeter()
-                # Test step: set the model to inference mode
                 model.eval()
                 progress_bar = tqdm(
                     test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test]", leave=True, total=len(test_loader)
@@ -124,7 +141,6 @@ def train(
 
                     valoss = test_step(model, inputs, targets, loss_fn, lossweights=lossweights)
 
-                    # Update loss and accuracy
                     valoss_meter.update(valoss.item(), inputs.size(0))
 
             progress_bar.set_postfix(loss=valoss_meter.avg)
@@ -401,19 +417,21 @@ def train_unrolled(
 
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} [Training]", leave=True, total=iterations)
 
-        for i, inputs in enumerate(progress_bar):
+        for i, (inputs, targets) in enumerate(progress_bar):
             inputs = inputs.to(device)
+            targets = targets.to(device)
             T_unroll = inputs.shape[1]
             loss = 0.0
             preds = inputs[:, 0, ...]
+
             for t in range(1, T_unroll):
-                preds = model(preds)  # Predict u_{t} from u{t-1}
+                preds = model(preds) 
+                if preds.dim() == 5 and preds.shape[1] == 1:
+                    preds = preds.squeeze(1)
 
-                # Ground truth
-                targets = inputs[:, t, ...]
+                targets_t = targets[:, t, ...]
 
-                # Accumulate loss
-                loss += loss_fn(preds, targets)
+                loss += loss_fn(preds, targets_t)
 
                 # Truncated gradient: detach every k steps
                 if (t % detach_every_k) == 0:
@@ -424,7 +442,6 @@ def train_unrolled(
             loss.backward()
             optimizer.step()
 
-            # Update loss and accuracy
             loss_meter.update(loss.item(), inputs.size(0))
 
             progress_bar.set_postfix(loss=loss_meter.avg, lr=optimizer.param_groups[0]["lr"])
@@ -432,13 +449,13 @@ def train_unrolled(
             if i >= iterations:
                 break
 
-            if scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step()
-
         avg_loss = loss_meter.avg
 
-        if scheduler is not None and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step(avg_loss)
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(avg_loss)
+            else:
+                scheduler.step()
 
         if avg_loss < best_loss or epoch == 0:
             best_loss = avg_loss
@@ -459,20 +476,23 @@ def train_unrolled(
 
                 for i, (inputs, targets) in enumerate(progress_bar):
                     inputs = inputs.to(device)
+                    targets = targets.to(device)
                     T_unroll = inputs.shape[1]
                     valoss = 0.0
                     preds = inputs[:, 0, ...]
+
                     for t in range(1, T_unroll):
                         preds = model(preds)  # Predict u_{t}
-                        # Ground truth
-                        targets = inputs[:, t, ...]
 
-                        # Accumulate loss
-                        valoss += loss_fn(preds, targets)
+                        if preds.dim() == 5 and preds.shape[1] == 1:
+                            preds = preds.squeeze(1)
+                        
+                        targets_t = targets[:, t, ...]
 
-                    valoss = test_step(model, inputs, targets, loss_fn, lossweights=lossweights)
+                        valoss += loss_fn(preds, targets_t)
 
-                    # Update loss and accuracy
+                    valoss = valoss / T_unroll
+
                     valoss_meter.update(valoss.item(), inputs.size(0))
 
             progress_bar.set_postfix(loss=valoss_meter.avg)
@@ -703,3 +723,207 @@ def CoDANO_training(
                 writer.add_scalar("val_physical_loss", physical_loss_meter.avg, epoch + 1)
 
     writer.close()
+
+def train_deeponet(
+    model,
+    dataloader,
+    epochs,
+    optimizer,
+    loss_fn,
+    savepath,
+    test_loader=None,
+    device=None,
+    lossweights=1.0,
+    scheduler=None,
+    iterations=None,
+):
+    os.makedirs(savepath, exist_ok=True)
+    writer = SummaryWriter(savepath)
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") if device is None else device
+    model.to(device)
+
+    best_loss = float("inf")
+    best_val_loss = float("inf")
+
+    if iterations is None:
+        iterations = len(dataloader)
+
+    for epoch in range(epochs):
+        model.train()
+        loss_meter = AverageMeter()
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} [Training]", total=iterations)
+
+        for i, (inputs, timestep, targets) in enumerate(progress_bar):
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            timestep = timestep.to(device)
+
+            loss = train_step_deeponet(model, inputs, timestep, targets, loss_fn, optimizer, lossweights)
+
+            loss_meter.update(loss.item(), inputs.size(0))
+            progress_bar.set_postfix(loss=loss_meter.avg, lr=optimizer.param_groups[0]["lr"])
+
+            if i >= iterations:
+                break
+
+        avg_loss = loss_meter.avg
+
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(avg_loss)
+            else:
+                scheduler.step()
+
+        if avg_loss < best_loss or epoch == 0:
+            best_loss = avg_loss
+            torch.save(model.state_dict(), Path(savepath) / "best_model.pth")
+
+        writer.add_scalar("loss", avg_loss, epoch + 1)
+        writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch + 1)
+
+        # Validation
+        if test_loader is not None:
+            model.eval()
+            val_loss_meter = AverageMeter()
+            val_bar = tqdm(test_loader, desc=f"Epoch {epoch+1}/{epochs} [Validation]", total=len(test_loader))
+
+            with torch.no_grad():
+                for inputs, timestep, targets in val_bar:
+                    inputs = inputs.to(device)
+                    targets = targets.to(device)
+                    timestep = timestep.to(device)
+
+                    val_loss = test_step_deeponet(model, inputs, timestep,targets, loss_fn, lossweights)
+                    val_loss_meter.update(val_loss.item(), inputs.size(0))
+
+            avg_val_loss = val_loss_meter.avg
+            val_bar.set_postfix(val_loss=avg_val_loss)
+
+            if avg_val_loss < best_val_loss or epoch == 0:
+                best_val_loss = avg_val_loss
+                torch.save(model.state_dict(), Path(savepath) / "best_val_model.pth")
+
+            writer.add_scalar("val_loss", avg_val_loss, epoch + 1)
+
+    writer.close()
+
+
+def train_step_deeponet(model, inputs, times, targets, loss_fn, optimizer, lossweights=1.0, gamma = 5.0):
+    device = inputs.device
+    inputs = inputs.to(device)     
+    times = times.to(device)        
+    targets = targets.to(device)  
+
+    preds = model(inputs, times)
+
+
+    if preds.shape != targets.shape:
+        raise ValueError(f"Shape mismatch: preds {preds.shape}, targets {targets.shape}")
+
+    if not isinstance(lossweights, (tuple, list)):
+        lossweights = [lossweights] * len(loss_fn)
+
+    loss = 0.0
+    for i, loss_function in enumerate(loss_fn):
+        loss += loss_function(preds, targets) * lossweights[i]
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    return loss
+
+
+
+@torch.no_grad()
+def test_step_deeponet(model, inputs, times, targets, loss_fn, lossweights=1.0, gamma=5.0, time_weighted=False):
+    device = inputs.device
+    inputs = inputs.to(device)
+    times = times.to(device)
+    targets = targets.to(device)
+
+    preds = model(inputs, times)
+
+    if preds.shape != targets.shape:
+        raise ValueError(f"Shape mismatch: preds {preds.shape}, targets {targets.shape}")
+    
+    if isinstance(loss_fn, (list, tuple)):
+        if not isinstance(lossweights, (list, tuple)):
+            lossweights = [lossweights] * len(loss_fn)
+        loss = sum(loss_fn[i](preds, targets) * lossweights[i] for i in range(len(loss_fn)))
+    else:
+        loss = loss_fn(preds, targets) * lossweights
+
+    return loss
+
+def train_warmup(
+    model,
+    dataloader,
+    epochs,
+    optimizer,
+    loss_fn,
+    savepath,
+    test_loader=None,
+    device=None,
+    lossweights=1.0,
+    scheduler=None,
+    iterations=None,
+):
+    """
+    Training loop variant for AE using Cosine_WarmUp.
+    Stepped smoothly each batch with fractional epoch increments.
+    """
+
+    os.makedirs(savepath, exist_ok=True)
+    writer = SummaryWriter(savepath)
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") if device is None else device
+    model.to(device)
+
+    best_loss = float("inf")
+    best_val_loss = float("inf")
+
+    if iterations is None:
+        iterations = len(dataloader)
+
+    for epoch in range(epochs):
+        model.train()
+        loss_meter = AverageMeter()
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} [Training]", leave=True, total=iterations)
+
+        for i, (inputs, targets) in enumerate(progress_bar):
+            inputs, targets = inputs.to(device), targets.to(device)
+            loss = train_step(model, inputs, targets, loss_fn, optimizer, lossweights=lossweights)
+
+            if scheduler is not None:
+                scheduler.step()
+
+            loss_meter.update(loss.item(), inputs.size(0))
+            progress_bar.set_postfix(loss=loss_meter.avg, lr=optimizer.param_groups[0]["lr"])
+
+            if i >= iterations:
+                break
+
+        avg_loss = loss_meter.avg
+
+        if avg_loss < best_loss or epoch == 0:
+            best_loss = avg_loss
+            torch.save(model.state_dict(), Path(savepath) / "best_model.pth")
+
+        writer.add_scalar("loss", avg_loss, epoch + 1)
+        writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch + 1)
+
+        if test_loader is not None:
+            with torch.no_grad():
+                model.eval()
+                val_meter = AverageMeter()
+                for vinputs, vtargets in tqdm(test_loader, desc=f"[Val epoch {epoch+1}]"):
+                    vinputs, vtargets = vinputs.to(device), vtargets.to(device)
+                    vloss = test_step(model, vinputs, vtargets, loss_fn, lossweights=lossweights)
+                    val_meter.update(vloss.item(), vinputs.size(0))
+
+            avg_val = val_meter.avg
+            if avg_val < best_val_loss or epoch == 0:
+                best_val_loss = avg_val
+                torch.save(model.state_dict(), Path(savepath) / "best_val_model.pth")
+            writer.add_scalar("val_loss", avg_val, epoch + 1)

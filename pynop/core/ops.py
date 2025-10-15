@@ -703,7 +703,7 @@ class FiniteDifferenceConvolution(nn.Module):
 
     """
 
-    def __init__(self, in_channels, out_channels, n_dim=2, kernel_size=3, groups=1, padding="same"):
+    def __init__(self, in_channels, out_channels, n_dim=2, kernel_size=3, groups=1, padding="same", grid_width = 1.0):
 
         super().__init__()
 
@@ -715,12 +715,13 @@ class FiniteDifferenceConvolution(nn.Module):
         self.groups = groups
         self.n_dim = n_dim
         self.padding = padding
+        self.grid_width = grid_width
 
         self.weights = torch.rand((out_channels, in_channels // groups, kernel_size, kernel_size))
-        k = torch.sqrt(groups / (in_channels * kernel_size**2))
+        k = math.sqrt(groups / (in_channels * kernel_size**2))
         self.weights = self.weights * 2 * k - k
 
-    def forward(self, x, grid_width):
+    def forward(self, x):
         """FiniteDifferenceConvolution's forward pass.
 
         Parameters
@@ -731,7 +732,10 @@ class FiniteDifferenceConvolution(nn.Module):
             discretization size of input grid
         """
 
+        weights = (self.weights - torch.mean(self.weights)) / self.grid_width
+        weights = weights.to(x.device)
+
         x = self.conv_function(
-            x, (self.weights - torch.mean(self.weights)) / grid_width, groups=self.groups, padding=self.padding
+            x, weights, groups=self.groups, padding=self.padding
         )
         return x

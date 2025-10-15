@@ -513,6 +513,7 @@ class ConvFNOBlock(nn.Module):
         self.resampling = resampling
         self.nconv = nconv
         self.grid_width = grid_width
+        self.final_activation = nn.Sigmoid()
 
         if self.resampling is not None:
             if self.resampling == "up":
@@ -555,18 +556,28 @@ class ConvFNOBlock(nn.Module):
         for i in range(nconv):
             in_ch = in_channels if i == 0 else hidden_channels
             out_ch = out_channels if i == nconv - 1 else hidden_channels
+            # self.conv.append(
+                # FiniteDifferenceLayer(
+                #     in_channels=in_ch,
+                #     out_channels=out_ch,
+                #     kernel_size=kernel_size,
+                #     stride=1,
+                #     padding="same",
+                #     norm=normalization,
+                #     activation=activation,
+                #     grid_width=self.grid_width * self.scaling,
+                # )
             self.conv.append(
-                FiniteDifferenceLayer(
-                    in_channels=in_ch,
-                    out_channels=out_ch,
-                    kernel_size=kernel_size,
-                    stride=1,
-                    padding="same",
-                    norm=normalization,
-                    activation=activation,
-                    grid_width=self.grid_width * self.scaling,
-                )
-            )
+                    FiniteDifferenceConvolution(
+                        in_channels=in_ch,
+                        out_channels=out_ch,
+                        kernel_size=kernel_size,
+                        padding="same",
+                        grid_width = 1.0 / 128  
+                    )
+)
+
+            
 
         # Shortcut Branch Layer
         # 1x1 Conv to potentially change input channels to output channels
@@ -598,6 +609,8 @@ class ConvFNOBlock(nn.Module):
 
         if self.activation is not None:
             x = self.activation(x)
+        
+        x = self.final_activation(x)
 
         return x
 
