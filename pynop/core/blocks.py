@@ -1154,8 +1154,7 @@ class DIT(nn.Module):
 
 class MLPBlock(nn.Module):
     """
-    A small MLP that takes a normalized 1D coordinate (real) and
-    produces (complex) values for a set of basis functions.
+    A small MLP that produces (complex) values for a set of basis functions.
     """
 
     def __init__(self, in_ch, out_ch, hidden_dim=64, num_layers=2, activation=nn.GELU, norm=nn.LayerNorm, dropout=0.0):
@@ -1215,13 +1214,66 @@ class MLPBlock(nn.Module):
         return complex_output
 
 
+class Linear1x1Conv(nn.Module):
+    """
+    Linear layers implemented with 1x1 convolutions
+    Input/Output format: (B, C, H, W).
+    """
+
+    def __init__(self, in_ch, out_ch, hidden_dim=64, num_layers=2, activation=nn.GELU, norm=nn.LayerNorm):
+        """
+        Initializes the MLP.
+        Args:
+            n_dim (int): Dimension of the input coordinates (default: 2).
+            Note: the kernel can be made non linear by using an input with the evaluation of the funciton at the coordinates.
+            num_modes (int): Number of modes to learn.
+            hidden_dim (int): Hidden dimension of the MLP.
+            num_layers (int): Number of hidden layers in the MLP.
+            activation (callable): Activation function to use (default: nn.GELU).
+            norm (callable): Normalization layer to use (default: nn.LayerNorm).
+            dropout (float): Dropout rate (default 0.0).
+        """
+        super().__init__()
+        self.out_ch = out_ch
+
+        layers = []
+
+        layers.append(nn.Conv2d(in_ch, hidden_dim, kernel_size=1))
+        if norm is not None:
+            layers.append(norm(hidden_dim))
+        if activation is not None:
+            layers.append(activation())  # Or ReLU, LeakyReLU, etc.
+
+        for _ in range(num_layers - 1):
+            layers.append(nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1))
+            if norm is not None:
+                layers.append(norm(hidden_dim))
+            if activation is not None:
+                layers.append(activation())
+
+        # The last layer produces 2 * num_modes real values (for real and imaginary parts)
+        layers.append(nn.Conv2d(hidden_dim, 2 * out_ch, kernel_size=1))
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        # x: (B, 2 + C_in, H_basis, W_basis)
+        out = self.net(x)  # (B, 2*m1*m2, H_basis, W_basis)
+
+        # Split Real and Imaginary parts (along the channel dimension)
+        out_real = out[:, : self.out_ch, :, :]
+        out_imag = out[:, self.out_ch :, :, :]
+
+        return torch.complex(out_real, out_imag)
+
+
 class LITBlock(nn.Module):
     """
-    Coninuous Linear Integral Transform Block (CLITBlock) is a
+    Linear Integral Transform Block (LITBlock) is a
     PyTorch module for a learned 2D integral transform that is resolution-invariant.
     The transform bases are learned as continuous functions via MLPs.
+    This is the separable kernels implementation
     Inspired by IAE-NET: INTEGRAL AUTOENCODERS FOR DISCRETIZATION-INVARIANT LEARNING
-
     """
 
     def __init__(
@@ -1373,12 +1425,140 @@ class LITBlock(nn.Module):
         return output
 
 
+class LITBlockv2(nn.Module):
+    """
+    Linear Integral Transform Block (LITBlock) is a
+    PyTorch module for a learned 2D integral transform that is resolution-invariant.
+    The transform bases are learned as continuous functions via MLPs.
+    This is the non-separable kernels implementation
+    Inspired by IAE-NET: INTEGRAL AUTOENCODERS FOR DISCRETIZATION-INVARIANT LEARNING
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        m1,
+        m2,
+        mlp_hidden_dim=64,
+        mlp_num_layers=2,
+        activation=nn.GELU,
+        norm=LayerNorm2d,
+    ):
+        """
+        Initializes the module.
+
+        Args:
+            in_channels (int): Number of input channels (C).
+            m1 (int): Number of modes to keep for the height dimension (u).
+            m2 (int): Number of modes to keep for the width dimension (v).
+            resampling: "down" or "up": resample the output by a factor 2.
+            mlp_hidden_dim (int): Hidden dimension of the MLPs learning the bases.
+            mlp_num_layers (int): Number of hidden layers in the MLPs learning the bases.
+        """
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.m1 = m1  # Number of modes kept in height (u)
+        self.m2 = m2  # Number of modes kept in width (v)
+
+        # The bases are MLPs that generate the basis values.
+        # These MLPs are the learnable parameters.
+        self.mlp = MLPBlock(
+            out_ch=self.m1 * self.m2,
+            in_ch=2,
+            hidden_dim=mlp_hidden_dim,
+            num_layers=mlp_num_layers,
+            activation=activation,
+        )
+
+        # Learned parameters for multiplication in the transformed space (per channel).
+        self.learned_weights = nn.Parameter(
+            torch.randn(self.in_channels, out_channels, self.m1, self.m2, dtype=torch.cfloat)
+        )
+        # Initialization of learned_weights for a good starting point (e.g., all to 1+0j)
+        nn.init.constant_(self.learned_weights, 1.0)
+
+        self.mixer = nn.Conv2d(
+            in_channels=out_channels,
+            out_channels=out_channels,
+            kernel_size=1,
+            stride=1,
+            bias=True,
+        )
+        # Activation & normalization
+        self.activation = activation()
+        if norm is not None:
+            self.norm = norm(out_channels)
+        else:
+            self.norm = None
+
+        # Shortcut Branch Layer
+        # 1x1 Conv to potentially change input channels to output channels
+        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        """
+        Performs the forward pass of the module for variable resolution input.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W).
+                                H and W may vary.
+
+        Returns:
+            torch.Tensor: Output tensor of shape (B, C, H, W), real part.
+        """
+        B, C, H, W = x.shape
+
+        # Convert input to complex numbers if it is real
+        xc = torch.complex(x, torch.zeros_like(x)) if not x.is_complex() else x
+
+        # if self.resample == "down":
+        # elif self.resample == "up":
+        # else:
+        h_coords = torch.linspace(0, 1, H, device=x.device).unsqueeze(1).repeat(1, W)
+        w_coords = torch.linspace(0, 1, W, device=x.device).unsqueeze(0).repeat(H, 1)
+        coords_2d = torch.stack([h_coords, w_coords], dim=-1).unsqueeze(0).repeat(B, 1, 1, 1)  # (B, H, W, 2)
+        coords_2d = coords_2d.view(B * H * W, 2)
+
+        encoder_basis = self.mlp(coords_2d)  # (B*H*W, m1*m2)
+
+        # 4. Reshape kernels for Einsum
+        encoder_basis = encoder_basis.view(B, H, W, self.m1, self.m2)
+
+        # Einsum: (B, C_in, H, W) @ (B, H, W, m1, m2) -> (B, C_in, m1, m2)
+        xhat = torch.einsum("bchw,bhwmn->bcmn", xc, encoder_basis)  # "Spectral" representation
+
+        # Multiply by learned weigths in transformed space
+        xhat = torch.einsum("bixy,oixy->boxy", xhat, self.learned_weights)
+
+        # ---2D Inverse Transform ---
+        # Einsum: (B, C_out, m1, m2) @ (B, m1, m2, H_out, W_out)* -> (B, C_out, H_out, W_out)
+        # We use .conj() for the inverse (adjoint) operation.
+        x_rec = torch.einsum("bcmn,bhwmn->bchw", xhat, encoder_basis.conj())
+
+        # Normalization
+        x_rec = x_rec.real * (1.0 / (H * W))
+
+        # Mixing channels
+        output = self.mixer(x_rec)
+        output = self.norm(output) if self.norm is not None else output
+        output = self.activation(output)
+
+        # Shortcut connection
+        output = output + self.shortcut(x)
+        output = self.activation(output)
+
+        return output
+
+
 class NLITBlock(nn.Module):
     """
     Non Linear Integral Transform Block (SNLITBlock) is a
     PyTorch module for a learned 2D non linear integral transform that is resolution-invariant.
-    The kernel is learned as a function of the input coordinates and values.
-    The transform bases are learned as continuous functions via MLPs.
+    The kernels are assumed to be separable in space and
+    are learned as a function of the input coordinates and values.
     Inspired by IAE-NET: INTEGRAL AUTOENCODERS FOR DISCRETIZATION-INVARIANT LEARNING
 
     """
@@ -1483,7 +1663,7 @@ class NLITBlock(nn.Module):
         w_input = torch.cat([x_w, w_coords], dim=-1)
         # Flatten for MLP input: (B*H*W, Cin + 1)
         # w_input = w_input.view(-1, channels + 1) not needed
-        # Generate basis values for W: (B*H*W, m2)
+        # Generate basis values for W: (B, H, W, m2)
         w_basis_runtime = self.basis_w_fn(w_input)
         # Reshape to (B, H, W, m2)
         # w_basis_runtime = w_basis_runtime.view(batch_size, H, W, self.m2)
@@ -1580,7 +1760,179 @@ class NLITBlock(nn.Module):
         return output
 
 
-class NRNLITBlock(nn.Module):
+class NLITBlockv2(nn.Module):
+    """NLITBlockv2 is a PyTorch module implementing a Non Linear Integral Transform Block for learned 2D non-linear
+    integral transforms that are resolution-invariant.
+
+    This block learns kernels K(u, v, x, y, f(x, y)) as a function of input coordinates (x, y) and values (f(x, y)),
+    Then it perfoms a multiplicaiton by a learned weigth in the transformed space and use conjugate kernels to go back to original space
+    During the inverse transform, it is possible to resample the image by a factor 2 (up or down)
+
+    inspired by IAE-NET: INTEGRAL AUTOENCODERS FOR DISCRETIZATION-INVARIANT LEARNING.
+
+        in_channels (int): Number of input channels.
+        out_channels (int): Number of output channels.
+        mlp_hidden_dim (int, optional): Hidden dimension of the MLPs learning the bases. Default is 64.
+        mlp_num_layers (int, optional): Number of hidden layers in the MLPs learning the bases. Default is 2.
+        activation (callable, optional): Activation function to use. Default is nn.GELU.
+        norm (callable, optional): Normalization layer to use. Default is LayerNorm2d.
+        resampling (str, optional): If "down" or "up", resample the output by a factor of 2. Default is None.
+        dim (int, optional): Dimensionality of the transform (default is 2 for 2d problems).
+
+    Attributes:
+        basis_generator: Module to generate learned basis functions from input coordinates and values.
+        learned_weights: Learnable parameters for multiplication in the transformed space.
+        mixer: 1x1 convolution for mixing output channels.
+        activation: Activation function.
+        norm: Normalization layer.
+        shortcut: 1x1 convolution for shortcut connection.
+
+    Forward Args:
+        x (torch.Tensor): Input tensor of shape (B, C, H, W), where H and W may vary.
+
+    Forward Returns:
+        torch.Tensor: Output tensor of shape (B, out_channels, H, W) (real part)
+
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        m1,
+        m2,
+        mlp_hidden_dim=64,
+        mlp_num_layers=2,
+        activation=nn.GELU,
+        norm=LayerNorm2d,
+        resampling=None,
+        dim=2,
+    ):
+
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.m1 = m1  # Number of modes kept in height (u)
+        self.m2 = m2  # Number of modes kept in width (v)
+        self.resampling = resampling
+
+        # We use faster 1x1conv layers instead of nn.Linear to implement the linear layers
+        self.basis_generator = Linear1x1Conv(
+            out_ch=self.m1 * self.m2,
+            in_ch=2 + in_channels,
+            hidden_dim=mlp_hidden_dim,
+            num_layers=mlp_num_layers,
+            activation=activation,
+        )
+
+        # Learned parameters for multiplication in the transformed space (per channel).
+        self.learned_weights = nn.Parameter(
+            torch.randn(self.in_channels, out_channels, self.m1, self.m2, dtype=torch.cfloat)
+        )
+        # Initialization of learned_weights for a good starting point (e.g., all to 1+0j)
+        nn.init.constant_(self.learned_weights, 1.0)
+
+        self.mixer = nn.Conv2d(
+            in_channels=out_channels,
+            out_channels=out_channels,
+            kernel_size=1,
+            stride=1,
+            bias=True,
+        )
+        # Activation & normalization
+        self.activation = activation()
+        if norm is not None:
+            self.norm = norm(out_channels)
+        else:
+            self.norm = None
+
+        # Shortcut Branch Layer
+        # 1x1 Conv to potentially change input channels to output channels
+        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        """
+        Performs the forward pass of the module for variable resolution input.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W).
+                                H and W may vary.
+
+        Returns:
+            torch.Tensor: Output tensor of shape (B, C, H_out, W_out), real part.
+        """
+        B, C, H, W = x.shape
+
+        if self.resampling == "up":
+            H_basis, W_basis = H * 2, W * 2
+            x_cond = F.interpolate(x, size=(H_basis, W_basis), mode="bilinear", align_corners=False)
+        else:
+            H_basis, W_basis = H, W
+            x_cond = x
+
+        h_coords_map = torch.linspace(0, 1, H_basis, device=x.device).view(1, H_basis, 1).repeat(1, 1, W_basis)
+        w_coords_map = torch.linspace(0, 1, W_basis, device=x.device).view(1, 1, W_basis).repeat(1, H_basis, 1)
+        coords_2d_base = torch.cat([h_coords_map, w_coords_map], dim=0)
+        # coords_2d: (B, 2, H_basis, W_basis). Add the batch dimension.
+        coords_2d = coords_2d_base.unsqueeze(0).repeat(B, 1, 1, 1)  # B C H W
+
+        x_in = torch.cat([coords_2d, x_cond], dim=1)  # (B, 2+cin, H, W)
+
+        # 3. Generate kernels
+        encoder_basis = self.basis_generator(x_in)  # (B, m1*m2, H, W)
+
+        # 4. Reshape kernels for Einsum
+        # encoder_basis = encoder_basis.view(B, H_basis, W_basis, self.m1, self.m2)
+        encoder_basis = encoder_basis.view(B, self.m1, self.m2, H_basis, W_basis)
+
+        if self.resampling == "up":
+            # Subsample the generated basis back to H_in x W_in (taking every second point)
+            fwd_basis = encoder_basis[:, :, :, ::2, ::2]
+        else:
+            fwd_basis = encoder_basis
+
+        # Convert input to complex numbers if it is real
+        xc = torch.complex(x, torch.zeros_like(x)) if not x.is_complex() else x
+        # Einsum: (B, C_in, H, W) @ (B, H, W, m1, m2) -> (B, C_in, m1, m2)
+        xhat = torch.einsum("bchw,bmnhw->bcmn", xc, fwd_basis)  # "Spectral" representation
+
+        # Multiply by learned weigths in transformed space
+        xhat = torch.einsum("bixy,oixy->boxy", xhat, self.learned_weights)
+
+        # ---2D Inverse Transform ---
+        if self.resampling == "down":
+            # Subsample the basis generated at H_in x W_in (H_basis) to H/2 x W/2 (every second point)
+            inv_basis = encoder_basis[:, :, :, ::2, ::2]
+            H_out, W_out = H // 2, W // 2
+        else:
+            # Use the full generated basis (H_in x W_in or H_out x W_out)
+            inv_basis = encoder_basis
+            H_out, W_out = H_basis, W_basis
+
+        # Einsum: (B, C_out, m1, m2) @ (B, m1, m2, H_out, W_out)* -> (B, C_out, H_out, W_out)
+        # We use .conj() for the inverse (adjoint) operation.
+        x_rec = torch.einsum("bcmn,bmnhw->bchw", xhat, inv_basis.conj())
+
+        # Normalization
+        x_rec = x_rec.real * (1.0 / (H_out * W_out))
+
+        # Mixing channels
+        output = self.mixer(x_rec)
+        output = self.norm(output) if self.norm is not None else output
+        output = self.activation(output)
+
+        # Shortcut connection
+        if self.resampling == "up" or self.resampling == "down":
+            x = F.interpolate(x, size=(H_out, W_out), mode="bilinear")
+
+        output = output + self.shortcut(x)
+        output = self.activation(output)
+
+        return output
+
+
+class IAETBlock(nn.Module):
     """
     Non Reversible Non Linear Integral Transform Block is a
     PyTorch module for a learned 2D non linear integral transform that is resolution-invariant.
@@ -1663,7 +2015,7 @@ class NRNLITBlock(nn.Module):
         self.learned_weights_freq = nn.Parameter(
             torch.randn(self.in_channels, out_channels, self.m1, self.m2, dtype=torch.cfloat)
         )
-        # Optional: Initialization of learned_weights_freq for a good starting point (e.g., all to 1.0)
+        # Initialization of learned_weights_freq
         nn.init.constant_(self.learned_weights_freq, 1.0)  # Initialize to 1+0j
 
         self.mixer = nn.Conv2d(

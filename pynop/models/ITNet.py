@@ -7,7 +7,9 @@ from pynop.core.norm import LayerNorm2d
 from pynop.core.blocks import LITBlock
 
 
-class CITNet(nn.Module):
+class LITNet(nn.Module):
+    """Learned Integral Transform Network"""
+
     def __init__(
         self,
         in_channels: int,
