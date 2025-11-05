@@ -341,7 +341,7 @@ class GRN(nn.Module):
 
 class TuckerSpectralConv2d(nn.Module):
     """
-    convolution spectrale 2D avec factorisation de Tucker (Paramètres Complexes).
+    convolution spectrale 2D avec factorisation de Tucker.
     Les facteurs de Tucker (U, V, S, G) sont des tenseurs complexes.
     Le nombres de paramètres est égal à (Cin * r1 + Cout * r2 + (modesx * modesy) * r3 + r1 * r2 * r3)
     vs  (Cin * Cout * modes_x * modes_y sans factorisation
@@ -350,6 +350,7 @@ class TuckerSpectralConv2d(nn.Module):
     r2 = Cout / k
     r3 = modes_x * modes_y / k'
     avec k & k' les facteurs de réduction souhaités (2, 4 etc)
+    où encore r1 = r2 = r3 = min(Cin, Cout, modes_x * modes_y)
     Parameters:
     in_channels (int): Nombre de canaux d'entrée.
     out_channels (int): Nombre de canaux de sortie.
@@ -413,10 +414,10 @@ class TuckerSpectralConv2d(nn.Module):
                 f"for input spatial size ({H}, {W}). modes_y must be <= W//2 + 1."
             )
 
-        # 1. FFT -> domaine spectral (x_ft est complexe)
+        # 1. FFT -> domaine spectral
         x_ft = torch.fft.rfft2(x, dim=(-2, -1), norm="ortho")  # (B, C_in, H, W//2 + 1), cfloat
 
-        # 2. Sélection des modes bas (garde les dimensions mx, my)
+        # 2. Sélection des modes bas
         x_ft_low_modes = x_ft[:, :, : self.modes_x, : self.modes_y]  # (B, C_in, mx, my), cfloat
 
         # 3. Reconstruire les poids spectraux W_hat
@@ -431,7 +432,7 @@ class TuckerSpectralConv2d(nn.Module):
 
         # 5. Zero-padding
         out_ft = torch.zeros(batchsize, self.out_channels, H, W // 2 + 1, dtype=torch.cfloat, device=device)
-        out_ft[:, :, : self.modes_x, : self.modes_y] = y_ft_low_modes  # Copie de tenseurs complexes
+        out_ft[:, :, : self.modes_x, : self.modes_y] = y_ft_low_modes
 
         # 6. Retour au domaine spatial
         y = torch.fft.irfft2(
