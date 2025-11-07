@@ -1267,7 +1267,7 @@ class Linear1x1Conv(nn.Module):
         return torch.complex(out_real, out_imag)
 
 
-class LITBlock(nn.Module):
+class SepLITBlock(nn.Module):
     """
     Linear Integral Transform Block (LITBlock) is a
     PyTorch module for a learned 2D integral transform that is resolution-invariant.
@@ -1425,7 +1425,7 @@ class LITBlock(nn.Module):
         return output
 
 
-class LITBlockv2(nn.Module):
+class LITBlock(nn.Module):
     """
     Linear Integral Transform Block (LITBlock) is a
     PyTorch module for a learned 2D integral transform that is resolution-invariant.
@@ -1553,7 +1553,7 @@ class LITBlockv2(nn.Module):
         return output
 
 
-class NLITBlock(nn.Module):
+class SepNLITBlock(nn.Module):
     """
     Non Linear Integral Transform Block (SNLITBlock) is a
     PyTorch module for a learned 2D non linear integral transform that is resolution-invariant.
@@ -1760,12 +1760,12 @@ class NLITBlock(nn.Module):
         return output
 
 
-class NLITBlockv2(nn.Module):
-    """NLITBlockv2 is a PyTorch module implementing a Non Linear Integral Transform Block for learned 2D non-linear
+class NLITBlock(nn.Module):
+    """NLITBlock is a PyTorch module implementing a Non Linear Integral Transform Block for learned 2D non-linear
     integral transforms that are resolution-invariant.
 
     This block learns kernels K(u, v, x, y, f(x, y)) as a function of input coordinates (x, y) and values (f(x, y)),
-    Then it perfoms a multiplicaiton by a learned weigth in the transformed space and use conjugate kernels to go back to original space
+    Then it perfoms a multiplication by a learned weigth in the transformed space and use conjugate kernels to go back to original space
     During the inverse transform, it is possible to resample the image by a factor 2 (up or down)
 
     inspired by IAE-NET: INTEGRAL AUTOENCODERS FOR DISCRETIZATION-INVARIANT LEARNING.
@@ -1817,7 +1817,8 @@ class NLITBlockv2(nn.Module):
         self.m2 = m2  # Number of modes kept in width (v)
         self.resampling = resampling
 
-        # We use faster 1x1conv layers instead of nn.Linear to implement the linear layers
+        # We use faster 1x1conv layers instead of nn.Linear to implement the linear layer
+        # to generate the basis functions from input coordinates and values.
         self.basis_generator = Linear1x1Conv(
             out_ch=self.m1 * self.m2,
             in_ch=2 + in_channels,
@@ -1899,6 +1900,188 @@ class NLITBlockv2(nn.Module):
 
         # Multiply by learned weigths in transformed space
         xhat = torch.einsum("bixy,oixy->boxy", xhat, self.learned_weights)
+
+        # ---2D Inverse Transform ---
+        if self.resampling == "down":
+            # Subsample the basis generated at H_in x W_in (H_basis) to H/2 x W/2 (every second point)
+            inv_basis = encoder_basis[:, :, :, ::2, ::2]
+            H_out, W_out = H // 2, W // 2
+        else:
+            # Use the full generated basis (H_in x W_in or H_out x W_out)
+            inv_basis = encoder_basis
+            H_out, W_out = H_basis, W_basis
+
+        # Einsum: (B, C_out, m1, m2) @ (B, m1, m2, H_out, W_out)* -> (B, C_out, H_out, W_out)
+        # We use .conj() for the inverse (adjoint) operation.
+        x_rec = torch.einsum("bcmn,bmnhw->bchw", xhat, inv_basis.conj())
+
+        # Normalization
+        x_rec = x_rec.real * (1.0 / (H_out * W_out))
+
+        # Mixing channels
+        output = self.mixer(x_rec)
+        output = self.norm(output) if self.norm is not None else output
+        output = self.activation(output)
+
+        # Shortcut connection
+        if self.resampling == "up" or self.resampling == "down":
+            x = F.interpolate(x, size=(H_out, W_out), mode="bilinear")
+
+        output = output + self.shortcut(x)
+        output = self.activation(output)
+
+        return output
+
+
+class AttentionITBlock(nn.Module):
+    """AttentionITBlock is a PyTorch module implementing a Non Linear Integral Transform Block for learned 2D non-linear
+    integral transforms that are resolution-invariant.
+
+    This block learns complex kernels K(u, v, x, y, f(x, y)) as a function of input coordinates (x, y) and values (f(x, y)),
+    1 - It transforms the input into a learned space using these kernels.
+    2 - It apply a self-attention layer in the transformed space (complex attention).
+    3 - It transforms back to the original space using conjugate kernels.
+    4 - It mixes the output channels and add a shortcut connection.
+    5 - A final Normalization and activation are applied
+    During the inverse transform, it is possible to resample the image by a factor 2 (up or down)
+
+    inspired by IAE-NET: INTEGRAL AUTOENCODERS FOR DISCRETIZATION-INVARIANT LEARNING.
+
+        in_channels (int): Number of input channels.
+        out_channels (int): Number of output channels.
+        mlp_hidden_dim (int, optional): Hidden dimension of the MLPs learning the bases. Default is 64.
+        mlp_num_layers (int, optional): Number of hidden layers in the MLPs learning the bases. Default is 2.
+        num_hads (int): Number of attention heads in the complex attention block
+        activation (callable, optional): Activation function to use. Default is nn.GELU.
+        norm (callable, optional): Normalization layer to use. Default is LayerNorm2d.
+        resampling (str, optional): If "down" or "up", resample the output by a factor of 2. Default is None.
+        dim (int, optional): Dimensionality of the transform (default is 2 for 2d problems).
+
+    Attributes:
+        basis_generator: Module to generate learned basis functions from input coordinates and values.
+        learned_weights: Learnable parameters for multiplication in the transformed space.
+        mixer: 1x1 convolution for mixing output channels.
+        activation: Activation function.
+        norm: Normalization layer.
+        shortcut: 1x1 convolution for shortcut connection.
+
+    Forward Args:
+        x (torch.Tensor): Input tensor of shape (B, C, H, W), where H and W may vary.
+
+    Forward Returns:
+        torch.Tensor: Output tensor of shape (B, out_channels, H, W) (real part)
+
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        m1,
+        m2,
+        mlp_hidden_dim=64,
+        mlp_num_layers=2,
+        num_heads=4,
+        activation=nn.GELU,
+        norm=LayerNorm2d,
+        resampling=None,
+        dim=2,
+    ):
+
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.m1 = m1  # Number of modes kept in height (u)
+        self.m2 = m2  # Number of modes kept in width (v)
+        self.resampling = resampling
+
+        # We use faster 1x1conv layers instead of nn.Linear to implement the linear layer
+        # to generate the basis functions from input coordinates and values.
+        self.basis_generator = Linear1x1Conv(
+            out_ch=self.m1 * self.m2,
+            in_ch=2 + in_channels,
+            hidden_dim=mlp_hidden_dim,
+            num_layers=mlp_num_layers,
+            activation=activation,
+        )
+
+        # Self-Attention block in the transformed space
+        self.attention = ComplexAttention(
+            in_ch=2 + in_channels,
+            out_ch=out_channels,
+            num_heads=num_heads,
+        )
+
+        self.mixer = nn.Conv2d(
+            in_channels=out_channels,
+            out_channels=out_channels,
+            kernel_size=1,
+            stride=1,
+            bias=True,
+        )
+        # Activation & normalization
+        self.activation = activation()
+        if norm is not None:
+            self.norm = norm(out_channels)
+        else:
+            self.norm = None
+
+        # Shortcut Branch Layer
+        # 1x1 Conv to potentially change input channels to output channels
+        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        """
+        Performs the forward pass of the module for variable resolution input.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W).
+                                H and W may vary.
+
+        Returns:
+            torch.Tensor: Output tensor of shape (B, C, H_out, W_out), real part.
+        """
+        B, C, H, W = x.shape
+
+        if self.resampling == "up":
+            H_basis, W_basis = H * 2, W * 2
+            x_cond = F.interpolate(x, size=(H_basis, W_basis), mode="bilinear", align_corners=False)
+        else:
+            H_basis, W_basis = H, W
+            x_cond = x
+
+        h_coords_map = torch.linspace(0, 1, H_basis, device=x.device).view(1, H_basis, 1).repeat(1, 1, W_basis)
+        w_coords_map = torch.linspace(0, 1, W_basis, device=x.device).view(1, 1, W_basis).repeat(1, H_basis, 1)
+        coords_2d_base = torch.cat([h_coords_map, w_coords_map], dim=0)
+        # coords_2d: (B, 2, H_basis, W_basis). Add the batch dimension.
+        coords_2d = coords_2d_base.unsqueeze(0).repeat(B, 1, 1, 1)  # B C H W
+
+        x_in = torch.cat([coords_2d, x_cond], dim=1)  # (B, 2+cin, H, W)
+
+        # 3. Generate kernels
+        encoder_basis = self.basis_generator(x_in)  # (B, m1*m2, H, W)
+
+        # 4. Reshape kernels for Einsum
+        # encoder_basis = encoder_basis.view(B, H_basis, W_basis, self.m1, self.m2)
+        encoder_basis = encoder_basis.view(B, self.m1, self.m2, H_basis, W_basis)
+
+        if self.resampling == "up":
+            # Subsample the generated basis back to H_in x W_in (taking every second point)
+            fwd_basis = encoder_basis[:, :, :, ::2, ::2]
+        else:
+            fwd_basis = encoder_basis
+
+        # Convert input to complex numbers if it is real
+        xc = torch.complex(x, torch.zeros_like(x)) if not x.is_complex() else x
+        # Einsum: (B, C_in, H, W) @ (B, H, W, m1, m2) -> (B, C_in, m1, m2)
+        xhat = torch.einsum("bchw,bmnhw->bcmn", xc, fwd_basis)  # "Spectral" representation
+
+        # Attention in transformed space (uses comple conv2D)
+        xhat = xhat.permute(0, 2, 3, 1).view(-1, 2 + C)  # (B, m1, m2, C_in)
+        xhat = self.attention(xhat)
+        xhat = xhat.permute(0, 3, 1, 2)  # (B, C_out, m1, m2)
+        xhat = xhat.view(B, self.out_channels, self.m1, self.m2)
 
         # ---2D Inverse Transform ---
         if self.resampling == "down":
