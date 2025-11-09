@@ -2020,7 +2020,7 @@ class AttentionITBlock(nn.Module):
             stride=1,
             bias=True,
         )
-        # Activation & normalization
+        # Activation & normalization in physical space (-> real values)
         self.activation = activation()
         if norm is not None:
             self.norm = norm(out_channels)
@@ -2077,9 +2077,9 @@ class AttentionITBlock(nn.Module):
         # Einsum: (B, C_in, H, W) @ (B, H, W, m1, m2) -> (B, C_in, m1, m2)
         xhat = torch.einsum("bchw,bmnhw->bcmn", xc, fwd_basis)  # "Spectral" representation
 
-        # Attention in transformed space (uses comple conv2D)
+        # Attention in transformed space (uses complex attnetion)
         xhat = xhat.permute(0, 2, 3, 1).view(-1, 2 + C)  # (B, m1, m2, C_in)
-        xhat = self.attention(xhat)
+        xhat = self.attention(xhat, xhat, xhat)
         xhat = xhat.permute(0, 3, 1, 2)  # (B, C_out, m1, m2)
         xhat = xhat.view(B, self.out_channels, self.m1, self.m2)
 
