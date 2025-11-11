@@ -1985,6 +1985,7 @@ class AttentionITBlock(nn.Module):
         activation=nn.GELU,
         norm=LayerNorm2d,
         resampling=None,
+        pos_encoding_dims=2,
         dim=2,
     ):
 
@@ -1995,6 +1996,8 @@ class AttentionITBlock(nn.Module):
         self.m1 = m1  # Number of modes kept in height (u)
         self.m2 = m2  # Number of modes kept in width (v)
         self.resampling = resampling
+
+        self.PE = nn.Parameter(torch.randn(1, pos_encoding_dims, m1, m2))
 
         # We use faster 1x1conv layers instead of nn.Linear to implement the linear layer
         # to generate the basis functions from input coordinates and values.
@@ -2008,7 +2011,7 @@ class AttentionITBlock(nn.Module):
 
         # Self-Attention block in the transformed space
         self.attention = ComplexAttention(
-            in_ch=2 + in_channels,
+            in_ch=dim + pos_encoding_dims + in_channels,
             out_ch=out_channels,
             num_heads=num_heads,
         )
@@ -2076,6 +2079,8 @@ class AttentionITBlock(nn.Module):
         xc = torch.complex(x, torch.zeros_like(x)) if not x.is_complex() else x
         # Einsum: (B, C_in, H, W) @ (B, H, W, m1, m2) -> (B, C_in, m1, m2)
         xhat = torch.einsum("bchw,bmnhw->bcmn", xc, fwd_basis)  # "Spectral" representation
+
+        xhat = xhat + self.PE.repeat(B, 1, 1, 1)
 
         # Attention in transformed space (uses complex attnetion)
         xhat = xhat.permute(0, 2, 3, 1).view(-1, 2 + C)  # (B, m1, m2, C_in)
