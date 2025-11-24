@@ -341,7 +341,7 @@ class GRN(nn.Module):
 
 class TuckerSpectralConv2d(nn.Module):
     """
-    convolution spectrale 2D avec factorisation de Tucker (Paramètres Complexes).
+    convolution spectrale 2D avec factorisation de Tucker.
     Les facteurs de Tucker (U, V, S, G) sont des tenseurs complexes.
     Le nombres de paramètres est égal à (Cin * r1 + Cout * r2 + (modesx * modesy) * r3 + r1 * r2 * r3)
     vs  (Cin * Cout * modes_x * modes_y sans factorisation
@@ -350,6 +350,7 @@ class TuckerSpectralConv2d(nn.Module):
     r2 = Cout / k
     r3 = modes_x * modes_y / k'
     avec k & k' les facteurs de réduction souhaités (2, 4 etc)
+    où encore r1 = r2 = r3 = min(Cin, Cout, modes_x * modes_y)
     Parameters:
     in_channels (int): Nombre de canaux d'entrée.
     out_channels (int): Nombre de canaux de sortie.
@@ -361,7 +362,7 @@ class TuckerSpectralConv2d(nn.Module):
 
     """
 
-    def __init__(self, in_channels, out_channels, modes, ranks, scaling=1):
+    def __init__(self, in_channels, out_channels, modes, ranks, scaling: Union[int, float] = 1):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -370,7 +371,7 @@ class TuckerSpectralConv2d(nn.Module):
 
         self.r1, self.r2, self.r3 = ranks
 
-        # Facteurs de la décomposition de Tucker (maintenant Complexes)
+        # Facteurs de la décomposition de Tucker
         self.U = nn.Parameter(torch.empty(in_channels, self.r1, dtype=torch.cfloat))  # (C_in, r1)
         self.V = nn.Parameter(torch.empty(out_channels, self.r2, dtype=torch.cfloat))  # (C_out, r2)
         self.S = nn.Parameter(torch.empty(self.modes_x, self.modes_y, self.r3, dtype=torch.cfloat))  # (mx, my, r3)
@@ -413,20 +414,17 @@ class TuckerSpectralConv2d(nn.Module):
                 f"for input spatial size ({H}, {W}). modes_y must be <= W//2 + 1."
             )
 
-        # 1. FFT -> domaine spectral (x_ft est complexe)
+        # 1. FFT -> domaine spectral
         x_ft = torch.fft.rfft2(x, dim=(-2, -1), norm="ortho")  # (B, C_in, H, W//2 + 1), cfloat
 
-        # 2. Sélection des modes bas (garde les dimensions mx, my)
+        # 2. Sélection des modes bas
         x_ft_low_modes = x_ft[:, :, : self.modes_x, : self.modes_y]  # (B, C_in, mx, my), cfloat
 
-        # 3. Reconstruire les poids spectraux W_hat (maintenant directement complexe)
+        # 3. Reconstruire les poids spectraux W_hat
         G1 = torch.einsum("ij,jkl->ikl", self.U, self.G)  # (C_in, r2, r3), cfloat
         G2 = torch.einsum("ok,ikl->iol", self.V, G1)  # (C_in, C_out, r3), cfloat
-        # Correction: einsum adaptée pour S(mx, my, r3) et G2(i, o, r3)
+        # S(mx, my, r3) et G2(i, o, r3)
         W_hat = torch.einsum("iol,xyl->ioxy", G2, self.S)  # (C_in, C_out, modes_x, modes_y), cfloat
-
-        # Plus besoin de caster W_hat
-        # W_hat = W_hat.to(dtype=torch.cfloat)
 
         # 4. Appliquer la convolution spectrale (multiplication de tenseurs complexes)
         # y_ft_low_modes[b, o, mx, my] = sum_i (x_ft_low_modes[b, i, mx, my] * W_hat[i, o, mx, my])
@@ -434,7 +432,7 @@ class TuckerSpectralConv2d(nn.Module):
 
         # 5. Zero-padding
         out_ft = torch.zeros(batchsize, self.out_channels, H, W // 2 + 1, dtype=torch.cfloat, device=device)
-        out_ft[:, :, : self.modes_x, : self.modes_y] = y_ft_low_modes  # Copie de tenseurs complexes
+        out_ft[:, :, : self.modes_x, : self.modes_y] = y_ft_low_modes
 
         # 6. Retour au domaine spatial
         y = torch.fft.irfft2(
@@ -671,6 +669,52 @@ class SinusoidalEmbedding(nn.Module):
         return output
 
 
+class ComplexAttention(nn.Module):
+    """Complex attention Module (can be self or cross attention) depedning on inputs Q, K, V of the forward method"""
+
+    def __init__(self, in_ch, out_ch, num_heads):
+        super(ComplexAttention, self).__init__()
+        assert out_ch % num_heads == 0
+        self.d_model = out_ch
+        self.num_heads = num_heads
+        self.head_dim = out_ch // num_heads
+
+        self.wq = nn.Linear(in_ch, out_ch, bias=True, dtype=torch.cfloat)
+        self.wk = nn.Linear(in_ch, out_ch, bias=True, dtype=torch.cfloat)
+        self.wv = nn.Linear(in_ch, out_ch, bias=True, dtype=torch.cfloat)
+        self.fc_out = nn.Linear(out_ch, out_ch, bias=True, dtype=torch.cfloat)
+
+    # Méthodes split_heads et combine_heads inchangées
+    def split_heads(self, x):
+        batch_size, seq_len, d_model = x.shape
+        x = x.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        return x.transpose(1, 2)
+
+    def combine_heads(self, x):
+        x = x.transpose(1, 2).contiguous()
+        batch_size, seq_len, num_heads, head_dim = x.shape
+        return x.reshape(batch_size, seq_len, num_heads * head_dim)
+
+    def forward(self, Q, V, K):
+        Q = self.split_heads(self.wq(Q))
+        K = self.split_heads(self.wk(V))
+        V = self.split_heads(self.wv(K))
+
+        # Produit scalaire Hermitien pour le score: Q @ K^H
+        attention_scores = torch.matmul(Q, K.transpose(-2, -1).conj())
+        attention_scores = attention_scores / (self.head_dim**0.5)
+
+        # Softmax appliqué sur la magnitude (valeur absolue) du score
+        real_attention_scores = torch.abs(attention_scores)
+        attention_weights = F.softmax(real_attention_scores, dim=-1)
+
+        # Application des poids réels à la valeur V complexe
+        weighted_output = torch.matmul(attention_weights, V)
+        output = self.combine_heads(weighted_output)
+
+        return self.fc_out(output)
+
+
 class FiniteDifferenceConvolution(nn.Module):
     """Finite Difference Convolution Layer introduced in [1]_.
     "Neural Operators with Localized Integral and Differential Kernels" (ICML 2024)
@@ -703,7 +747,16 @@ class FiniteDifferenceConvolution(nn.Module):
 
     """
 
-    def __init__(self, in_channels, out_channels, n_dim=2, kernel_size=3, groups=1, padding="same", grid_width = 1.0):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        n_dim=2,
+        kernel_size=3,
+        groups=1,
+        stride=1,
+        padding="same",
+    ):
 
         super().__init__()
 
@@ -715,13 +768,14 @@ class FiniteDifferenceConvolution(nn.Module):
         self.groups = groups
         self.n_dim = n_dim
         self.padding = padding
-        self.grid_width = grid_width
+        self.stride = stride
 
+        # init kernel weigths
         self.weights = torch.rand((out_channels, in_channels // groups, kernel_size, kernel_size))
-        k = math.sqrt(groups / (in_channels * kernel_size**2))
+        k = torch.sqrt(torch.tensor(groups / (in_channels * kernel_size**2)))
         self.weights = self.weights * 2 * k - k
 
-    def forward(self, x):
+    def forward(self, x, grid_width: float = 1.0) -> torch.Tensor:
         """FiniteDifferenceConvolution's forward pass.
 
         Parameters
@@ -735,7 +789,83 @@ class FiniteDifferenceConvolution(nn.Module):
         weights = (self.weights - torch.mean(self.weights)) / self.grid_width
         weights = weights.to(x.device)
 
-        x = self.conv_function(
-            x, weights, groups=self.groups, padding=self.padding
+        self.weights = self.weights.to(x.device)
+        x = (
+            self.conv_function(
+                x,
+                (self.weights - torch.mean(self.weights)),
+                groups=self.groups,
+                stride=self.stride,
+                padding=self.padding,
+            )
+            / grid_width
         )
+        return x
+
+
+class FiniteDifferenceLayer(nn.Module):
+    """Finite Difference Layer introduced in [1]_.
+    "Neural Operators with Localized Integral and Differential Kernels" (ICML 2024)
+        https://arxiv.org/abs/2402.16845
+
+    Computes a finite difference convolution on a regular grid,
+    which converges to a directional derivative as the grid is refined.
+
+    Parameters
+    ----------
+    in_channels : int
+        number of in_channels
+    out_channels : int
+        number of out_channels
+    n_dim : int
+        number of dimensions in the input domain
+    kernel_size : int
+        odd kernel size used for convolutional finite difference stencil
+    groups : int
+        splitting number of channels
+    padding : literal {'periodic', 'replicate', 'reflect', 'zeros'}
+        mode of padding to use on input.
+        See `torch.nn.functional.padding`.
+
+    References
+    ----------
+    .. [1] : Liu-Schiaffini, M., et al. (2024). "Neural Operators with
+        Localized Integral and Differential Kernels".
+        ICML 2024, https://arxiv.org/abs/2402.16845.
+
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        n_dim=2,
+        kernel_size=3,
+        groups=1,
+        stride=1,
+        padding="same",
+        norm=None,
+        activation=None,
+        grid_width: float = 1.0,
+    ):
+        super().__init__()
+        self.fdc = FiniteDifferenceConvolution(
+            in_channels,
+            out_channels,
+            n_dim=n_dim,
+            kernel_size=kernel_size,
+            groups=groups,
+            stride=stride,
+            padding=padding,
+        )
+        self.normalization = norm(out_channels) if norm is not None else None
+        self.activation = activation() if activation is not None else None
+        self.grid_width = grid_width
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fdc(x, self.grid_width)
+        if self.normalization is not None:
+            x = self.normalization(x)
+        if self.activation is not None:
+            x = self.activation(x)
         return x

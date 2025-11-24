@@ -4,10 +4,12 @@ import torch.nn.functional as F
 from typing import Union, Sequence, Callable
 import collections.abc as abc
 from pynop.core.norm import LayerNorm2d
-from pynop.core.blocks import SNLITBlock, LITBlock, ANLITBlock
+from pynop.core.blocks import LITBlock
 
 
-class CITNet(nn.Module):
+class LITNet(nn.Module):
+    """Learned Integral Transform Network"""
+
     def __init__(
         self,
         in_channels: int,
