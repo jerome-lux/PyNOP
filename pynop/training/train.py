@@ -809,7 +809,19 @@ def train_deeponet(
     writer.close()
 
 
-def train_step_deeponet(model, inputs, times, targets, loss_fn, optimizer, lossweights=1.0, gamma = 5.0):
+def train_step_deeponet(
+        model,
+        inputs, 
+        times, 
+        targets, 
+        loss_fn, 
+        optimizer, 
+        lossweights=1.0, 
+        gamma = 5.0, 
+        early_t_max=1.0, 
+        time_weighted=True,
+    ):
+    
     device = inputs.device
     inputs = inputs.to(device)     
     times = times.to(device)        
@@ -821,12 +833,30 @@ def train_step_deeponet(model, inputs, times, targets, loss_fn, optimizer, lossw
     if preds.shape != targets.shape:
         raise ValueError(f"Shape mismatch: preds {preds.shape}, targets {targets.shape}")
 
+    if not isinstance(loss_fn, (tuple, list)):
+        loss_fn = [loss_fn]
+    
     if not isinstance(lossweights, (tuple, list)):
         lossweights = [lossweights] * len(loss_fn)
 
+    t_flat = times.view(-1)
+    time_w = torch.ones_like(t_flat)
+    time_w[t_flat <= early_t_max] = gamma
+    time_w = time_w.view(-1, 1, 1, 1)
+    
     loss = 0.0
     for i, loss_function in enumerate(loss_fn):
         loss += loss_function(preds, targets) * lossweights[i]
+    
+    # for lf, lw in zip(loss_fn, lossweights):
+    #     base = lf(preds, targets)
+
+    #     if time_weighted and isinstance(base, torch.Tensor) and base.shape == preds.shape:
+    #         loss_term = (base * time_w).mean()
+    #     else:
+    #         loss_term = base
+
+    #     loss += loss_term * lw
 
     optimizer.zero_grad()
     loss.backward()
@@ -836,7 +866,18 @@ def train_step_deeponet(model, inputs, times, targets, loss_fn, optimizer, lossw
 
 
 @torch.no_grad()
-def test_step_deeponet(model, inputs, times, targets, loss_fn, lossweights=1.0, gamma=5.0, time_weighted=False):
+def test_step_deeponet(
+    model, 
+    inputs, 
+    times, 
+    targets, 
+    loss_fn, 
+    lossweights=1.0, 
+    gamma=5.0, 
+    early_t_max=1.0, 
+    time_weighted=True
+    ):
+
     device = inputs.device
     inputs = inputs.to(device)
     times = times.to(device)
@@ -847,6 +888,12 @@ def test_step_deeponet(model, inputs, times, targets, loss_fn, lossweights=1.0, 
     if preds.shape != targets.shape:
         raise ValueError(f"Shape mismatch: preds {preds.shape}, targets {targets.shape}")
     
+    # if not isinstance(loss_fn, (tuple, list)):
+    #     loss_fn = [loss_fn]
+
+    # if not isinstance(lossweights, (tuple, list)):
+    #     lossweights = [lossweights] * len(loss_fn)
+
     if isinstance(loss_fn, (list, tuple)):
         if not isinstance(lossweights, (list, tuple)):
             lossweights = [lossweights] * len(loss_fn)
@@ -855,6 +902,24 @@ def test_step_deeponet(model, inputs, times, targets, loss_fn, lossweights=1.0, 
         loss = loss_fn(preds, targets) * lossweights
 
     return loss
+
+    # t_flat = times.view(-1)
+    # time_w = torch.ones_like(t_flat)
+    # time_w[t_flat <= early_t_max] = gamma
+    # time_w = time_w.view(-1, 1, 1, 1)
+
+    # total_loss = 0.0
+    # for lf, lw in zip(loss_fn, lossweights):
+    #     base = lf(preds, targets)
+
+    #     if time_weighted and isinstance(base, torch.Tensor) and base.shape == preds.shape:
+    #         loss_term = (base * time_w).mean()
+    #     else:
+    #         loss_term = base
+
+    #     total_loss += loss_term * lw
+
+    # return total_loss
 
 def train_warmup(
     model,
