@@ -1220,7 +1220,7 @@ class Linear1x1Conv(nn.Module):
     Input/Output format: (B, C, H, W).
     """
 
-    def __init__(self, in_ch, out_ch, hidden_dim=64, num_layers=2, activation=nn.GELU, norm=nn.LayerNorm):
+    def __init__(self, in_ch, out_ch, hidden_dim=64, num_layers=2, activation=nn.GELU, norm=LayerNorm2d):
         """
         Initializes the MLP.
         Args:
@@ -1819,7 +1819,15 @@ class NLITBlock(nn.Module):
 
         # We use faster 1x1conv layers instead of nn.Linear to implement the linear layer
         # to generate the basis functions from input coordinates and values.
-        self.basis_generator = Linear1x1Conv(
+        # self.basis_generator = Linear1x1Conv(
+        #     out_ch=self.m1 * self.m2,
+        #     in_ch=2 + in_channels,
+        #     hidden_dim=mlp_hidden_dim,
+        #     num_layers=mlp_num_layers,
+        #     activation=activation,
+        # )
+
+        self.basis_generator = MLPBlock(
             out_ch=self.m1 * self.m2,
             in_ch=2 + in_channels,
             hidden_dim=mlp_hidden_dim,
@@ -1878,14 +1886,19 @@ class NLITBlock(nn.Module):
         # coords_2d: (B, 2, H_basis, W_basis). Add the batch dimension.
         coords_2d = coords_2d_base.unsqueeze(0).repeat(B, 1, 1, 1)  # B C H W
 
-        x_in = torch.cat([coords_2d, x_cond], dim=1)  # (B, 2+cin, H, W)
-
         # 3. Generate kernels
-        encoder_basis = self.basis_generator(x_in)  # (B, m1*m2, H, W)
+        # Using MLP : seems to be faster
+        x_in = torch.cat([coords_2d, x_cond], dim=1).permute(0, 2, 3, 1).reshape(B * H * W, 2 + C)  # (B, 2+cin, H, W)
+        encoder_basis = self.basis_generator(x_in)  # (B*H*W, m1*m2)
+        encoder_basis = encoder_basis.view(B, H, W, self.m1, self.m2)
+
+        # Using Conv1x1
+        # x_in = torch.cat([coords_2d, x_cond], dim=1)
+        # encoder_basis = self.basis_generator(x_in)  # (B, m1*m2, H, W)
 
         # 4. Reshape kernels for Einsum
         # encoder_basis = encoder_basis.view(B, H_basis, W_basis, self.m1, self.m2)
-        encoder_basis = encoder_basis.view(B, self.m1, self.m2, H_basis, W_basis)
+        # encoder_basis = encoder_basis.view(B, self.m1, self.m2, H_basis, W_basis)
 
         if self.resampling == "up":
             # Subsample the generated basis back to H_in x W_in (taking every second point)
@@ -1895,8 +1908,12 @@ class NLITBlock(nn.Module):
 
         # Convert input to complex numbers if it is real
         xc = torch.complex(x, torch.zeros_like(x)) if not x.is_complex() else x
+        # If using Conv1x1
         # Einsum: (B, C_in, H, W) @ (B, H, W, m1, m2) -> (B, C_in, m1, m2)
-        xhat = torch.einsum("bchw,bmnhw->bcmn", xc, fwd_basis)  # "Spectral" representation
+        # xhat = torch.einsum("bchw,bmnhw->bcmn", xc, fwd_basis)  # "Spectral" representation
+
+        # If using MLP
+        xhat = torch.einsum("bchw,bhwmn->bcmn", xc, fwd_basis)  # "Spectral" representation
 
         # Multiply by learned weigths in transformed space
         xhat = torch.einsum("bixy,oixy->boxy", xhat, self.learned_weights)
@@ -1913,7 +1930,10 @@ class NLITBlock(nn.Module):
 
         # Einsum: (B, C_out, m1, m2) @ (B, m1, m2, H_out, W_out)* -> (B, C_out, H_out, W_out)
         # We use .conj() for the inverse (adjoint) operation.
-        x_rec = torch.einsum("bcmn,bmnhw->bchw", xhat, inv_basis.conj())
+        # If using conv 1x1
+        # x_rec = torch.einsum("bcmn,bmnhw->bchw", xhat, inv_basis.conj())
+        # If using MLP
+        x_rec = torch.einsum("bcmn,bhwmn->bchw", xhat, inv_basis.conj())
 
         # Normalization
         x_rec = x_rec.real * (1.0 / (H_out * W_out))
