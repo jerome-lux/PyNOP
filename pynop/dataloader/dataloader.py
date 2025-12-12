@@ -10,7 +10,7 @@ import torchvision.transforms as T
 import re
 import glob
 from collections import defaultdict
-
+import h5py
 import torch
 from torch.utils.data import Dataset
 import numpy as np
@@ -524,5 +524,246 @@ class ImageUnrolledTimeVaryingDataset(Dataset):
 
         input_tensor = torch.stack(input_seq, dim=0)  
         target_tensor = torch.stack(target_seq, dim=0)
+
+        return input_tensor, target_tensor
+
+
+class UnrolledH5ConcentrationDataset(Dataset):
+    def __init__(self, h5_path, T_unroll=10):
+        self.h5_path = h5_path
+        self.T_unroll = T_unroll
+        self.windows = []
+
+        with h5py.File(h5_path, "r") as f:
+            self.sample_ids = sorted(list(f.keys()))
+
+            for sid in self.sample_ids:
+                T = f[sid]["data"].shape[0]
+
+                if T < T_unroll:
+                    print(f"Skipping sample {sid}: insufficient T={T}")
+                    continue
+
+                for t0 in range(T - T_unroll):
+                    self.windows.append((sid, t0))
+
+        print(f"Found {len(self.sample_ids)} simulation samples")
+        print(f"Total unrolled windows: {len(self.windows)}")
+
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, idx):
+        sid, t0 = self.windows[idx]
+
+        with h5py.File(self.h5_path, "r") as f:
+            conc = f[sid]["data"][t0:t0 + self.T_unroll]
+
+        conc = torch.from_numpy(np.moveaxis(conc, -1, 1)).float()
+
+        return conc[:-1], conc[1:]
+
+
+class FNOH5TimestepDataset(Dataset):
+    def __init__(self, h5_path,max_sims=100, time_first=True, transform=None):
+        self.h5_path = h5_path
+        self.time_first = time_first
+        self.transform = transform
+        self.samples = []
+        self._file = None  
+
+        with h5py.File(h5_path, "r") as f:
+            all_sids  = sorted(list(f.keys()))  
+            self.sample_ids = all_sids[:max_sims]
+
+            for sid in self.sample_ids:
+                data_ds = f[sid]["data"]
+                shape = data_ds.shape
+
+                if time_first:
+                  
+                    T = shape[0]
+                else:
+                
+                    T = shape[-1]
+
+                if T < 2:
+                    print(f"Skipping {sid}: T={T} < 2")
+                    continue
+
+               
+                for t in range(T - 1):
+                    self.samples.append((sid, t))
+
+        print(f"Found {len(self.sample_ids)} simulations in {os.path.basename(h5_path)}")
+        print(f"Using {len(self.sample_ids)} simulations (first {max_sims})")
+        print(f"Total one-step samples: {len(self.samples)}")
+
+    def _get_file(self):
+        if self._file is None:
+            self._file = h5py.File(self.h5_path, "r")
+        return self._file
+    
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sid, t = self.samples[idx]
+
+        with h5py.File(self.h5_path, "r") as f:
+            data_ds = f[sid]["data"]
+
+            if self.time_first:
+       
+                c_t_np  = data_ds[t]     
+                c_t1_np = data_ds[t + 1] 
+            else:
+             
+                c_t_np  = data_ds[..., t]     
+                c_t1_np = data_ds[..., t + 1] 
+
+        c_t_np  = np.transpose(c_t_np,  (2, 0, 1))
+        c_t1_np = np.transpose(c_t1_np, (2, 0, 1))
+
+        input_tensor  = torch.from_numpy(c_t_np).float()
+        target_tensor = torch.from_numpy(c_t1_np).float()
+
+        if self.transform is not None:
+            input_tensor, target_tensor = self.transform((input_tensor, target_tensor))
+
+        return input_tensor, target_tensor
+
+class UnrolledH5ConcentrationDataset(Dataset):
+    """
+    Unrolled multi-step dataset for PDEBench.
+        input_tensor  = seq[0 : T_unroll-1]  -> [T-1, C, H, W]
+        target_tensor = seq[1 : T_unroll]    -> [T-1, C, H, W]
+    """
+
+    def __init__(self, h5_path, T_unroll=10, max_sims=None):
+        super().__init__()
+        self.h5_path = str(h5_path)
+        self.T_unroll = T_unroll
+        self.samples = []          
+        self._file = None      
+
+        with h5py.File(self.h5_path, "r") as f:
+            all_sids = sorted(list(f.keys()))
+            if max_sims is not None:
+                all_sids = all_sids[:max_sims]
+
+            self.sample_ids = all_sids
+
+            for sid in self.sample_ids:
+                data_ds = f[sid]["data"]        
+                T = data_ds.shape[0]
+
+                if T < T_unroll:
+                    print(f"Skipping sample {sid}: T={T} < T_unroll={T_unroll}")
+                    continue
+
+                for t0 in range(T - T_unroll):
+                    self.samples.append((sid, t0))
+
+        print(f"Using {len(self.sample_ids)} simulations from {os.path.basename(self.h5_path)}")
+        print(f"Total unrolled windows: {len(self.samples)}")
+
+    def _get_file(self):
+        if self._file is None:
+            self._file = h5py.File(self.h5_path, "r")
+        return self._file
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sid, t0 = self.samples[idx]
+        f = self._get_file()
+
+        seq = f[sid]["data"][t0 : t0 + self.T_unroll]
+
+        seq = np.moveaxis(seq, -1, 1)
+
+        input_tensor  = torch.from_numpy(seq[:-1]).float()  
+        target_tensor = torch.from_numpy(seq[1:]).float()  
+
+        return input_tensor, target_tensor
+
+class H5TimestepDataset_Norm(Dataset):
+    def __init__(self, h5_path, max_sims=100, time_first=True,
+                 mean=None, std=None, transform=None):
+        self.h5_path = h5_path
+        self.time_first = time_first
+        self.transform = transform
+        self.samples = []
+        self._file = None  
+
+        if mean is not None and std is not None:
+            mean = np.asarray(mean)
+            std = np.asarray(std)
+            assert mean.ndim == 1 and std.ndim == 1, "mean/std must be 1D [C]"
+            self.mean = mean[:, None, None]  
+            self.std = std[:, None, None]
+        else:
+            self.mean = None
+            self.std = None
+
+        with h5py.File(h5_path, "r") as f:
+            all_sids = sorted(list(f.keys()))
+            self.sample_ids = all_sids[:max_sims]
+
+            for sid in self.sample_ids:
+                data_ds = f[sid]["data"]
+                shape = data_ds.shape
+
+                if time_first:
+                    T = shape[0]
+                else:
+                    T = shape[-1]
+
+                if T < 2:
+                    print(f"Skipping {sid}: T={T} < 2")
+                    continue
+
+                for t in range(T - 1):
+                    self.samples.append((sid, t))
+
+        print(f"Found {len(self.sample_ids)} simulations in {os.path.basename(h5_path)}")
+        print(f"Using {len(self.sample_ids)} simulations (first {max_sims})")
+        print(f"Total one-step samples: {len(self.samples)}")
+
+    def _get_file(self):
+        if self._file is None:
+            self._file = h5py.File(self.h5_path, "r")
+        return self._file
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sid, t = self.samples[idx]
+        f = self._get_file()
+        data_ds = f[sid]["data"]
+
+        if self.time_first:
+            c_t_np  = data_ds[t]      
+            c_t1_np = data_ds[t + 1]
+        else:
+            c_t_np  = data_ds[..., t] 
+            c_t1_np = data_ds[..., t + 1]
+
+
+        c_t_np  = np.transpose(c_t_np,  (2, 0, 1))
+        c_t1_np = np.transpose(c_t1_np, (2, 0, 1))
+
+        if self.mean is not None and self.std is not None:
+            c_t_np  = (c_t_np  - self.mean) / self.std
+            c_t1_np = (c_t1_np - self.mean) / self.std
+
+        input_tensor  = torch.from_numpy(c_t_np).float()
+        target_tensor = torch.from_numpy(c_t1_np).float()
+
+        if self.transform is not None:
+            input_tensor, target_tensor = self.transform((input_tensor, target_tensor))
 
         return input_tensor, target_tensor

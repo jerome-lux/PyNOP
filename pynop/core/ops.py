@@ -669,51 +669,175 @@ class SinusoidalEmbedding(nn.Module):
         return output
 
 
+# class ComplexAttention(nn.Module):
+#     """Complex attention Module (can be self or cross attention) depedning on inputs Q, K, V of the forward method"""
+
+#     def __init__(self, in_ch, out_ch, num_heads):
+#         super(ComplexAttention, self).__init__()
+#         assert out_ch % num_heads == 0
+#         self.d_model = out_ch
+#         self.num_heads = num_heads
+#         self.head_dim = out_ch // num_heads
+
+#         # We'll initialize the Linear layers lazily, once we see Q
+#         self._initialized = False
+#         self._config_in_ch = in_ch  # keep for sanity check / debugging
+
+#         # self.wq = nn.Linear(in_ch, out_ch, bias=True, dtype=torch.cfloat)
+#         # self.wk = nn.Linear(in_ch, out_ch, bias=True, dtype=torch.cfloat)
+#         # self.wv = nn.Linear(in_ch, out_ch, bias=True, dtype=torch.cfloat)
+#         # self.fc_out = nn.Linear(out_ch, out_ch, bias=True, dtype=torch.cfloat)
+#         self.wq = None
+#         self.wk = None
+#         self.wv = None
+#         self.fc_out = None
+
+#     def _lazy_init(self, Q: torch.Tensor):
+#         """Create projection layers with the correct in_features / dtype / device."""
+#         in_ch = Q.shape[-1]
+#         dtype = Q.dtype
+#         device = Q.device
+
+#         # Optional sanity: you can uncomment this if you want a warning
+#         # if in_ch != self._config_in_ch:
+#         #     print(f"[ComplexAttention] Warning: constructed with in_ch={self._config_in_ch}, "
+#         #           f"but got Q with last dim={in_ch}. Using {in_ch}.")
+
+#         self.wq = nn.Linear(in_ch, self.d_model, bias=True, dtype=dtype, device=device)
+#         self.wk = nn.Linear(in_ch, self.d_model, bias=True, dtype=dtype, device=device)
+#         self.wv = nn.Linear(in_ch, self.d_model, bias=True, dtype=dtype, device=device)
+#         self.fc_out = nn.Linear(self.d_model, self.d_model, bias=True, dtype=dtype, device=device)
+
+#         self._initialized = True
+
+#     # Méthodes split_heads et combine_heads inchangées
+#     def split_heads(self, x):
+#         batch_size, seq_len, d_model = x.shape
+#         x = x.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+#         return x.transpose(1, 2)
+
+#     def combine_heads(self, x):
+#         x = x.transpose(1, 2).contiguous()
+#         batch_size, seq_len, num_heads, head_dim = x.shape
+#         return x.reshape(batch_size, seq_len, num_heads * head_dim)
+
+#     def forward(self, Q, V, K):
+#         if not self._initialized:
+#             self._lazy_init(Q)
+        
+#         Q = self.wq(Q)
+#         K = self.wk(K)
+#         V = self.wv(V)
+
+#         Q = self.split_heads(Q)   # [B, H, N, D_h]
+#         K = self.split_heads(K)   # [B, H, N, D_h]
+#         V = self.split_heads(V)   # [B, H, N, D_h]
+
+#         # Produit scalaire Hermitien pour le score: Q @ K^H
+#         attention_scores = torch.matmul(Q, K.transpose(-2, -1).conj())
+#         attention_scores = attention_scores / (self.head_dim**0.5)
+
+#         if torch.is_complex(attention_scores):
+#             real_attention_scores = torch.abs(attention_scores)
+#             attention_weights = F.softmax(real_attention_scores, dim=-1)
+#         else:
+#             attention_weights = F.softmax(attention_scores, dim=-1)
+
+#         # # Softmax appliqué sur la magnitude (valeur absolue) du score
+#         # real_attention_scores = torch.abs(attention_scores)
+#         # attention_weights = F.softmax(real_attention_scores, dim=-1)
+
+#         # Application des poids réels à la valeur V complexe
+#         weighted_output = torch.matmul(attention_weights, V)
+#         output = self.combine_heads(weighted_output)
+
+#         return self.fc_out(output)
 class ComplexAttention(nn.Module):
-    """Complex attention Module (can be self or cross attention) depedning on inputs Q, K, V of the forward method"""
+    """Complex attention Module (can be self or cross attention) depending on Q, K, V."""
 
     def __init__(self, in_ch, out_ch, num_heads):
-        super(ComplexAttention, self).__init__()
+        super().__init__()
         assert out_ch % num_heads == 0
         self.d_model = out_ch
         self.num_heads = num_heads
         self.head_dim = out_ch // num_heads
 
-        self.wq = nn.Linear(in_ch, out_ch, bias=True, dtype=torch.cfloat)
-        self.wk = nn.Linear(in_ch, out_ch, bias=True, dtype=torch.cfloat)
-        self.wv = nn.Linear(in_ch, out_ch, bias=True, dtype=torch.cfloat)
-        self.fc_out = nn.Linear(out_ch, out_ch, bias=True, dtype=torch.cfloat)
+        # Lazy init
+        self._initialized = False
+        self._config_in_ch = in_ch  # just for debugging if needed
 
-    # Méthodes split_heads et combine_heads inchangées
+        self.wq = None
+        self.wk = None
+        self.wv = None
+        self.fc_out = None
+
+    def _lazy_init(self, Q: torch.Tensor):
+        """Create projection layers with correct in_features / dtype / device."""
+        in_ch = Q.shape[-1]
+        device = Q.device
+        dtype = Q.dtype
+
+        self.wq = nn.Linear(in_ch, self.d_model, bias=True)
+        self.wk = nn.Linear(in_ch, self.d_model, bias=True)
+        self.wv = nn.Linear(in_ch, self.d_model, bias=True)
+        self.fc_out = nn.Linear(self.d_model, self.d_model, bias=True)
+
+        # move to same device/dtype as Q
+        self.wq.to(device=device, dtype=dtype)
+        self.wk.to(device=device, dtype=dtype)
+        self.wv.to(device=device, dtype=dtype)
+        self.fc_out.to(device=device, dtype=dtype)
+
+        self._initialized = True
+
     def split_heads(self, x):
-        batch_size, seq_len, d_model = x.shape
-        x = x.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        return x.transpose(1, 2)
+        # x: [B, N, d_model]
+        B, N, d_model = x.shape
+        x = x.reshape(B, N, self.num_heads, self.head_dim)  # [B, N, H, Dh]
+        return x.transpose(1, 2)                            # [B, H, N, Dh]
 
     def combine_heads(self, x):
-        x = x.transpose(1, 2).contiguous()
-        batch_size, seq_len, num_heads, head_dim = x.shape
-        return x.reshape(batch_size, seq_len, num_heads * head_dim)
+        # x: [B, H, N, Dh]
+        x = x.transpose(1, 2).contiguous()                  # [B, N, H, Dh]
+        B, N, H, Dh = x.shape
+        return x.reshape(B, N, H * Dh)                      # [B, N, d_model]
 
     def forward(self, Q, V, K):
-        Q = self.split_heads(self.wq(Q))
-        K = self.split_heads(self.wk(V))
-        V = self.split_heads(self.wv(K))
+        # Lazy initialization on first forward
+        if not self._initialized:
+            self._lazy_init(Q)
 
-        # Produit scalaire Hermitien pour le score: Q @ K^H
-        attention_scores = torch.matmul(Q, K.transpose(-2, -1).conj())
-        attention_scores = attention_scores / (self.head_dim**0.5)
+        # 1) Linear projections
+        Q = self.wq(Q)   # [B, N, d_model]
+        K = self.wk(K)   # [B, N, d_model]
+        V = self.wv(V)   # [B, N, d_model]
 
-        # Softmax appliqué sur la magnitude (valeur absolue) du score
-        real_attention_scores = torch.abs(attention_scores)
-        attention_weights = F.softmax(real_attention_scores, dim=-1)
+        # 2) Split into heads
+        Q = self.split_heads(Q)   # [B, H, N, Dh]
+        K = self.split_heads(K)   # [B, H, N, Dh]
+        V = self.split_heads(V)   # [B, H, N, Dh]
 
-        # Application des poids réels à la valeur V complexe
-        weighted_output = torch.matmul(attention_weights, V)
-        output = self.combine_heads(weighted_output)
+        # 3) Scaled dot-product attention: Q K^H
+        scores = torch.matmul(Q, K.transpose(-2, -1).conj())  # [B, H, N, N]
+        scores = scores / (self.head_dim ** 0.5)
 
-        return self.fc_out(output)
+        # 4) Softmax over real scores
+        if torch.is_complex(scores):
+            real_scores = torch.abs(scores)
+            attention_weights = F.softmax(real_scores, dim=-1)  # float
+            # ?? make dtype match V (real or complex)
+            attention_weights = attention_weights.to(V.dtype)
+        else:
+            attention_weights = F.softmax(scores, dim=-1)       # same dtype as scores
 
+        # 5) Apply attention weights
+        weighted_output = torch.matmul(attention_weights, V)    # [B, H, N, Dh]
+
+        # 6) Merge heads + final projection
+        output = self.combine_heads(weighted_output)            # [B, N, d_model]
+        output = self.fc_out(output)                            # [B, N, d_model]
+
+        return output
 
 class FiniteDifferenceConvolution(nn.Module):
     """Finite Difference Convolution Layer introduced in [1]_.
