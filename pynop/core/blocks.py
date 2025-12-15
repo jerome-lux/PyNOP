@@ -513,7 +513,6 @@ class ConvFNOBlock(nn.Module):
         self.resampling = resampling
         self.nconv = nconv
         self.grid_width = grid_width
-        self.final_activation = nn.Sigmoid()
 
         if self.resampling is not None:
             if self.resampling == "up":
@@ -556,28 +555,18 @@ class ConvFNOBlock(nn.Module):
         for i in range(nconv):
             in_ch = in_channels if i == 0 else hidden_channels
             out_ch = out_channels if i == nconv - 1 else hidden_channels
-            # self.conv.append(
-                # FiniteDifferenceLayer(
-                #     in_channels=in_ch,
-                #     out_channels=out_ch,
-                #     kernel_size=kernel_size,
-                #     stride=1,
-                #     padding="same",
-                #     norm=normalization,
-                #     activation=activation,
-                #     grid_width=self.grid_width * self.scaling,
-                # )
             self.conv.append(
-                    FiniteDifferenceConvolution(
-                        in_channels=in_ch,
-                        out_channels=out_ch,
-                        kernel_size=kernel_size,
-                        padding="same",
-                        grid_width = 1.0 / 128  
-                    )
-)
-
-            
+                FiniteDifferenceLayer(
+                    in_channels=in_ch,
+                    out_channels=out_ch,
+                    kernel_size=kernel_size,
+                    stride=1,
+                    padding="same",
+                    norm=normalization,
+                    activation=activation,
+                    grid_width=self.grid_width * self.scaling,
+                )
+            )
 
         # Shortcut Branch Layer
         # 1x1 Conv to potentially change input channels to output channels
@@ -609,8 +598,6 @@ class ConvFNOBlock(nn.Module):
 
         if self.activation is not None:
             x = self.activation(x)
-        
-        x = self.final_activation(x)
 
         return x
 
@@ -1233,7 +1220,7 @@ class Linear1x1Conv(nn.Module):
     Input/Output format: (B, C, H, W).
     """
 
-    def __init__(self, in_ch, out_ch, hidden_dim=64, num_layers=2, activation=nn.GELU, norm=None):
+    def __init__(self, in_ch, out_ch, hidden_dim=64, num_layers=2, activation=nn.GELU, norm=LayerNorm2d):
         """
         Initializes the MLP.
         Args:
@@ -1532,7 +1519,6 @@ class LITBlock(nn.Module):
         # else:
         h_coords = torch.linspace(0, 1, H, device=x.device).unsqueeze(1).repeat(1, W)
         w_coords = torch.linspace(0, 1, W, device=x.device).unsqueeze(0).repeat(H, 1)
-
         coords_2d = torch.stack([h_coords, w_coords], dim=-1).unsqueeze(0).repeat(B, 1, 1, 1)  # (B, H, W, 2)
         coords_2d = coords_2d.view(B * H * W, 2)
 
@@ -1551,7 +1537,6 @@ class LITBlock(nn.Module):
         # Einsum: (B, C_out, m1, m2) @ (B, m1, m2, H_out, W_out)* -> (B, C_out, H_out, W_out)
         # We use .conj() for the inverse (adjoint) operation.
         x_rec = torch.einsum("bcmn,bhwmn->bchw", xhat, encoder_basis.conj())
-        
 
         # Normalization
         x_rec = x_rec.real * (1.0 / (H * W))
@@ -1834,13 +1819,20 @@ class NLITBlock(nn.Module):
 
         # We use faster 1x1conv layers instead of nn.Linear to implement the linear layer
         # to generate the basis functions from input coordinates and values.
-        self.basis_generator = Linear1x1Conv(
+        # self.basis_generator = Linear1x1Conv(
+        #     out_ch=self.m1 * self.m2,
+        #     in_ch=2 + in_channels,
+        #     hidden_dim=mlp_hidden_dim,
+        #     num_layers=mlp_num_layers,
+        #     activation=activation,
+        # )
+
+        self.basis_generator = MLPBlock(
             out_ch=self.m1 * self.m2,
             in_ch=2 + in_channels,
             hidden_dim=mlp_hidden_dim,
             num_layers=mlp_num_layers,
             activation=activation,
-            norm = None,
         )
 
         # Learned parameters for multiplication in the transformed space (per channel).
@@ -1894,14 +1886,19 @@ class NLITBlock(nn.Module):
         # coords_2d: (B, 2, H_basis, W_basis). Add the batch dimension.
         coords_2d = coords_2d_base.unsqueeze(0).repeat(B, 1, 1, 1)  # B C H W
 
-        x_in = torch.cat([coords_2d, x_cond], dim=1)  # (B, 2+cin, H, W)
-
         # 3. Generate kernels
-        encoder_basis = self.basis_generator(x_in)  # (B, m1*m2, H, W)
+        # Using MLP : seems to be faster
+        x_in = torch.cat([coords_2d, x_cond], dim=1).permute(0, 2, 3, 1).reshape(B * H * W, 2 + C)  # (B, 2+cin, H, W)
+        encoder_basis = self.basis_generator(x_in)  # (B*H*W, m1*m2)
+        encoder_basis = encoder_basis.view(B, H, W, self.m1, self.m2)
+
+        # Using Conv1x1
+        # x_in = torch.cat([coords_2d, x_cond], dim=1)
+        # encoder_basis = self.basis_generator(x_in)  # (B, m1*m2, H, W)
 
         # 4. Reshape kernels for Einsum
         # encoder_basis = encoder_basis.view(B, H_basis, W_basis, self.m1, self.m2)
-        encoder_basis = encoder_basis.view(B, self.m1, self.m2, H_basis, W_basis)
+        # encoder_basis = encoder_basis.view(B, self.m1, self.m2, H_basis, W_basis)
 
         if self.resampling == "up":
             # Subsample the generated basis back to H_in x W_in (taking every second point)
@@ -1911,8 +1908,12 @@ class NLITBlock(nn.Module):
 
         # Convert input to complex numbers if it is real
         xc = torch.complex(x, torch.zeros_like(x)) if not x.is_complex() else x
+        # If using Conv1x1
         # Einsum: (B, C_in, H, W) @ (B, H, W, m1, m2) -> (B, C_in, m1, m2)
-        xhat = torch.einsum("bchw,bmnhw->bcmn", xc, fwd_basis)  # "Spectral" representation
+        # xhat = torch.einsum("bchw,bmnhw->bcmn", xc, fwd_basis)  # "Spectral" representation
+
+        # If using MLP
+        xhat = torch.einsum("bchw,bhwmn->bcmn", xc, fwd_basis)  # "Spectral" representation
 
         # Multiply by learned weigths in transformed space
         xhat = torch.einsum("bixy,oixy->boxy", xhat, self.learned_weights)
@@ -1929,7 +1930,10 @@ class NLITBlock(nn.Module):
 
         # Einsum: (B, C_out, m1, m2) @ (B, m1, m2, H_out, W_out)* -> (B, C_out, H_out, W_out)
         # We use .conj() for the inverse (adjoint) operation.
-        x_rec = torch.einsum("bcmn,bmnhw->bchw", xhat, inv_basis.conj())
+        # If using conv 1x1
+        # x_rec = torch.einsum("bcmn,bmnhw->bchw", xhat, inv_basis.conj())
+        # If using MLP
+        x_rec = torch.einsum("bcmn,bhwmn->bchw", xhat, inv_basis.conj())
 
         # Normalization
         x_rec = x_rec.real * (1.0 / (H_out * W_out))
@@ -2012,7 +2016,6 @@ class AttentionITBlock(nn.Module):
         self.m1 = m1  # Number of modes kept in height (u)
         self.m2 = m2  # Number of modes kept in width (v)
         self.resampling = resampling
-        self.pos_encoding_dims = pos_encoding_dims #new
 
         self.PE = nn.Parameter(torch.randn(1, pos_encoding_dims, m1, m2))
 
@@ -2024,54 +2027,32 @@ class AttentionITBlock(nn.Module):
             hidden_dim=mlp_hidden_dim,
             num_layers=mlp_num_layers,
             activation=activation,
-            norm = None,
         )
 
         # Self-Attention block in the transformed space
-        # self.attention = ComplexAttention(
-        #     in_ch=dim + pos_encoding_dims + in_channels,
-        #     out_ch=out_channels,
-        #     num_heads=num_heads,
-        # )
-        # self.attention = ComplexAttention(
-        # in_ch=in_channels + pos_encoding_dims,  # C_in + PE dims
-        # out_ch=out_channels,
-        # num_heads=num_heads,
-        # )
-         # --- NEW: define attention input dim & pre-projection ---
-        # C_modes = in_channels + pos_encoding_dims (what we actually have)
-        # self.c_modes = in_channels + pos_encoding_dims
-        self.c_modes = in_channels + pos_encoding_dims
-        
-        # Now ComplexAttention sees the dim it expects
         self.attention = ComplexAttention(
-            in_ch=self.c_modes,
+            in_ch=dim + pos_encoding_dims + in_channels,
             out_ch=out_channels,
             num_heads=num_heads,
         )
 
-        self.mixer = nn.Conv2d(out_channels, out_channels, 1, 1, bias=True)
+        self.mixer = nn.Conv2d(
+            in_channels=out_channels,
+            out_channels=out_channels,
+            kernel_size=1,
+            stride=1,
+            bias=True,
+        )
+        # Activation & normalization in physical space (-> real values)
         self.activation = activation()
-        self.norm = norm(out_channels) if norm is not None else None
+        if norm is not None:
+            self.norm = norm(out_channels)
+        else:
+            self.norm = None
+
+        # Shortcut Branch Layer
+        # 1x1 Conv to potentially change input channels to output channels
         self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-
-        # self.mixer = nn.Conv2d(
-        #     in_channels=out_channels,
-        #     out_channels=out_channels,
-        #     kernel_size=1,
-        #     stride=1,
-        #     bias=True,
-        # )
-        # # Activation & normalization in physical space (-> real values)
-        # self.activation = activation()
-        # if norm is not None:
-        #     self.norm = norm(out_channels)
-        # else:
-        #     self.norm = None
-
-        # # Shortcut Branch Layer
-        # # 1x1 Conv to potentially change input channels to output channels
-        # self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
     def forward(self, x):
         """
@@ -2097,8 +2078,8 @@ class AttentionITBlock(nn.Module):
         w_coords_map = torch.linspace(0, 1, W_basis, device=x.device).view(1, 1, W_basis).repeat(1, H_basis, 1)
         coords_2d_base = torch.cat([h_coords_map, w_coords_map], dim=0)
         # coords_2d: (B, 2, H_basis, W_basis). Add the batch dimension.
-        # coords_2d = coords_2d_base.unsqueeze(0).repeat(B, 1, 1, 1)  # B C H W
-        coords_2d = coords_2d_base.unsqueeze(0).expand(B, -1, -1, -1)
+        coords_2d = coords_2d_base.unsqueeze(0).repeat(B, 1, 1, 1)  # B C H W
+
         x_in = torch.cat([coords_2d, x_cond], dim=1)  # (B, 2+cin, H, W)
 
         # 3. Generate kernels
@@ -2114,86 +2095,18 @@ class AttentionITBlock(nn.Module):
         else:
             fwd_basis = encoder_basis
 
-        # # Convert input to complex numbers if it is real
-        # xc = torch.complex(x, torch.zeros_like(x)) if not x.is_complex() else x
-        # # Einsum: (B, C_in, H, W) @ (B, H, W, m1, m2) -> (B, C_in, m1, m2)
-        # xhat = torch.einsum("bchw,bmnhw->bcmn", xc, fwd_basis)  # "Spectral" representation
-
-        # pe = self.PE.expand(B, -1, -1, -1)
-        # xhat = torch.cat([xhat, pe], dim=1)
-        # # xhat = xhat + self.PE.repeat(B, 1, 1, 1)
-
-        # B, C_modes, M1, M2 = xhat.shape
-        # N = M1 * M2
-
-        # # (B, C_modes, M1, M2) -> (B, N, C_modes)
-        # xhat = xhat.view(B, C_modes, N).permute(0, 2, 1)   # (B, N, C_modes)
-
-        # # Self-attention in mode space
-        # xhat = self.attention(xhat, xhat, xhat)            # (B, N, out_channels)
-
-        # # Back to (B, out_channels, m1, m2)
-        # xhat = xhat.permute(0, 2, 1).view(B, self.out_channels, M1, M2)
-
-        # # Attention in transformed space (uses complex attnetion)
-        # xhat = xhat.permute(0, 2, 3, 1).view(-1, 2 + C)  # (B, m1, m2, C_in)
-        # xhat = self.attention(xhat, xhat, xhat)
-        # xhat = xhat.permute(0, 3, 1, 2)  # (B, C_out, m1, m2)
-        # xhat = xhat.view(B, self.out_channels, self.m1, self.m2)
-        # -------- forward transform --------
+        # Convert input to complex numbers if it is real
         xc = torch.complex(x, torch.zeros_like(x)) if not x.is_complex() else x
-        xhat_c = torch.einsum("bchw,bmnhw->bcmn", xc, fwd_basis)  # (B, C_in, m1, m2)
+        # Einsum: (B, C_in, H, W) @ (B, H, W, m1, m2) -> (B, C_in, m1, m2)
+        xhat = torch.einsum("bchw,bmnhw->bcmn", xc, fwd_basis)  # "Spectral" representation
 
-        # concat PE as extra channels in spectral space
-        pe = self.PE.expand(B, -1, -1, -1)          
-        pe_c = torch.complex(pe, torch.zeros_like(pe))             # (B, pos_dims, m1, m2)
-        xhat_c = torch.cat([xhat_c, pe_c], dim=1)                     # (B, C_in + pos_dims, m1, m2)
-        # C_modes = xhat_c.shape[1]
+        xhat = xhat + self.PE.repeat(B, 1, 1, 1)
 
-        # --------- NEW convert complex spectral features -> real channels ---------
-        # xhat_c: (B, C_modes, m1, m2), complex
-
-        # view_as_real -> (B, C_modes, m1, m2, 2) where last dim = [Re, Im]
-        # xhat = xhat_c.real 
-        # xhat_ri = torch.view_as_real(xhat_c)                              # (B, C_modes, m1, m2, 2)
-
-
-        # -------- attention in mode space --------
-        B, C_modes, M1, M2 = xhat_c.shape
-        # assert C_modes == self.c_modes, f"Expected {self.c_modes} modes, got {C_modes}"
-        # xhat_r = xhat_ri.permute(0, 1, 4, 2, 3).reshape(B, 2 * C_modes, M1, M2)
-
-        # --------- attention in mode space ---------
-        # Treat each mode (u,v) as a token:
-        #   tokens = M1 * M2, feature dim = 2*C_modes
-        # C_modes_real = xhat_r.shape[1]                                    # should equal self.c_modes_real
-        N = M1 * M2
-
-        # # (B, C_modes, M1, M2) -> (B, N, C_modes)
-        # xhat = xhat.view(B, C_modes, N).permute(0, 2, 1)        # (B, N, C_modes)
-
-        # # Project feature dim from C_modes -> att_in_ch (= 22)
-        # xhat = self.pre_attn(xhat)                              # (B, N, att_in_ch)
-
-        # # ComplexAttention expects (B, N, att_in_ch)
-        # xhat = self.attention(xhat, xhat, xhat)                 # (B, N, out_channels)
-
-        # # Back to (B, out_channels, m1, m2)
-        # xhat = xhat.permute(0, 2, 1).view(B, self.out_channels, M1, M2)
-        
-        # (B, C_modes_real, M1, M2) -> (B, N, C_modes_real)
-        x_tokens = xhat_c.view(B, C_modes, N).permute(0, 2, 1)    # (B, N, C_modes_real)
-        # x_tokens = xhat_c.permute(0, 2, 3, 1, 4).reshape(B, N, 2 * C_modes)
-        # Real-valued ComplexAttention
-        x_tokens = self.attention(x_tokens, x_tokens, x_tokens)  # (B, N, out_channels)
-        xhat_out = x_tokens.permute(0, 2, 1).view(B, self.out_channels, M1, M2)
-
-
-        # # Back to spectral grid: (B, C_out, m1, m2)
-        # xhat_real = xhat_tokens.permute(0, 2, 1).view(B, self.out_channels, M1, M2)
-
-
-
+        # Attention in transformed space (uses complex attnetion)
+        xhat = xhat.permute(0, 2, 3, 1).view(-1, 2 + C)  # (B, m1, m2, C_in)
+        xhat = self.attention(xhat, xhat, xhat)
+        xhat = xhat.permute(0, 3, 1, 2)  # (B, C_out, m1, m2)
+        xhat = xhat.view(B, self.out_channels, self.m1, self.m2)
 
         # ---2D Inverse Transform ---
         if self.resampling == "down":
@@ -2207,7 +2120,7 @@ class AttentionITBlock(nn.Module):
 
         # Einsum: (B, C_out, m1, m2) @ (B, m1, m2, H_out, W_out)* -> (B, C_out, H_out, W_out)
         # We use .conj() for the inverse (adjoint) operation.
-        x_rec = torch.einsum("bcmn,bmnhw->bchw", xhat_out, inv_basis.conj())
+        x_rec = torch.einsum("bcmn,bmnhw->bchw", xhat, inv_basis.conj())
 
         # Normalization
         x_rec = x_rec.real * (1.0 / (H_out * W_out))
