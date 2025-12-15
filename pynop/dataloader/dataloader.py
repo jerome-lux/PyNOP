@@ -689,81 +689,58 @@ class UnrolledH5ConcentrationDataset(Dataset):
 
         return input_tensor, target_tensor
 
-class H5TimestepDataset_Norm(Dataset):
-    def __init__(self, h5_path, max_sims=100, time_first=True,
-                 mean=None, std=None, transform=None):
-        self.h5_path = h5_path
-        self.time_first = time_first
-        self.transform = transform
-        self.samples = []
-        self._file = None  
+class UnrolledNSDataset(Dataset):
+    """
+    Per-simulation files:
+        velocity: (T, H, W, 2)
 
-        if mean is not None and std is not None:
-            mean = np.asarray(mean)
-            std = np.asarray(std)
-            assert mean.ndim == 1 and std.ndim == 1, "mean/std must be 1D [C]"
-            self.mean = mean[:, None, None]  
-            self.std = std[:, None, None]
-        else:
-            self.mean = None
-            self.std = None
+    Returns:
+        input:  (T_unroll-1, 2, H, W)
+        target: (T_unroll-1, 2, H, W)
+    """
 
-        with h5py.File(h5_path, "r") as f:
-            all_sids = sorted(list(f.keys()))
-            self.sample_ids = all_sids[:max_sims]
+    def __init__(self, per_sim_glob, T_unroll=10, max_files=None):
+        super().__init__()
+        self.files = sorted(glob.glob(per_sim_glob))
+        if max_files is not None:
+            self.files = self.files[:max_files]
+        if not self.files:
+            raise FileNotFoundError(f"No files matched: {per_sim_glob}")
 
-            for sid in self.sample_ids:
-                data_ds = f[sid]["data"]
-                shape = data_ds.shape
+        self.T_unroll = int(T_unroll)
+        self.samples = []     
+        self._handles = {}   
 
-                if time_first:
-                    T = shape[0]
-                else:
-                    T = shape[-1]
-
-                if T < 2:
-                    print(f"Skipping {sid}: T={T} < 2")
+        for file_i, path in enumerate(self.files):
+            with h5py.File(path, "r") as f:
+                v = f["velocity"]
+                if v.ndim != 4 or v.shape[-1] != 2:
+                    raise ValueError(f"{path}: expected velocity (T,H,W,2), got {v.shape}")
+                T = v.shape[0]
+                if T < self.T_unroll:
                     continue
+                for t0 in range(T - self.T_unroll):
+                    self.samples.append((file_i, t0))
 
-                for t in range(T - 1):
-                    self.samples.append((sid, t))
+        print(f"Per-sim files: {len(self.files)}")
+        print(f"T_unroll = {self.T_unroll}")
+        print(f"Total windows: {len(self.samples)}")
 
-        print(f"Found {len(self.sample_ids)} simulations in {os.path.basename(h5_path)}")
-        print(f"Using {len(self.sample_ids)} simulations (first {max_sims})")
-        print(f"Total one-step samples: {len(self.samples)}")
-
-    def _get_file(self):
-        if self._file is None:
-            self._file = h5py.File(self.h5_path, "r")
-        return self._file
+    def _get_file(self, file_i):
+        if file_i not in self._handles:
+            self._handles[file_i] = h5py.File(self.files[file_i], "r")
+        return self._handles[file_i]
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        sid, t = self.samples[idx]
-        f = self._get_file()
-        data_ds = f[sid]["data"]
+        file_i, t0 = self.samples[idx]
+        f = self._get_file(file_i)
 
-        if self.time_first:
-            c_t_np  = data_ds[t]      
-            c_t1_np = data_ds[t + 1]
-        else:
-            c_t_np  = data_ds[..., t] 
-            c_t1_np = data_ds[..., t + 1]
+        seq = f["velocity"][t0 : t0 + self.T_unroll]  
+        seq = np.moveaxis(seq, -1, 1)                
 
-
-        c_t_np  = np.transpose(c_t_np,  (2, 0, 1))
-        c_t1_np = np.transpose(c_t1_np, (2, 0, 1))
-
-        if self.mean is not None and self.std is not None:
-            c_t_np  = (c_t_np  - self.mean) / self.std
-            c_t1_np = (c_t1_np - self.mean) / self.std
-
-        input_tensor  = torch.from_numpy(c_t_np).float()
-        target_tensor = torch.from_numpy(c_t1_np).float()
-
-        if self.transform is not None:
-            input_tensor, target_tensor = self.transform((input_tensor, target_tensor))
-
-        return input_tensor, target_tensor
+        x = torch.from_numpy(seq[:-1]).float()
+        y = torch.from_numpy(seq[1:]).float()
+        return x, y
