@@ -34,11 +34,12 @@ def train_step(model, inputs, targets, loss_fn, optimizer, lossweights=1.0):
     optimizer.step()
     return loss
 
+
 def test_step(model, inputs, targets, loss_fn, lossweights=1.0):
 
     preds = model(inputs)
     if preds.dim() == 5 and preds.shape[1] == 1:
-        preds = preds.squeeze(1)  
+        preds = preds.squeeze(1)
 
     loss = 0.0
 
@@ -52,6 +53,7 @@ def test_step(model, inputs, targets, loss_fn, lossweights=1.0):
         loss = loss_fn(preds, targets) * lossweights
 
     return loss
+
 
 # 3 TODO: implemmmment one stage GAN https://github.com/zju-vipa/OSGAN
 
@@ -93,15 +95,17 @@ def train(
         for i, (inputs, targets) in enumerate(progress_bar):
             inputs = inputs.to(device)
             targets = targets.to(device)
-       
+
             loss = train_step(model, inputs, targets, loss_fn, optimizer, lossweights=lossweights)
 
             loss_meter.update(loss.item(), inputs.size(0))
 
-            current_lr = (scheduler.get_last_lr()[0]
-                      if scheduler is not None and hasattr(scheduler, "get_last_lr")
-                      else optimizer.param_groups[0]["lr"])
-            
+            current_lr = (
+                scheduler.get_last_lr()[0]
+                if scheduler is not None and hasattr(scheduler, "get_last_lr")
+                else optimizer.param_groups[0]["lr"]
+            )
+
             progress_bar.set_postfix(loss=loss_meter.avg, lr=current_lr)
 
             if i >= iterations:
@@ -109,24 +113,25 @@ def train(
 
         avg_loss = loss_meter.avg
 
-        if scheduler is not None: 
+        if scheduler is not None:
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 scheduler.step(avg_loss)
             else:
                 scheduler.step()
-        
 
         if avg_loss < best_loss or epoch == 0:
             best_loss = avg_loss
             torch.save(model.state_dict(), Path(savepath) / Path("best_model.pth"))
 
-        log_lr = (scheduler.get_last_lr()[0]
-              if scheduler is not None and hasattr(scheduler, "get_last_lr")
-              else optimizer.param_groups[0]["lr"])
-        
+        log_lr = (
+            scheduler.get_last_lr()[0]
+            if scheduler is not None and hasattr(scheduler, "get_last_lr")
+            else optimizer.param_groups[0]["lr"]
+        )
+
         writer.add_scalar("loss", avg_loss, epoch + 1)
 
-        writer.add_scalar("lr",   log_lr,   epoch + 1)
+        writer.add_scalar("lr", log_lr, epoch + 1)
 
         if test_loader is not None:
 
@@ -420,7 +425,7 @@ def train_unrolled(
 
         for i, (inputs, targets) in enumerate(progress_bar):
             inputs = inputs.to(device)
-            targets = targets.to(device)  
+            targets = targets.to(device)
             T_unroll = inputs.shape[1]
 
             loss = 0.0
@@ -436,12 +441,12 @@ def train_unrolled(
                     preds = model(inputs[:, t, ...])
                     loss += loss_fn(preds, targets[:, t, ...])
                 else:
-                    preds = model(preds) 
+                    preds = model(preds)
                     if preds.dim() == 5 and preds.shape[1] == 1:
                         preds = preds.squeeze(1)
 
                     targets_t = targets[:, t, ...]
-                        # targets_t = targets[:, step, ...]
+                    # targets_t = targets[:, step, ...]
 
                     loss += loss_fn(preds, targets_t)
 
@@ -498,7 +503,7 @@ def train_unrolled(
 
                         if preds.dim() == 5 and preds.shape[1] == 1:
                             preds = preds.squeeze(1)
-                        
+
                         targets_t = targets[:, t, ...]
 
                         valoss += loss_fn(preds, targets_t)
@@ -528,7 +533,7 @@ def train_new_unrolled(
     detach_every_k: int = 4,
     test_loader=None,
     device=None,
-    lossweights=1.0,  
+    lossweights=1.0,
     scheduler=None,
     iterations=None,
 ):
@@ -556,34 +561,32 @@ def train_new_unrolled(
         model.train()
         loss_meter = AverageMeter()
 
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} [Training]",
-                            leave=True, total=iterations)
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} [Training]", leave=True, total=iterations)
 
         for i, (inputs, targets) in enumerate(progress_bar):
-            inputs = inputs.to(device)    
-            targets = targets.to(device)  
+            inputs = inputs.to(device)
+            targets = targets.to(device)
             B, T_unroll, C, H, W = inputs.shape
             threshold = int(T_unroll * epoch / epochs)
 
             loss = 0.0
 
-            preds = model(inputs[:, 0, ...])       
+            preds = model(inputs[:, 0, ...])
             if preds.dim() == 5 and preds.shape[1] == 1:
                 preds = preds.squeeze(1)
 
             loss += loss_fn(preds, targets[:, 0, ...])
 
-           
             for t in range(1, T_unroll):
 
                 if t > threshold:
-                    # TEACHER FORCING: 
+                    # TEACHER FORCING:
                     preds = model(inputs[:, t, ...])
-                    
+
                 else:
-                    # AUTOREGRESSIVE: 
+                    # AUTOREGRESSIVE:
                     preds = model(preds)
-                   
+
                 if preds.dim() == 5 and preds.shape[1] == 1:
                     preds = preds.squeeze(1)
 
@@ -607,14 +610,12 @@ def train_new_unrolled(
 
         avg_loss = loss_meter.avg
 
-       
         if scheduler is not None:
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 scheduler.step(avg_loss)
             else:
                 scheduler.step()
 
-      
         if avg_loss < best_loss or epoch == 0:
             best_loss = avg_loss
             torch.save(model.state_dict(), Path(savepath) / "best_model.pth")
@@ -622,15 +623,146 @@ def train_new_unrolled(
         writer.add_scalar("loss", avg_loss, epoch + 1)
         writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch + 1)
 
-       
         if test_loader is not None:
             with torch.no_grad():
                 valoss_meter = AverageMeter()
                 model.eval()
 
-                progress_bar = tqdm(test_loader,
-                                    desc=f"Epoch {epoch+1}/{epochs} [Test]",
-                                    leave=True, total=len(test_loader))
+                progress_bar = tqdm(
+                    test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test]", leave=True, total=len(test_loader)
+                )
+
+                for i, (inputs, targets) in enumerate(progress_bar):
+                    inputs = inputs.to(device)
+                    targets = targets.to(device)
+                    B, T_unroll, C, H, W = inputs.shape
+
+                    valoss = 0.0
+
+                    preds = model(inputs[:, 0, ...])
+                    if preds.dim() == 5 and preds.shape[1] == 1:
+                        preds = preds.squeeze(1)
+                    valoss += loss_fn(preds, targets[:, 0, ...])
+
+                    for t in range(1, T_unroll):
+                        preds = model(preds)
+
+                        if preds.dim() == 5 and preds.shape[1] == 1:
+                            preds = preds.squeeze(1)
+
+                        targets_t = targets[:, t, ...]
+                        valoss += loss_fn(preds, targets_t)
+
+                    valoss = valoss / T_unroll
+                    valoss_meter.update(valoss.item(), inputs.size(0))
+
+                progress_bar.set_postfix(loss=valoss_meter.avg)
+                avg_valoss = valoss_meter.avg
+
+                if avg_valoss < best_val_loss or epoch == 0:
+                    best_val_loss = avg_valoss
+                    torch.save(model.state_dict(), Path(savepath) / "best_val_model.pth")
+
+                writer.add_scalar("val_loss", avg_valoss, epoch + 1)
+
+
+def train_unrolled_lin_tf(
+    model,
+    dataloader,
+    epochs,
+    optimizer,
+    savepath,
+    loss_fn=F.mse_loss,
+    detach_every_k=4,
+    test_loader=None,
+    device=None,
+    scheduler=None,
+    iterations=None,
+):
+    os.makedirs(savepath, exist_ok=True)
+    writer = SummaryWriter(savepath)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if device is None else device
+    model.to(device)
+
+    best_loss = float("inf")
+    best_val_loss = float("inf")
+
+    if iterations is None:
+        iterations = len(dataloader)
+
+    for epoch in range(epochs):
+        model.train()
+
+        # tf_prob = 1.0 - epoch / max(1, (epochs - 1))
+        tf_prob = max(0.1, 1.0 - epoch / (epochs - 1))
+
+        loss_meter = AverageMeter()
+
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} [Training]", leave=True, total=iterations)
+
+        for i, (inputs, targets) in enumerate(progress_bar):
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+
+            B, T, C, H, W = inputs.shape
+
+            x = inputs[:, 0]
+            loss = 0.0
+
+            for t in range(T):
+                pred = model(x)
+                if pred.dim() == 5 and pred.shape[1] == 1:
+                    pred = pred.squeeze(1)
+
+                loss = loss + loss_fn(pred, targets[:, t])
+
+                if t < T - 1:
+                    use_teacher = torch.rand((), device=device) < tf_prob
+                    x = inputs[:, t + 1] if use_teacher else pred
+
+                    if detach_every_k and ((t + 1) % detach_every_k == 0):
+                        x = x.detach()
+
+            loss = loss / T
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            loss_meter.update(loss.item(), B)
+            progress_bar.set_postfix(
+                loss=f"{loss_meter.avg:.3e}", tf_prob=f"{tf_prob:.3f}", lr=optimizer.param_groups[0]["lr"]
+            )
+
+            if i >= iterations:
+                break
+
+        avg_loss = loss_meter.avg
+
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(avg_loss)
+            else:
+                scheduler.step()
+
+        if avg_loss < best_loss or epoch == 0:
+            best_loss = avg_loss
+            torch.save(model.state_dict(), Path(savepath) / "best_model.pth")
+
+        writer.add_scalar("loss", avg_loss, epoch + 1)
+        writer.add_scalar("tf_prob", tf_prob, epoch + 1)
+        writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch + 1)
+
+        if test_loader is not None:
+            with torch.no_grad():
+                valoss_meter = AverageMeter()
+                model.eval()
+
+                progress_bar = tqdm(
+                    test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test]", leave=True, total=len(test_loader)
+                )
 
                 for i, (inputs, targets) in enumerate(progress_bar):
                     inputs = inputs.to(device)
@@ -884,6 +1016,7 @@ def CoDANO_training(
 
     writer.close()
 
+
 def train_deeponet(
     model,
     dataloader,
@@ -954,7 +1087,7 @@ def train_deeponet(
                     targets = targets.to(device)
                     timestep = timestep.to(device)
 
-                    val_loss = test_step_deeponet(model, inputs, timestep,targets, loss_fn, lossweights)
+                    val_loss = test_step_deeponet(model, inputs, timestep, targets, loss_fn, lossweights)
                     val_loss_meter.update(val_loss.item(), inputs.size(0))
 
             avg_val_loss = val_loss_meter.avg
@@ -970,32 +1103,31 @@ def train_deeponet(
 
 
 def train_step_deeponet(
-        model,
-        inputs, 
-        times, 
-        targets, 
-        loss_fn, 
-        optimizer, 
-        lossweights=1.0, 
-        gamma = 5.0, 
-        early_t_max=1.0, 
-        time_weighted=True,
-    ):
-    
+    model,
+    inputs,
+    times,
+    targets,
+    loss_fn,
+    optimizer,
+    lossweights=1.0,
+    gamma=5.0,
+    early_t_max=1.0,
+    time_weighted=True,
+):
+
     device = inputs.device
-    inputs = inputs.to(device)     
-    times = times.to(device)        
-    targets = targets.to(device)  
+    inputs = inputs.to(device)
+    times = times.to(device)
+    targets = targets.to(device)
 
     preds = model(inputs, times)
-
 
     if preds.shape != targets.shape:
         raise ValueError(f"Shape mismatch: preds {preds.shape}, targets {targets.shape}")
 
     if not isinstance(loss_fn, (tuple, list)):
         loss_fn = [loss_fn]
-    
+
     if not isinstance(lossweights, (tuple, list)):
         lossweights = [lossweights] * len(loss_fn)
 
@@ -1003,11 +1135,11 @@ def train_step_deeponet(
     time_w = torch.ones_like(t_flat)
     time_w[t_flat <= early_t_max] = gamma
     time_w = time_w.view(-1, 1, 1, 1)
-    
+
     loss = 0.0
     for i, loss_function in enumerate(loss_fn):
         loss += loss_function(preds, targets) * lossweights[i]
-    
+
     # for lf, lw in zip(loss_fn, lossweights):
     #     base = lf(preds, targets)
 
@@ -1024,19 +1156,10 @@ def train_step_deeponet(
     return loss
 
 
-
 @torch.no_grad()
 def test_step_deeponet(
-    model, 
-    inputs, 
-    times, 
-    targets, 
-    loss_fn, 
-    lossweights=1.0, 
-    gamma=5.0, 
-    early_t_max=1.0, 
-    time_weighted=True
-    ):
+    model, inputs, times, targets, loss_fn, lossweights=1.0, gamma=5.0, early_t_max=1.0, time_weighted=True
+):
 
     device = inputs.device
     inputs = inputs.to(device)
@@ -1047,7 +1170,7 @@ def test_step_deeponet(
 
     if preds.shape != targets.shape:
         raise ValueError(f"Shape mismatch: preds {preds.shape}, targets {targets.shape}")
-    
+
     # if not isinstance(loss_fn, (tuple, list)):
     #     loss_fn = [loss_fn]
 
@@ -1080,6 +1203,7 @@ def test_step_deeponet(
     #     total_loss += loss_term * lw
 
     # return total_loss
+
 
 def train_warmup(
     model,
