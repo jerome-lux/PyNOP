@@ -2139,6 +2139,126 @@ class AttentionITBlock(nn.Module):
 
         return output
 
+class updAttentionITBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        m1,
+        m2,
+        mlp_hidden_dim=64,
+        mlp_num_layers=2,
+        num_heads=4,
+        activation=nn.GELU,
+        norm=LayerNorm2d,
+        resampling=None,
+        pos_encoding_dims=2,
+        dim=2,
+    ):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.m1 = m1
+        self.m2 = m2
+        self.resampling = resampling
+        self.pos_encoding_dims = pos_encoding_dims
+
+        # Positional encoding lives in spectral grid (m1,m2)
+        self.PE = nn.Parameter(torch.randn(1, pos_encoding_dims, m1, m2))
+
+        self.basis_generator = Linear1x1Conv(
+            out_ch=self.m1 * self.m2,
+            in_ch=2 + in_channels,
+            hidden_dim=mlp_hidden_dim,
+            num_layers=mlp_num_layers,
+            activation=activation,
+        )
+
+        # Attention feature dim = (in_channels + pos_encoding_dims)
+        # (dim=2 coords are not part of xhat, so don't include them here)
+        att_in = in_channels + pos_encoding_dims
+
+        self.attention = updComplexAttention(
+            in_ch=att_in,
+            out_ch=out_channels,
+            num_heads=num_heads,
+        )
+
+        self.mixer = nn.Conv2d(out_channels, out_channels, kernel_size=1, stride=1, bias=True)
+
+        self.activation = activation()
+        self.norm = norm(out_channels) if norm is not None else None
+        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        # basis resolution
+        if self.resampling == "up":
+            H_basis, W_basis = H * 2, W * 2
+            x_cond = F.interpolate(x, size=(H_basis, W_basis), mode="bilinear", align_corners=False)
+        else:
+            H_basis, W_basis = H, W
+            x_cond = x
+
+        # coords: [1, H, W]
+        h_coords_map = torch.linspace(0, 1, H_basis, device=x.device).view(1, H_basis, 1).repeat(1, 1, W_basis)
+        w_coords_map = torch.linspace(0, 1, W_basis, device=x.device).view(1, 1, W_basis).repeat(1, H_basis, 1)
+        coords_2d = torch.cat([h_coords_map, w_coords_map], dim=0).unsqueeze(0).repeat(B, 1, 1, 1)  # [B,2,H,W]
+
+        x_in = torch.cat([coords_2d, x_cond], dim=1)  # [B, 2+C, H, W]
+
+        # basis: [B, m1*m2, H, W] -> [B, m1, m2, H, W]
+        encoder_basis = self.basis_generator(x_in).view(B, self.m1, self.m2, H_basis, W_basis)
+
+        # forward basis uses input resolution
+        fwd_basis = encoder_basis[:, :, :, ::2, ::2] if self.resampling == "up" else encoder_basis
+
+        xc = x.to(torch.cfloat) if not x.is_complex() else x  # [B,C,H,W]
+
+        # forward transform: [B,C,H,W] x [B,m1,m2,H,W] -> [B,C,m1,m2]
+        xhat = torch.einsum("bchw,bmnhw->bcmn", xc, fwd_basis)
+
+        # CONCAT positional encoding along channel dimension (not add!)
+        pe = self.PE.to(device=xhat.device, dtype=xhat.real.dtype).repeat(B, 1, 1, 1)  # [B,PE,m1,m2]
+        xhat_feat = torch.cat([xhat, pe.to(xhat.dtype)], dim=1)  # [B, C+PE, m1, m2] (complex)
+
+        # tokens: [B, m1*m2, C+PE]
+        x_tokens = xhat_feat.permute(0, 2, 3, 1).reshape(B, self.m1 * self.m2, C + self.pos_encoding_dims)
+
+        # attention: returns [B, N, out_channels]
+        x_tokens = self.attention(x_tokens, x_tokens, x_tokens)
+
+        # back to grid: [B, out_channels, m1, m2]
+        xhat_out = x_tokens.reshape(B, self.m1, self.m2, self.out_channels).permute(0, 3, 1, 2).contiguous()
+
+        # inverse basis
+        if self.resampling == "down":
+            inv_basis = encoder_basis[:, :, :, ::2, ::2]
+            H_out, W_out = H // 2, W // 2
+        else:
+            inv_basis = encoder_basis
+            H_out, W_out = H_basis, W_basis
+
+        # inverse transform: [B,out,m1,m2] x [B,m1,m2,H,W] -> [B,out,H,W]
+        x_rec = torch.einsum("bcmn,bmnhw->bchw", xhat_out.to(torch.cfloat), inv_basis.conj())
+
+        # back to real
+        x_rec = x_rec.real * (1.0 / (H_out * W_out))
+
+        out = self.mixer(x_rec)
+        out = self.norm(out) if self.norm is not None else out
+        out = self.activation(out)
+
+        # shortcut
+        x_sc = x
+        if self.resampling in ("up", "down"):
+            x_sc = F.interpolate(x_sc, size=(H_out, W_out), mode="bilinear", align_corners=False)
+
+        out = out + self.shortcut(x_sc)
+        out = self.activation(out)
+        return out
 
 class IAETBlock(nn.Module):
     """

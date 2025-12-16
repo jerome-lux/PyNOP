@@ -838,6 +838,77 @@ class ComplexAttention(nn.Module):
         output = self.fc_out(output)                            # [B, N, d_model]
 
         return output
+    
+class updComplexAttention(nn.Module):
+    """Complex attention: works on (B, N, F) complex or real tokens."""
+
+    def __init__(self, in_ch, out_ch, num_heads):
+        super().__init__()
+        assert out_ch % num_heads == 0
+        self.d_model = out_ch
+        self.num_heads = num_heads
+        self.head_dim = out_ch // num_heads
+        self._initialized = False
+
+        self.wq = None
+        self.wk = None
+        self.wv = None
+        self.fc_out = None
+
+    def _lazy_init(self, Q: torch.Tensor):
+        in_ch = Q.shape[-1]
+        self.wq = nn.Linear(in_ch, self.d_model, bias=True)
+        self.wk = nn.Linear(in_ch, self.d_model, bias=True)
+        self.wv = nn.Linear(in_ch, self.d_model, bias=True)
+        self.fc_out = nn.Linear(self.d_model, self.d_model, bias=True)
+
+        # match device/dtype (complex dtype is allowed for Linear in recent torch,
+        # but if it breaks on your version, we can project real/imag separately)
+        self.wq.to(device=Q.device, dtype=Q.dtype)
+        self.wk.to(device=Q.device, dtype=Q.dtype)
+        self.wv.to(device=Q.device, dtype=Q.dtype)
+        self.fc_out.to(device=Q.device, dtype=Q.dtype)
+
+        self._initialized = True
+
+    def split_heads(self, x):
+        B, N, d = x.shape
+        x = x.reshape(B, N, self.num_heads, self.head_dim)
+        return x.transpose(1, 2)  # [B,H,N,Dh]
+
+    def combine_heads(self, x):
+        x = x.transpose(1, 2).contiguous()  # [B,N,H,Dh]
+        B, N, H, Dh = x.shape
+        return x.reshape(B, N, H * Dh)
+
+    def forward(self, Q, K, V):  # <-- standard order
+        if not self._initialized:
+            self._lazy_init(Q)
+
+        Q = self.wq(Q)
+        K = self.wk(K)
+        V = self.wv(V)
+
+        Q = self.split_heads(Q)
+        K = self.split_heads(K)
+        V = self.split_heads(V)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1).conj()) / (self.head_dim ** 0.5)
+
+        # softmax must be on REAL scores
+        if torch.is_complex(scores):
+            attn = F.softmax(scores.abs(), dim=-1)  # float
+        else:
+            attn = F.softmax(scores, dim=-1)
+
+        # keep attn real; matmul(real, complex) works fine
+        # out = torch.matmul(attn, V)
+        attn = attn.to(dtype=V.dtype)   # make float -> complex if V is complex
+        out = torch.matmul(attn, V)
+
+        out = self.combine_heads(out)
+        out = self.fc_out(out)
+        return out
 
 class FiniteDifferenceConvolution(nn.Module):
     """Finite Difference Convolution Layer introduced in [1]_.
