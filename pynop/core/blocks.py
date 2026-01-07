@@ -1,4 +1,4 @@
-from re import L
+from typing import Tuple
 from typing import Callable, Union, Sequence
 import numpy as np
 from functools import partial
@@ -1425,6 +1425,83 @@ class SepLITBlock(nn.Module):
         return output
 
 
+class LITDecoder(nn.Module):
+    """
+    learns a integral transform to map a C * m1 * m2 feature map to space using trainable kernels.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        m1: int,
+        m2: int,
+        mlp_hidden_dim: int = 64,
+        mlp_num_layers: int = 2,
+        activation: nn.Module = nn.GELU,
+        norm: nn.Module = LayerNorm2d,
+    ):
+        super().__init__()
+
+        self.m1 = m1
+        self.m2 = m2
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        self.mlp = MLPBlock(
+            out_ch=self.m1 * self.m2,
+            in_ch=2,
+            hidden_dim=mlp_hidden_dim,
+            num_layers=mlp_num_layers,
+            activation=activation,
+        )
+
+        self.spectral_transform = nn.Parameter(torch.randn(in_channels, out_channels, m1, m2, dtype=torch.cfloat))
+        nn.init.constant_(self.spectral_transform, 1.0)
+
+        self.mixer = nn.Conv2d(out_channels, out_channels, kernel_size=1)
+        self.activation = activation()
+        self.norm = norm(out_channels) if norm is not None else nn.Identity()
+
+    def forward(self, xhat, output_res: Tuple[int, int]):
+        """
+        Args:
+            xhat (torch.Tensor): Coefficients spectraux (B, C_in, m1, m2)
+            output_res (tuple): Résolution cible (H, W)
+        Returns:
+            torch.Tensor: Reconstruction spatiale (B, C_out, H, W)
+        """
+        B, C, m1, m2 = xhat.shape
+        H, W = output_res
+
+        h_coords = torch.linspace(0, 1, H, device=xhat.device)
+        w_coords = torch.linspace(0, 1, W, device=xhat.device)
+        grid_h, grid_w = torch.meshgrid(h_coords, w_coords, indexing="ij")
+
+        # Shape: (H*W, 2)
+        coords_2d = torch.stack([grid_h, grid_w], dim=-1).view(-1, 2)
+
+        # Génération des bases
+        # Shape: (H*W, m1*m2) -> (H, W, m1, m2)
+        decoder_basis = self.mlp(coords_2d).view(H, W, self.m1, self.m2)
+
+        # (B, C_in, m1, m2) @ (C_in, C_out, m1, m2) -> (B, C_out, m1, m2)
+        xhat = torch.einsum("bcmn,icmn->bimn", xhat, self.spectral_transform)
+
+        # 3. Inverse Transform
+        # (B, C_out, m1, m2) @ (H, W, m1, m2).conj -> (B, C_out, H, W)
+        x_rec = torch.einsum("bcmn,hwmn->bchw", xhat, decoder_basis.conj())
+
+        # 4. Normalisation et Post-processing
+        x_rec = x_rec.real * (1.0 / (H * W))
+
+        output = self.mixer(x_rec)
+        output = self.norm(output)
+        output = self.activation(output)
+
+        return output
+
+
 class LITBlock(nn.Module):
     """
     Linear Integral Transform Block (LITBlock) is a
@@ -1817,8 +1894,7 @@ class NLITBlock(nn.Module):
         self.m2 = m2  # Number of modes kept in width (v)
         self.resampling = resampling
 
-        # We use faster 1x1conv layers instead of nn.Linear to implement the linear layer
-        # to generate the basis functions from input coordinates and values.
+        # 1x1 conv on a nx * ny feature map seems to be slower than nx*ny batched Linear...
         # self.basis_generator = Linear1x1Conv(
         #     out_ch=self.m1 * self.m2,
         #     in_ch=2 + in_channels,
