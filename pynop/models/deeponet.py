@@ -36,9 +36,8 @@ class DeepONet(nn.Module):
         C can be > 1 if the function is a vector function.
         - CNN or FNO: a structured 2D or 3D grid [Bb, C, H, W] for example).
         Note that the batch dimension of the two networks may not be the same: we evaluate Bb functions at Bt coordinates.
-        The output tensor is therefore [Bb, Bt, ...]: Bt predictions for each of the Bb functions
-        If the output of the branchnet has spatial dimensions (e.g. [Bb, Cout, H, W]), the final results is just the channel wise multiplication of this tensor with the output of the trunknet
-        If there is a decoder, this tensor is reshape to [Bb*Bt, ...], because the decoder is generally trained to decode only one image at a time.
+        The output tensor is therefore [Bb, Bt, ...]: Bt predictions for each of the Bb functions. This is NOT equivalent to the multi-branch DeepONet
+        If there is a decoder, this tensor is reshaped to [Bb*Bt, ...], because the decoder is generally trained to decode only one image at a time.
         """
 
         super(DeepONet, self).__init__()
