@@ -83,6 +83,10 @@ class UnrolledH5Dataset(Dataset):
 
     def __init__(self, h5_path, T_unroll=10, step=None, load_in_ram=False, split_type=None, split_ratio=0.8, seed=42):
 
+        if T_unroll < 1:
+            print("Warning, T_unroll must ba at least 1. Setting it to 1 to continue")
+            T_unroll = 1
+
         self.h5_path = h5_path
         self.T_unroll = T_unroll
         self.step = T_unroll if step is None else step
@@ -94,7 +98,6 @@ class UnrolledH5Dataset(Dataset):
         with h5py.File(h5_path, "r") as f:
             all_sample_ids = sorted(list(f.keys()))
 
-            # --- SEPARATION DES SIMULATIONS ICI ---
             if split_type is not None:
                 import random
 
