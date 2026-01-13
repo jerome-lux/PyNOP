@@ -23,8 +23,6 @@ class LITNet(nn.Module):
         activation: Callable = nn.GELU,
         norm: Callable = LayerNorm2d,
         fixed_pos_encoding: bool = True,
-        trainable_pos_encoding: bool = False,
-        trainable_pos_encoding_dims=8,
     ):
 
         super().__init__()
@@ -32,33 +30,10 @@ class LITNet(nn.Module):
         assert isinstance(hidden_channels, abc.Sequence), "hidden_channels must be a sequence"
 
         self.fixed_pos_encoding = fixed_pos_encoding
-        self.trainable_pos_encoding = trainable_pos_encoding
 
         if fixed_pos_encoding:
             in_channels += 2
             self.grid_encoding = CartesianEmbedding()
-
-        if trainable_pos_encoding:
-            self.pos_enc_decoder = ITDecoder(
-                trainable_pos_encoding_dims,
-                trainable_pos_encoding_dims,
-                modes if isinstance(modes, int) else modes[0],
-                modes if isinstance(modes, int) else modes[1],
-                mlp_hidden_dim=mlp_dim,
-                activation=activation,
-                norm=norm,
-            )
-            self.pos_embedding_weights = nn.Parameter(
-                torch.randn(
-                    1,
-                    trainable_pos_encoding_dims,
-                    modes if isinstance(modes, int) else modes[0],
-                    modes if isinstance(modes, int) else modes[1],
-                    dtype=torch.cfloat,
-                )
-            )
-
-            in_channels += trainable_pos_encoding_dims
 
         self.lifting = nn.Conv2d(in_channels, hidden_channels[0], 1, bias=True)
 
@@ -85,11 +60,6 @@ class LITNet(nn.Module):
 
         if self.fixed_pos_encoding:
             x = self.grid_encoding(x)
-
-        if self.trainable_pos_encoding:
-            learned_pos_encoding = self.pos_enc_decoder(self.pos_embedding_weights, x.shape[2:4])
-            learned_pos_encoding = learned_pos_encoding.expand(x.shape[0], -1, -1, -1)
-            x = torch.cat([x, learned_pos_encoding], dim=1)
 
         x = self.lifting(x)
 
