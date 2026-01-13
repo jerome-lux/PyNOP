@@ -670,6 +670,47 @@ class SinusoidalEmbedding(nn.Module):
         return output
 
 
+class Attention(nn.Module):
+    """Attention Module (can be self or cross attention) depedning on inputs Q, K, V of the forward method"""
+
+    def __init__(self, in_ch, out_ch, num_heads):
+        super(Attention, self).__init__()
+        assert out_ch % num_heads == 0
+        self.d_model = out_ch
+        self.num_heads = num_heads
+        self.head_dim = out_ch // num_heads
+
+        self.wq = nn.Linear(in_ch, out_ch, bias=True)
+        self.wk = nn.Linear(in_ch, out_ch, bias=True)
+        self.wv = nn.Linear(in_ch, out_ch, bias=True)
+
+    def split_heads(self, x):
+        batch_size, seq_len, d_model = x.shape
+        x = x.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        return x.transpose(1, 2)
+
+    def combine_heads(self, x):
+        x = x.transpose(1, 2).contiguous()
+        batch_size, seq_len, num_heads, head_dim = x.shape
+        return x.reshape(batch_size, seq_len, num_heads * head_dim)
+
+    def forward(self, Q, V, K):
+        Q = self.split_heads(self.wq(Q))
+        K = self.split_heads(self.wk(V))
+        V = self.split_heads(self.wv(K))
+
+        attention_scores = torch.matmul(Q, K.transpose(-2, -1))
+        attention_scores = attention_scores / (self.head_dim**0.5)
+
+        attention_scores = attention_scores
+        attention_weights = F.softmax(attention_scores, dim=-1)
+
+        weighted_output = torch.matmul(attention_weights, V)
+        output = self.combine_heads(weighted_output)
+
+        return output
+
+
 class ComplexAttention(nn.Module):
     """Complex attention Module (can be self or cross attention) depedning on inputs Q, K, V of the forward method"""
 
@@ -683,7 +724,6 @@ class ComplexAttention(nn.Module):
         self.wq = nn.Linear(in_ch, out_ch, bias=True, dtype=torch.cfloat)
         self.wk = nn.Linear(in_ch, out_ch, bias=True, dtype=torch.cfloat)
         self.wv = nn.Linear(in_ch, out_ch, bias=True, dtype=torch.cfloat)
-        self.fc_out = nn.Linear(out_ch, out_ch, bias=True, dtype=torch.cfloat)
 
     def split_heads(self, x):
         batch_size, seq_len, d_model = x.shape
@@ -712,7 +752,7 @@ class ComplexAttention(nn.Module):
         weighted_output = torch.matmul(attention_weights, V)
         output = self.combine_heads(weighted_output)
 
-        return self.fc_out(output)
+        return output
 
 
 class FiniteDifferenceConvolution(nn.Module):

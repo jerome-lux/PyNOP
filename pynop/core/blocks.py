@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, Any
 from typing import Callable, Union, Sequence
 import numpy as np
 from functools import partial
@@ -10,6 +10,7 @@ from torchvision.ops import SqueezeExcitation
 from .utils import make_tuple
 from .ops import *
 from .norm import LayerNorm2d
+from ..training.loss import ortho_loss
 
 # TODO: implement FNO block with  differential kernels (i.e. conv when the kernel is rescaled by 1/h and the mean is substracted)
 # It would allows to capture the high frequencies while keeping the resolution invariance, far better and more grounded than  the U-FNO! see neuralop for an implementation
@@ -809,7 +810,7 @@ class UBlock(nn.Module):
             # print("shortcut", shortcuts[i].shape)
             x = self.upblocks[i](x)
             # print("upblock after", i, x.shape)
-            x = torch.cat([shortcuts[i], x], 1)
+            x = torch.concat([shortcuts[i], x], 1)
             x = self.proj[i](x)
             for j in range(n):
                 counter += 1
@@ -1009,7 +1010,7 @@ class CoDABlock2D(nn.Module):
         return attention
 
 
-class MLPBlock(nn.Module):
+class ComplexMLPBlock(nn.Module):
     """
     A small MLP that produces (complex) values for a set of basis functions.
     """
@@ -1071,6 +1072,56 @@ class MLPBlock(nn.Module):
         return complex_output
 
 
+class MLPBlock(nn.Module):
+    """
+    MLP block
+    """
+
+    def __init__(self, in_ch, out_ch, hidden_dim=64, num_layers=2, activation=nn.GELU, norm=nn.LayerNorm, dropout=0.0):
+        """
+        Initializes the MLP.
+        Args:
+            n_dim (int): Dimension of the input coordinates (default: 2).
+            Note: the kernel can be made non linear by using an input with the evaluation of the funciton at the coordinates.
+            num_modes (int): Number of modes to learn.
+            hidden_dim (int): Hidden dimension of the MLP.
+            num_layers (int): Number of hidden layers in the MLP.
+            activation (callable): Activation function to use (default: nn.GELU).
+            norm (callable): Normalization layer to use (default: nn.LayerNorm).
+            dropout (float): Dropout rate (default 0.0).
+        """
+        super().__init__()
+        self.num_modes = out_ch
+
+        layers = []
+        # The first layer takes 1 coordinate (e.g., normalized)
+        layers.append(nn.Linear(in_ch, hidden_dim))
+        if dropout > 0.0:
+            layers.append(nn.Dropout(dropout))
+        if norm is not None:
+            layers.append(norm(hidden_dim))
+        if activation is not None:
+            layers.append(activation())  # Or ReLU, LeakyReLU, etc.
+
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
+            if norm is not None:
+                layers.append(norm(hidden_dim))
+            if activation is not None:
+                layers.append(activation())
+
+        # The last layer produces 2 * num_modes real values (for real and imaginary parts)
+        layers.append(nn.Linear(hidden_dim, out_ch))
+
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x):
+
+        return self.mlp(x)
+
+
 class SepLITBlock(nn.Module):
     """
     Linear Integral Transform Block (LITBlock) is a
@@ -1109,10 +1160,10 @@ class SepLITBlock(nn.Module):
 
         # The bases are MLPs that generate the basis values.
         # These MLPs are the learnable parameters.
-        self.basis_h_fn = MLPBlock(
+        self.basis_h_fn = ComplexMLPBlock(
             out_ch=self.m1, in_ch=1, hidden_dim=mlp_hidden_dim, num_layers=mlp_num_layers, activation=activation
         )
-        self.basis_w_fn = MLPBlock(
+        self.basis_w_fn = ComplexMLPBlock(
             out_ch=self.m2, in_ch=1, hidden_dim=mlp_hidden_dim, num_layers=mlp_num_layers, activation=activation
         )
 
@@ -1271,14 +1322,14 @@ class SepNLITBlock(nn.Module):
 
         # The bases are MLPs that generate the basis values.
         # These MLPs are the learnable parameters.
-        self.basis_h_fn = MLPBlock(
+        self.basis_h_fn = ComplexMLPBlock(
             out_ch=self.m1,
             in_ch=self.coords_dim,
             hidden_dim=mlp_hidden_dim,
             num_layers=mlp_num_layers,
             activation=activation,
         )
-        self.basis_w_fn = MLPBlock(
+        self.basis_w_fn = ComplexMLPBlock(
             out_ch=self.m2,
             in_ch=self.coords_dim,
             hidden_dim=mlp_hidden_dim,
@@ -1338,7 +1389,7 @@ class SepNLITBlock(nn.Module):
         # Repeat the coordinates to match batch and height dimensions: (B, H, W, 1)
         w_coords = w_coords.unsqueeze(0).unsqueeze(0).repeat(batch_size, H, 1, 1)
         # Concatenate channel values and W coordinates: (B, H, W, Cin + 1)
-        w_input = torch.cat([x_w, w_coords], dim=-1)
+        w_input = torch.concat([x_w, w_coords], dim=-1)
         # Flatten for MLP input: (B*H*W, Cin + 1)
         # w_input = w_input.view(-1, channels + 1) not needed
         # Generate basis values for W: (B, H, W, m2)
@@ -1362,7 +1413,7 @@ class SepNLITBlock(nn.Module):
         h_coords = h_coords.unsqueeze(0).unsqueeze(0).repeat(batch_size, self.m2, 1, 1)
 
         # Concatenate channel values and H coordinates: (B, m2, H, Cin + 1)
-        h_input = torch.cat([x_h, h_coords], dim=-1)
+        h_input = torch.concat([x_h, h_coords], dim=-1)
 
         # Flatten for MLP input: (B*m2*H, Cin + 1)
         # h_input = h_input.view(-1, channels + 1)
@@ -1500,7 +1551,7 @@ class ITBlock(nn.Module):
         self.sampling = sampling
 
         in_ch = 2 + in_channels if nonlinear else 2
-        self.basis_generator = MLPBlock(
+        self.basis_generator = ComplexMLPBlock(
             out_ch=self.m1 * self.m2,
             in_ch=in_ch,
             hidden_dim=mlp_hidden_dim,
@@ -1536,42 +1587,6 @@ class ITBlock(nn.Module):
         # 1x1 Conv to potentially change input channels to output channels
         self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
-    def get_ortho_loss(self, basis, n_samples=2048, norm="frobenius", norm_weight=1e-3):
-        """
-        compute a sampled loss to force orthogonality of the kernels
-        basis: (B, H, W, m1, m2) - note that basis should be already normalized
-        n_samples: number of samples
-        """
-        B, H, W, m1, m2 = basis.shape
-        M = m1 * m2
-        basis_flat = basis.view(B, H * W, M)
-        n_samples = min(n_samples, H * W)
-
-        # Spatial sampling
-        indices = torch.randint(0, H * W, (n_samples,), device=basis.device)
-        sampled_basis = basis_flat[:, indices, :]  # (B, n_samples, M)
-
-        # Gram matrix over space
-        # (B, M, n_samples) @ (B, n_samples, M) -> (B, M, M)
-        gram = torch.matmul(sampled_basis.transpose(-2, -1).conj(), sampled_basis)
-        gram = gram * ((H * W) / n_samples)  # because the basis are normalized over H*W
-
-        # Loss: la moyenne risque de limiter un peu les gradients -> norme de Frobenius plus aggresive ?
-        identity = torch.eye(M, device=basis.device).unsqueeze(0).to(basis.dtype)
-        if norm == "frobenius":
-            ortho_loss = torch.linalg.matrix_norm(gram - identity, ord="fro").mean()
-        else:
-            ortho_loss = torch.mean(torch.abs(gram - identity) ** 2)
-
-        # diag = torch.diagonal(gram, dim1=-2, dim2=-1)
-        # off_diag = gram - torch.diag_embed(diag)
-
-        # ortho_loss = (
-        #     off_diag.abs().pow(2).mean() + norm_weight * (diag.real - 1).pow(2).mean()
-        # )  # imag of diag should be 0
-
-        return ortho_loss
-
     def forward(self, x):
         """
         Performs the forward pass of the module for variable resolution input.
@@ -1594,7 +1609,7 @@ class ITBlock(nn.Module):
 
         h_coords_map = torch.linspace(0, 1, H_basis, device=x.device).view(1, H_basis, 1).repeat(1, 1, W_basis)
         w_coords_map = torch.linspace(0, 1, W_basis, device=x.device).view(1, 1, W_basis).repeat(1, H_basis, 1)
-        coords_2d_base = torch.cat([h_coords_map, w_coords_map], dim=0)
+        coords_2d_base = torch.concat([h_coords_map, w_coords_map], dim=0)
         # coords_2d: (B, 2, H_basis, W_basis). Add the batch dimension.
         coords_2d = coords_2d_base.unsqueeze(0).repeat(B, 1, 1, 1)  # B C H W
 
@@ -1602,7 +1617,7 @@ class ITBlock(nn.Module):
         # Using MLP : seems to be faster
         if self.nonlinear:
             x_in = (
-                torch.cat([coords_2d, x_cond], dim=1).permute(0, 2, 3, 1).reshape(B * H * W, 2 + C)
+                torch.concat([coords_2d, x_cond], dim=1).permute(0, 2, 3, 1).reshape(B * H * W, 2 + C)
             )  # (B, 2+cin, H, W)
         else:
             x_in = coords_2d.permute(0, 2, 3, 1).reshape(B * H * W, 2)
@@ -1614,7 +1629,7 @@ class ITBlock(nn.Module):
         encoder_basis = F.normalize(encoder_basis, p=2, dim=(1, 2))
 
         if self.compute_ortho_loss:
-            self.ortho_loss = self.get_ortho_loss(encoder_basis, n_samples=self.sampling)
+            self.ortho_loss = ortho_loss(encoder_basis, n_samples=self.sampling)
 
         if self.resampling == "up":
             # Subsample the generated basis back to H_in x W_in (taking every second point)
@@ -1709,42 +1724,13 @@ class ITEncoder(nn.Module):
 
         in_ch = 2 + in_channels if nonlinear else 2
 
-        self.basis_generator = MLPBlock(
+        self.basis_generator = ComplexMLPBlock(
             out_ch=self.m1 * self.m2,
             in_ch=in_ch,
             hidden_dim=mlp_hidden_dim,
             num_layers=mlp_num_layers,
             activation=activation,
         )
-
-    def get_ortho_loss(self, basis, n_samples=2048, norm="frobenius", norm_weight=1e-3):
-        """
-        compute a sampled loss to force orthogonality of the kernels
-        basis: (B, H, W, m1, m2) - note that basis should be already normalized
-        n_samples: number of samples
-        """
-        B, H, W, m1, m2 = basis.shape
-        M = m1 * m2
-        basis_flat = basis.view(B, H * W, M)
-        n_samples = min(n_samples, H * W)
-
-        # Spatial sampling
-        indices = torch.randint(0, H * W, (n_samples,), device=basis.device)
-        sampled_basis = basis_flat[:, indices, :]  # (B, n_samples, M)
-
-        # Gram matrix over space
-        # (B, M, n_samples) @ (B, n_samples, M) -> (B, M, M)
-        gram = torch.matmul(sampled_basis.transpose(-2, -1).conj(), sampled_basis)
-        gram = gram * ((H * W) / n_samples)  # because the basis are normalized over H*W
-
-        # Loss: la moyenne risque de limiter un peu les gradients -> norme de Frobenius plus aggresive ?
-        identity = torch.eye(M, device=basis.device).unsqueeze(0).to(basis.dtype)
-        if norm == "frobenius":
-            ortho_loss = torch.linalg.matrix_norm(gram - identity, ord="fro").mean()
-        else:
-            ortho_loss = torch.mean(torch.abs(gram - identity) ** 2)
-
-        return ortho_loss
 
     def forward(self, x):
         """
@@ -1764,7 +1750,7 @@ class ITEncoder(nn.Module):
 
         h_coords_map = torch.linspace(0, 1, H_basis, device=x.device).view(1, H_basis, 1).repeat(1, 1, W_basis)
         w_coords_map = torch.linspace(0, 1, W_basis, device=x.device).view(1, 1, W_basis).repeat(1, H_basis, 1)
-        coords_2d_base = torch.cat([h_coords_map, w_coords_map], dim=0)
+        coords_2d_base = torch.concat([h_coords_map, w_coords_map], dim=0)
         # coords_2d: (B, 2, H_basis, W_basis). Add the batch dimension.
         coords_2d = coords_2d_base.unsqueeze(0).repeat(B, 1, 1, 1)  # B C H W
 
@@ -1772,7 +1758,7 @@ class ITEncoder(nn.Module):
         # Using MLP : seems to be faster
         if self.nonlinear:  # concat with the function values
             x_in = (
-                torch.cat([coords_2d, x_cond], dim=1).permute(0, 2, 3, 1).reshape(B * H * W, 2 + C)
+                torch.concat([coords_2d, x_cond], dim=1).permute(0, 2, 3, 1).reshape(B * H * W, 2 + C)
             )  # (B, 2+cin, H, W)
         else:
             x_in = coords_2d.permute(0, 2, 3, 1).view(B * H * W, 2)
@@ -1784,7 +1770,7 @@ class ITEncoder(nn.Module):
         encoder_basis = F.normalize(encoder_basis, p=2, dim=(1, 2))
 
         if self.compute_ortho_loss:
-            self.ortho_loss = self.get_ortho_loss(encoder_basis, n_samples=self.sampling)
+            self.ortho_loss = ortho_loss(encoder_basis, n_samples=self.sampling)
 
         # Convert input to complex numbers if it is real
         xc = torch.complex(x, torch.zeros_like(x)) if not x.is_complex() else x
@@ -1922,7 +1908,7 @@ class AttentionITBlock(nn.Module):
         self.PE = nn.Parameter(torch.randn(1, pos_encoding_dims, m1, m2))
 
         in_ch = 2 + in_channels if nonlinear else 2
-        self.basis_generator = MLPBlock(
+        self.basis_generator = ComplexMLPBlock(
             out_ch=self.m1 * self.m2,
             in_ch=in_ch,
             hidden_dim=mlp_hidden_dim,
@@ -1932,9 +1918,19 @@ class AttentionITBlock(nn.Module):
 
         # Self-Attention block in the transformed space
         self.attention = ComplexAttention(
-            in_ch=dim + pos_encoding_dims + in_channels,
+            in_ch=pos_encoding_dims + in_channels,
             out_ch=out_channels,
             num_heads=num_heads,
+        )
+
+        # Mixing in transformed domain
+        self.fc = MLPBlock(
+            in_ch=out_channels,
+            out_ch=out_channels,
+            hidden_dim=4 * out_channels,
+            num_layers=1,
+            activation=None,
+            norm=None,
         )
 
         self.mixer = nn.Conv2d(
@@ -1954,35 +1950,6 @@ class AttentionITBlock(nn.Module):
         # Shortcut Branch Layer
         # 1x1 Conv to potentially change input channels to output channels
         self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-
-    def get_ortho_loss(self, basis, n_samples=2048, norm="frobenius", norm_weight=1e-3):
-        """
-        compute a sampled loss to force orthogonality of the kernels
-        basis: (B, H, W, m1, m2) - note that basis should be already normalized
-        n_samples: number of samples
-        """
-        B, H, W, m1, m2 = basis.shape
-        M = m1 * m2
-        basis_flat = basis.view(B, H * W, M)
-        n_samples = min(n_samples, H * W)
-
-        # Spatial sampling
-        indices = torch.randint(0, H * W, (n_samples,), device=basis.device)
-        sampled_basis = basis_flat[:, indices, :]  # (B, n_samples, M)
-
-        # Gram matrix over space
-        # (B, M, n_samples) @ (B, n_samples, M) -> (B, M, M)
-        gram = torch.matmul(sampled_basis.transpose(-2, -1).conj(), sampled_basis)
-        gram = gram * ((H * W) / n_samples)  # because the basis are normalized over H*W
-
-        # Loss: la moyenne risque de limiter un peu les gradients -> norme de Frobenius plus aggresive ?
-        identity = torch.eye(M, device=basis.device).unsqueeze(0).to(basis.dtype)
-        if norm == "frobenius":
-            ortho_loss = torch.linalg.matrix_norm(gram - identity, ord="fro").mean()
-        else:
-            ortho_loss = torch.mean(torch.abs(gram - identity) ** 2)
-
-        return ortho_loss
 
     def forward(self, x):
         """
@@ -2006,7 +1973,7 @@ class AttentionITBlock(nn.Module):
 
         h_coords_map = torch.linspace(0, 1, H_basis, device=x.device).view(1, H_basis, 1).repeat(1, 1, W_basis)
         w_coords_map = torch.linspace(0, 1, W_basis, device=x.device).view(1, 1, W_basis).repeat(1, H_basis, 1)
-        coords_2d_base = torch.cat([h_coords_map, w_coords_map], dim=0)
+        coords_2d_base = torch.concat([h_coords_map, w_coords_map], dim=0)
         # coords_2d: (B, 2, H_basis, W_basis). Add the batch dimension.
         coords_2d = coords_2d_base.unsqueeze(0).repeat(B, 1, 1, 1)  # B C H W
 
@@ -2014,7 +1981,7 @@ class AttentionITBlock(nn.Module):
         # Using MLP : seems to be faster
         if self.nonlinear:
             x_in = (
-                torch.cat([coords_2d, x_cond], dim=1).permute(0, 2, 3, 1).reshape(B * H * W, 2 + C)
+                torch.concat([coords_2d, x_cond], dim=1).permute(0, 2, 3, 1).reshape(B * H * W, 2 + C)
             )  # (B, 2+cin, H, W)
         else:
             x_in = coords_2d.permute(0, 2, 3, 1).reshape(B * H * W, 2)
@@ -2026,7 +1993,7 @@ class AttentionITBlock(nn.Module):
         encoder_basis = F.normalize(encoder_basis, p=2, dim=(1, 2))
 
         if self.compute_ortho_loss:
-            self.ortho_loss = self.get_ortho_loss(encoder_basis, n_samples=self.sampling)
+            self.ortho_loss = ortho_loss(encoder_basis, n_samples=self.sampling)
 
         if self.resampling == "up":
             # Subsample the generated basis back to H_in x W_in (taking every second point)
@@ -2039,10 +2006,9 @@ class AttentionITBlock(nn.Module):
 
         xhat = torch.einsum("bchw,bhwmn->bcmn", xc, fwd_basis)  # "Spectral" representation
 
-        xhat = xhat + self.PE.repeat(B, 1, 1, 1)
-
         # Attention in transformed space (uses complex attention)
-        xhat = xhat.permute(0, 2, 3, 1).view(-1, 2 + C)  # (B, m1, m2, C_in)
+        xhat = xhat.permute(0, 2, 3, 1).view(B, -1, C)  # (B, m1 * m2, C_in)
+        xhat = torch.concat([xhat, self.PE.repeat(B, 1, 1)], dim=-1)
         xhat = self.attention(xhat, xhat, xhat)
         xhat = xhat.permute(0, 3, 1, 2)  # (B, C_out, m1, m2)
         xhat = xhat.view(B, self.out_channels, self.m1, self.m2)
@@ -2075,6 +2041,38 @@ class AttentionITBlock(nn.Module):
         output = self.activation(output)
 
         return output
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, n_heads, activation=nn.GELU, mlp_dim=256, dropout=0.1, complex=True):
+        super().__init__()
+
+        self.attention = ComplexAttention(in_ch, out_ch, n_heads) if complex else Attention(in_ch, out_ch, n_heads)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(out_ch, mlp_dim),
+            activation(),  # GELU est souvent préféré dans les Transformers récents
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, out_ch),
+            nn.Dropout(dropout),
+        )
+
+        self.norm1 = nn.LayerNorm(in_ch)
+        self.norm2 = nn.LayerNorm(out_ch)
+
+    def forward(self, x):
+        # x: [B, N, C]
+
+        res = x
+        x = self.norm1(x)
+        x = self.attention(q=x, k=x, v=x)
+        x = x + res
+        res = x
+        x = self.norm2(x)
+        x = self.mlp(x)
+        x = x + res
+
+        return x
 
 
 class IAETBlock(nn.Module):
@@ -2122,14 +2120,14 @@ class IAETBlock(nn.Module):
 
         # The bases are MLPs that generate the basis values.
         # These MLPs are the learnable parameters.
-        self.basis_h_fn = MLPBlock(
+        self.basis_h_fn = ComplexMLPBlock(
             out_ch=self.m1,
             in_ch=self.coords_dim,
             hidden_dim=mlp_hidden_dim,
             num_layers=mlp_num_layers,
             activation=activation,
         )
-        self.basis_w_fn = MLPBlock(
+        self.basis_w_fn = ComplexMLPBlock(
             out_ch=self.m2,
             in_ch=self.coords_dim,
             hidden_dim=mlp_hidden_dim,
@@ -2138,14 +2136,14 @@ class IAETBlock(nn.Module):
         )
         # Decoder MLPs: bases conditionnées par les valeurs des modes spectraux (fréquentiels)
         # Pour la transformation inverse H (m1 -> H), conditionnée par (C_out, m2) modes
-        self.mlp_h_inv = MLPBlock(
+        self.mlp_h_inv = ComplexMLPBlock(
             in_ch=1 + 2 * out_channels,
             out_ch=m1,
             hidden_dim=mlp_hidden_dim,
             num_layers=mlp_num_layers,
             activation=activation,
         )
-        self.mlp_w_inv = MLPBlock(
+        self.mlp_w_inv = ComplexMLPBlock(
             in_ch=1 + 2 * out_channels,
             out_ch=m2,
             hidden_dim=mlp_hidden_dim,
@@ -2201,7 +2199,7 @@ class IAETBlock(nn.Module):
         # We predict m2 kernels for each spatial coordinates
         # Input MLP: (B, H, W, C+1)
         w_coords = torch.linspace(0, 1, w, device=x.device).unsqueeze(-1).unsqueeze(0).unsqueeze(0).repeat(b, h, 1, 1)
-        mlp_w_in = torch.cat([xc.real.permute(0, 2, 3, 1), w_coords], dim=-1)
+        mlp_w_in = torch.concat([xc.real.permute(0, 2, 3, 1), w_coords], dim=-1)
         b_w = self.basis_w_fn(mlp_w_in)  # (B, H, W, m2)
 
         # Matmul: (B, H, C, W) @ (B, H, W, m2) -> (B, H, C, m2)
@@ -2213,7 +2211,7 @@ class IAETBlock(nn.Module):
         h_coords = (
             torch.linspace(0, 1, h, device=x.device).unsqueeze(-1).unsqueeze(0).unsqueeze(0).repeat(b, self.m2, 1, 1)
         )
-        mlp_h_in = torch.cat([x_w.real.permute(0, 3, 2, 1), h_coords], dim=-1)
+        mlp_h_in = torch.concat([x_w.real.permute(0, 3, 2, 1), h_coords], dim=-1)
         # predict m1 kernels for eachcoordinates (m2, H)
         b_h = self.basis_h_fn(mlp_h_in)  # (B, m2, H, m1)
 
@@ -2234,7 +2232,7 @@ class IAETBlock(nn.Module):
         # Prepare conditioning for the MLP (concatenate real and imaginary parts and compress)
         # xf is (B, C_out, m1, m2)
         # Concatenate real and imaginary: (B, 2*C_out, m1, m2)
-        xf_combined_real_imag = torch.cat([xf.real, xf.imag], dim=1)
+        xf_combined_real_imag = torch.concat([xf.real, xf.imag], dim=1)
 
         # Permute so that m1 is the last dimension for the compressor: (B, 2*C_out, m2, m1)
         cond_h_val_for_comp = xf_combined_real_imag.permute(0, 1, 3, 2)
@@ -2245,7 +2243,7 @@ class IAETBlock(nn.Module):
         # Permute for the MLP: (B, m2, h, 2*C_out)
         cond_h_val_mlp_in = cond_h_val_repeated.permute(0, 2, 3, 1)
 
-        mlp_h_inv_in = torch.cat([h_rec_coords, cond_h_val_mlp_in], dim=-1)  # (B, m2, h, 1 + 2*C_out)
+        mlp_h_inv_in = torch.concat([h_rec_coords, cond_h_val_mlp_in], dim=-1)  # (B, m2, h, 1 + 2*C_out)
         b_h_inv = self.mlp_h_inv(mlp_h_inv_in)  # (B, m2, h, m1) - Basis generated by MLP
 
         # Matmul: (B, m2, C_out, m1) @ (B, m2, m1, h).mH -> (B, m2, C_out, h)
@@ -2261,7 +2259,7 @@ class IAETBlock(nn.Module):
         # Prepare conditioning for the MLP (concatenate real and imaginary parts and compress)
         # x_h_rec is (B, C_out, h, m2)
         # Concatenate real and imaginary: (B, 2*C_out, h, m2)
-        x_h_rec_combined_real_imag = torch.cat([x_h_rec.real, x_h_rec.imag], dim=1)
+        x_h_rec_combined_real_imag = torch.concat([x_h_rec.real, x_h_rec.imag], dim=1)
 
         # Permute so that m2 is the last dimension for the compressor: (B, 2*C_out, h, m2)
         cond_w_val_for_comp = x_h_rec_combined_real_imag
@@ -2272,7 +2270,7 @@ class IAETBlock(nn.Module):
         # Permute for the MLP: (B, h, w, 2*C_out)
         cond_w_val_mlp_in = cond_w_val_repeated.permute(0, 2, 3, 1)
 
-        mlp_w_inv_in = torch.cat([w_rec_coords, cond_w_val_mlp_in], dim=-1)  # (B, h, w, 1 + 2*C_out)
+        mlp_w_inv_in = torch.concat([w_rec_coords, cond_w_val_mlp_in], dim=-1)  # (B, h, w, 1 + 2*C_out)
         b_w_inv = self.mlp_w_inv(mlp_w_inv_in)  # (B, h, w, m2) - Basis generated by MLP
 
         # Matmul: (B, h, C_out, m2) @ (B, h, m2, w).mH -> (B, h, C_out, w)

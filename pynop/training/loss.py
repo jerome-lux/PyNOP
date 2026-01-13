@@ -147,3 +147,33 @@ def diffusion_loss(c_pred, ct, dt, diffusivity, x_coords, y_coords, time_derivat
     residual = dc_dt_approx - div_D_grad_c
 
     return torch.mean(residual**2)
+
+
+def ortho_loss(basis, n_samples=2048, norm="frobenius", norm_weight=1e-3):
+    """
+    compute a sampled loss to force orthogonality of the kernels
+    basis: (B, H, W, m1, m2) - note that basis should be already normalized
+    n_samples: number of samples
+    """
+    B, H, W, m1, m2 = basis.shape
+    M = m1 * m2
+    basis_flat = basis.view(B, H * W, M)
+    n_samples = min(n_samples, H * W)
+
+    # Spatial sampling
+    indices = torch.randint(0, H * W, (n_samples,), device=basis.device)
+    sampled_basis = basis_flat[:, indices, :]  # (B, n_samples, M)
+
+    # Gram matrix over space
+    # (B, M, n_samples) @ (B, n_samples, M) -> (B, M, M)
+    gram = torch.matmul(sampled_basis.transpose(-2, -1).conj(), sampled_basis)
+    gram = gram * ((H * W) / n_samples)  # because the basis are normalized over H*W
+
+    identity = torch.eye(M, device=basis.device).unsqueeze(0).to(basis.dtype)
+    if norm == "frobenius":
+        ortho_loss = torch.linalg.matrix_norm(gram - identity, ord="fro") / n_samples
+        ortho_loss = ortho_loss.mean()
+    else:
+        ortho_loss = torch.mean(torch.abs(gram - identity) ** 2)
+
+    return ortho_loss

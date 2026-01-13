@@ -6,3 +6,4 @@ from .CoDANO import *
 from .FNO import *
 from .unet import *
 from .ITNet import *
+from .LNO import *
