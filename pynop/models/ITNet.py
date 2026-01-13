@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from typing import Union, Sequence, Callable
 import collections.abc as abc
 from pynop.core.norm import LayerNorm2d
-from pynop.core.blocks import LITBlock, LITDecoder
+from pynop.core.blocks import ITBlock, ITDecoder
 from pynop.core.ops import CartesianEmbedding
 
 
@@ -17,7 +17,7 @@ class LITNet(nn.Module):
         out_channels: int,
         modes: Union[int, Sequence[int]],
         hidden_channels: Sequence[int],
-        block: Callable = LITBlock,
+        block: Callable = ITBlock,
         mlp_layers: int = 2,
         mlp_dim: int = 64,
         activation: Callable = nn.GELU,
@@ -39,7 +39,7 @@ class LITNet(nn.Module):
             self.grid_encoding = CartesianEmbedding()
 
         if trainable_pos_encoding:
-            self.pos_enc_decoder = LITDecoder(
+            self.pos_enc_decoder = ITDecoder(
                 trainable_pos_encoding_dims,
                 trainable_pos_encoding_dims,
                 modes if isinstance(modes, int) else modes[0],

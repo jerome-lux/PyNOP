@@ -9,6 +9,7 @@ import json
 from typing import Any
 from torchmetrics import MeanMetric
 from attr import dataclass
+from pynop import ITBlock, add_noise
 
 default_scheduler_config = [
     {
@@ -33,6 +34,9 @@ class TrainingSchedule:
     max_autoregressive_steps: int = 0  # maximum number of autoregressive steps
     detach_grad_steps: int = 4  # number of steps before detaching the gradient in autoregressive mode
     loss_fn: Any = torch.nn.MSELoss()
+    force_orthogonality: bool = True
+    ortho_weight: float = 1
+    noise_level: float = 0  # no noise if 0
 
 
 class Model(pl.LightningModule):
@@ -103,14 +107,16 @@ class Model(pl.LightningModule):
         B, T_unroll, C, H, W = inputs.shape
 
         epoch = self.current_epoch
-        max_AR_steps = min(T_unroll - 1, self.train_config.max_autoregressive_steps)
+        max_AR_steps = int(min(T_unroll - 1, self.train_config.max_autoregressive_steps))
         min_AR_steps = max(self.train_config.min_autoregressive_steps, 1)
 
         if self.train_config.start_autoregressive is not None and self.train_config.final_autoregressive is not None:
             nint = max_AR_steps - min_AR_steps + 1
             delta = (self.train_config.final_autoregressive - self.train_config.start_autoregressive) // nint
+            if epoch < self.train_config.start_autoregressive:
+                AR_steps = 0
             if delta > 0:
-                AR_steps = min(max(min_AR_steps + (epoch // delta), 0), max_AR_steps)
+                AR_steps = int(min(max(min_AR_steps + (epoch // delta), 0), max_AR_steps))
             else:
                 AR_steps = max_AR_steps
 
@@ -121,8 +127,9 @@ class Model(pl.LightningModule):
 
         loss = 0.0
 
-        # First prediction - always teacher forcing
-        preds = self.model(inputs[:, 0, ...])  # predict next time step -> should be B, C, H, W
+        # First prediction - always teacher forcing. Note that add_noise returns the input of nise_level is <= 0
+        preds = self.model(add_noise(inputs[:, 0, ...], self.train_config.noise_level, positive=False))
+
         if preds.dim() == 5 and preds.shape[1] == 1:
             preds = preds.squeeze(1)
 
@@ -133,7 +140,7 @@ class Model(pl.LightningModule):
 
             if t < threshold:
                 # TEACHER FORCING:
-                preds = self.model(inputs[:, t, ...])
+                preds = self.model(add_noise(inputs[:, t, ...], self.train_config.noise_level, positive=False))
             else:
                 # AUTOREGRESSIVE:
                 preds = self.model(preds)
@@ -142,19 +149,34 @@ class Model(pl.LightningModule):
 
             targets_t = inputs[:, t + 1, ...]
             loss += self.loss_fn(preds, targets_t)
-
-            # The real batch size is B * self.detach_every_k
+            # limit the gradient backpropagation to detach_every_k time steps
             if (t % self.detach_every_k) == 0:
                 preds = preds.detach()
 
-        loss = loss / (T_unroll - 1)
+        if T_unroll > 1:
+            loss = loss / (T_unroll - 1)
+
         self.train_loss_avg.update(loss)
 
-        self.log("loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("avg_loss", self.train_loss_avg.compute(), prog_bar=True)
+        self.log("MSE", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log("avg_MSE", self.train_loss_avg.compute(), prog_bar=True)
+
+        # orthogonal loss
+        if self.train_config.force_orthogonality:
+            total_ortho_loss = 0
+            for i, module in enumerate(self.model.modules()):
+                if isinstance(module, ITBlock):
+                    total_ortho_loss += module.ortho_loss
+            total_ortho_loss /= i + 1
+            self.log("orth_loss", total_ortho_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            total_loss = loss + self.train_config.ortho_weight * total_ortho_loss
+        else:
+            total_loss = loss
+
+        self.log("loss", total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log("AR_steps", int(AR_steps), on_step=True, prog_bar=True, on_epoch=True, logger=True)
 
-        return loss
+        return total_loss
 
     def validation_step(self, batch, batch_idx):
         inputs, time_idx = batch
@@ -206,7 +228,8 @@ class Model(pl.LightningModule):
             if (t % self.detach_every_k) == 0:
                 preds = preds.detach()
 
-        loss = loss / (T_unroll - 1)
+        if T_unroll > 1:
+            loss = loss / (T_unroll - 1)
 
         self.log("val_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
