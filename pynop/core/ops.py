@@ -382,7 +382,6 @@ class TuckerSpectralConv2d(nn.Module):
 
     def _initialize_parameters_complex(self):
         with torch.no_grad():
-            # Option 1: Initialisation Réelle/Imaginaire séparée avec Kaiming (adapté)
             nn.init.xavier_normal_(self.U.real)
             nn.init.xavier_normal_(self.V.real)
             nn.init.xavier_normal_(self.S.real)
@@ -537,9 +536,11 @@ class CartesianEmbedding(nn.Module):
     Coordinates are normalized to the range [-1, 1] using torch.meshgrid.
     """
 
-    def __init__(self):
+    def __init__(self, minval=-1, maxval=1):
         super().__init__()
         # No learnable parameters needed for this embedding layer
+        self.minval = minval
+        self.maxval = maxval
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -556,8 +557,8 @@ class CartesianEmbedding(nn.Module):
         device = x.device
 
         # Generate 1D coordinate vectors normalized to [-1, 1]
-        x_lin = torch.linspace(-1, 1, steps=width, device=device)  # Shape (W,)
-        y_lin = torch.linspace(-1, 1, steps=height, device=device)  # Shape (H,)
+        x_lin = torch.linspace(self.minval, self.maxval, steps=width, device=device)  # Shape (W,)
+        y_lin = torch.linspace(self.minval, self.maxval, steps=height, device=device)  # Shape (H,)
 
         # Use meshgrid to create 2D grids of coordinates
         # grid_y will have shape (H, W), grid_x will have shape (H, W)
@@ -684,7 +685,6 @@ class ComplexAttention(nn.Module):
         self.wv = nn.Linear(in_ch, out_ch, bias=True, dtype=torch.cfloat)
         self.fc_out = nn.Linear(out_ch, out_ch, bias=True, dtype=torch.cfloat)
 
-    # Méthodes split_heads et combine_heads inchangées
     def split_heads(self, x):
         batch_size, seq_len, d_model = x.shape
         x = x.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
