@@ -529,6 +529,56 @@ class SpectralConv2d(nn.Module):
         )  # (B, C_out, H, W), float
 
         return y
+    
+
+class SpectralConv2d_fast(nn.Module): #PDEBench
+    """
+    PDEBench-style 2D spectral conv:
+      - rfft2
+      - multiply low modes with learned complex weights
+      - uses two weight tensors to cover +/- x frequencies
+      - irfft2 back
+    Input:  [B, Cin, H, W]
+    Output: [B, Cout, H, W]
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes1 = modes1  
+        self.modes2 = modes2 
+
+        scale = 1.0 / (in_channels * out_channels)
+        self.weights1 = nn.Parameter(
+            scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat)
+        )
+        self.weights2 = nn.Parameter(
+            scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat)
+        )
+
+    @staticmethod
+    def compl_mul2d(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.einsum("bixy,ioxy->boxy", a, b)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, Cin, H, W = x.shape
+        x_ft = torch.fft.rfft2(x) 
+
+        out_ft = torch.zeros(
+            B, self.out_channels, H, W // 2 + 1, device=x.device, dtype=torch.cfloat
+        )
+
+        out_ft[:, :, : self.modes1, : self.modes2] = self.compl_mul2d(
+            x_ft[:, :, : self.modes1, : self.modes2], self.weights1
+        )
+        
+        out_ft[:, :, -self.modes1 :, : self.modes2] = self.compl_mul2d(
+            x_ft[:, :, -self.modes1 :, : self.modes2], self.weights2
+        )
+
+        x = torch.fft.irfft2(out_ft, s=(H, W))
+        return x
 
 
 class CartesianEmbedding(nn.Module):

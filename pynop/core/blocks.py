@@ -1497,60 +1497,197 @@ class LITBlock(nn.Module):
         # Shortcut Branch Layer
         # 1x1 Conv to potentially change input channels to output channels
         self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+    # def _get_coords(self, H, W, device, dtype):
+    #     key = (H, W, device)
+    #     if not hasattr(self, "_coords_cache"):
+    #         self._coords_cache = {}
+    #     if key not in self._coords_cache:
+    #         h = torch.linspace(0, 1, H, device=device, dtype=dtype)
+    #         w = torch.linspace(0, 1, W, device=device, dtype=dtype)
+    #         hh = h[:, None].repeat(1, W)
+    #         ww = w[None, :].repeat(H, 1)
+    #         coords = torch.stack([hh, ww], dim=-1).reshape(H*W, 2)  # [HW,2]
+    #         self._coords_cache[key] = coords
+    #     return self._coords_cache[key]
 
-    def forward(self, x):
-        """
-        Performs the forward pass of the module for variable resolution input.
+    # 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, Cin, H, W = x.shape
 
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, C, H, W).
-                                H and W may vary.
-
-        Returns:
-            torch.Tensor: Output tensor of shape (B, C, H, W), real part.
-        """
-        B, C, H, W = x.shape
-
-        # Convert input to complex numbers if it is real
-        xc = torch.complex(x, torch.zeros_like(x)) if not x.is_complex() else x
-
-        # if self.resample == "down":
-        # elif self.resample == "up":
-        # else:
-        h_coords = torch.linspace(0, 1, H, device=x.device).unsqueeze(1).repeat(1, W)
-        w_coords = torch.linspace(0, 1, W, device=x.device).unsqueeze(0).repeat(H, 1)
-        coords_2d = torch.stack([h_coords, w_coords], dim=-1).unsqueeze(0).repeat(B, 1, 1, 1)  # (B, H, W, 2)
-        coords_2d = coords_2d.view(B * H * W, 2)
-
-        encoder_basis = self.mlp(coords_2d)  # (B*H*W, m1*m2)
-
-        # 4. Reshape kernels for Einsum
-        encoder_basis = encoder_basis.view(B, H, W, self.m1, self.m2)
-
-        # Einsum: (B, C_in, H, W) @ (B, H, W, m1, m2) -> (B, C_in, m1, m2)
-        xhat = torch.einsum("bchw,bhwmn->bcmn", xc, encoder_basis)  # "Spectral" representation
-
-        # Multiply by learned weigths in transformed space
+        # complex view of x (cheap)
+        xc = x.to(torch.cfloat) if not x.is_complex() else x
+        h_coords = torch.linspace(0, 1, H, device=x.device).unsqueeze(1).repeat(1, W) 
+        w_coords = torch.linspace(0, 1, W, device=x.device).unsqueeze(0).repeat(H, 1) 
+        coords_2d = torch.stack([h_coords, w_coords], dim=-1).unsqueeze(0).repeat(B, 1, 1, 1) 
+        # (B, H, W, 2) coords_2d = coords_2d.view(B * H * W, 2) 
+        encoder_basis = self.mlp(coords_2d) 
+        # # (B*H*W, m1*m2) # 4. Reshape kernels for Einsum 
+        encoder_basis = encoder_basis.view(B, H, W, self.m1, self.m2) 
+        # # Einsum: (B, C_in, H, W) @ (B, H, W, m1, m2) -> (B, C_in, m1, m2) 
+        #
+        xhat = torch.einsum("bchw,bhwmn->bcmn", xc, encoder_basis) 
+        # "Spectral" representation 
+        # Multiply by learned weigths in transformed space 
         xhat = torch.einsum("bixy,oixy->boxy", xhat, self.learned_weights)
-
-        # ---2D Inverse Transform ---
+        # ---2D Inverse Transform --- # 
         # Einsum: (B, C_out, m1, m2) @ (B, m1, m2, H_out, W_out)* -> (B, C_out, H_out, W_out)
-        # We use .conj() for the inverse (adjoint) operation.
-        x_rec = torch.einsum("bcmn,bhwmn->bchw", xhat, encoder_basis.conj())
-
-        # Normalization
-        x_rec = x_rec.real * (1.0 / (H * W))
-
-        # Mixing channels
-        output = self.mixer(x_rec)
+        # We use .conj() for the inverse (adjoint) operation. 
+        x_rec = torch.einsum("bcmn,bhwmn->bchw", xhat, encoder_basis.conj()) 
+        # Normalization 
+        x_rec = x_rec.real * (1.0 / (H * W)) 
+        # Mixing channels 
+        output = self.mixer(x_rec) 
         output = self.norm(output) if self.norm is not None else output
-        output = self.activation(output)
-
-        # Shortcut connection
-        output = output + self.shortcut(x)
-        output = self.activation(output)
-
+        output = self.activation(output) 
+        # Shortcut connection 
+        output = output + self.shortcut(x) 
+        output = self.activation(output) 
         return output
+
+
+        # coords = self._get_coords(H, W, x.device, x.dtype)      # [HW, 2]
+        # basis = self.mlp(coords).view(H, W, self.m1, self.m2)   # [H,W,m1,m2] (cfloat)
+
+        # # Hc, Wc = H // 2, W // 2
+        # # coords_c = self._get_coords(Hc, Wc, x.device, x.dtype)
+        # # basis_c = self.mlp(coords_c).view(Hc, Wc, self.m1, self.m2)  # complex64 likely
+
+        # # # [Hc,Wc,m1,m2] -> treat m1*m2 as channels: [1, M, Hc, Wc]
+        # # M = self.m1 * self.m2
+        # # basis_ch = basis_c.permute(2, 3, 0, 1).reshape(M, Hc, Wc).unsqueeze(0)  # complex
+
+        # # # split real/imag for interpolation
+        # # basis_r = basis_ch.real
+        # # basis_i = basis_ch.imag
+
+        # # basis_r_up = F.interpolate(basis_r, size=(H, W), mode="bilinear", align_corners=False)
+        # # basis_i_up = F.interpolate(basis_i, size=(H, W), mode="bilinear", align_corners=False)
+
+        # # basis_up = torch.complex(basis_r_up, basis_i_up)  # [1, M, H, W] complex
+
+        # # # back to [H,W,m1,m2]
+        # # basis = basis_up.squeeze(0).view(self.m1, self.m2, H, W).permute(2, 3, 0, 1)
+
+        # # forward transform: [B,Cin,H,W] x [H,W,m1,m2] -> [B,Cin,m1,m2]
+        # xhat = torch.einsum("bchw,hwmn->bcmn", xc, basis)
+
+        # # channel mixing in transform space: [B,Cin,m1,m2] x [Cin,Cout,m1,m2] -> [B,Cout,m1,m2]
+        # # (your learned_weights are complex)
+        # xhat = torch.einsum("bimn, iomn -> bomn", xhat, self.learned_weights)
+
+        # # inverse transform: [B,Cout,m1,m2] x [H,W,m1,m2] -> [B,Cout,H,W]
+        # x_rec = torch.einsum("bcmn,hwmn->bchw", xhat, basis.conj())
+
+        # # normalization (real output)
+        # x_rec = x_rec.real * (1.0 / (H * W))
+        # # x_rec = x_rec.real / (self.m1 * self.m2)
+
+        # # post-mix + norm + act
+        # out = self.mixer(x_rec)
+        # if self.norm is not None:
+        #     out = self.norm(out)
+        # out = self.activation(out)
+
+        # # residual
+        # out = out + self.shortcut(x)
+        # out = self.activation(out)
+        # return out
+
+
+class newLITBlock(nn.Module):
+    """
+    FNO-bench comparable LITBlock:
+      - basis = MLP(coords) (global, not per-sample)
+      - basis energy normalization per mode
+      - no 1/(H*W) scaling (basis is not orthonormal)
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        m1,
+        m2,
+        mlp_hidden_dim=64,
+        mlp_num_layers=2,
+        activation=nn.GELU,
+        norm=None,  # you can pass LayerNorm2d if you want
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.m1 = m1
+        self.m2 = m2
+
+        self.mlp = MLPBlock(
+            out_ch=self.m1 * self.m2,
+            in_ch=2,
+            hidden_dim=mlp_hidden_dim,
+            num_layers=mlp_num_layers,
+            activation=activation,
+        )
+
+        # complex learned mixing in transform space
+        self.learned_weights = nn.Parameter(
+            torch.empty(in_channels, out_channels, self.m1, self.m2, dtype=torch.cfloat)
+        )
+        # small init (do NOT set to 1 everywhere)
+        with torch.no_grad():
+            self.learned_weights.real.normal_(0.0, 0.02)
+            self.learned_weights.imag.normal_(0.0, 0.02)
+
+        self.mixer = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=True)
+
+        self.activation = activation()
+        self.norm = norm(out_channels) if norm is not None else None
+
+        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=True)
+
+        self._coords_cache = {}  # (H,W,device,dtype) -> coords [HW,2]
+
+    def _coords(self, H, W, device, dtype):
+        key = (H, W, device, dtype)
+        if key not in self._coords_cache:
+            h = torch.linspace(0, 1, H, device=device, dtype=dtype)
+            w = torch.linspace(0, 1, W, device=device, dtype=dtype)
+            hh = h[:, None].expand(H, W)
+            ww = w[None, :].expand(H, W)
+            coords = torch.stack([hh, ww], dim=-1).reshape(H * W, 2)  # [HW,2]
+            self._coords_cache[key] = coords
+        return self._coords_cache[key]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, Cin, H, W = x.shape
+
+        # complex view (float32 complex); avoid fp16 complex kernels
+        xc = x.to(torch.float32).to(torch.cfloat)
+
+        # ---- global basis (no batch dimension) ----
+        coords = self._coords(H, W, x.device, torch.float32)  # [HW,2]
+        basis = self.mlp(coords).view(H, W, self.m1, self.m2)  # [H,W,m1,m2] complex (from MLPBlock)
+
+        # ---- basis energy normalization (critical) ----
+        energy = (basis.real**2 + basis.imag**2).mean(dim=(0, 1), keepdim=True)  # [1,1,m1,m2]
+        basis = basis / torch.sqrt(energy + 1e-6)
+
+        # ---- forward transform ----
+        xhat = torch.einsum("bchw,hwmn->bcmn", xc, basis)  # [B,Cin,m1,m2]
+
+        # ---- mixing in transform space ----
+        xhat = torch.einsum("bimn,iomn->bomn", xhat, self.learned_weights)  # [B,Cout,m1,m2]
+
+        # ---- inverse transform ----
+        x_rec = torch.einsum("bcmn,hwmn->bchw", xhat, basis.conj())  # [B,Cout,H,W]
+        x_rec = x_rec.real  # NO 1/(H*W) scaling
+
+        out = self.mixer(x_rec)
+        if self.norm is not None:
+            out = self.norm(out)
+        out = self.activation(out)
+
+        out = out + self.shortcut(x)
+        out = self.activation(out)
+        return out
 
 
 class SepNLITBlock(nn.Module):
@@ -2765,3 +2902,143 @@ class IAETBlock(nn.Module):
 #         attention = attention.view(batch_size, n_tokens * attention.shape[1], *attention.shape[-self.n_dim :])
 
 #         return attention
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# assumes you already have: MLPBlock, LayerNorm2d
+# from your codebase (same as in LITBlock)
+
+class LITTimeCrossAttnBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        m1,
+        m2,
+        mlp_hidden_dim=64,
+        mlp_num_layers=2,
+        d_model=128,         
+        num_heads=4,
+        activation=nn.GELU,
+        norm=LayerNorm2d,
+    ):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.m1 = m1
+        self.m2 = m2
+
+        # Basis MLP:
+        self.mlp = MLPBlock(
+            out_ch=self.m1 * self.m2,
+            in_ch=2,
+            hidden_dim=mlp_hidden_dim,
+            num_layers=mlp_num_layers,
+            activation=activation,
+        )
+
+        # Complex spectral weights: 
+        self.learned_weights = nn.Parameter(
+            torch.randn(self.in_channels, out_channels, self.m1, self.m2, dtype=torch.cfloat)
+        )
+        nn.init.constant_(self.learned_weights, 1.0)
+
+        # --- Attention machinery (REAL) ---
+        
+        self.token_in_dim = 2 * out_channels
+
+        self.token_proj = nn.Linear(self.token_in_dim, d_model)
+        self.time_proj = nn.Sequential(
+            nn.Linear(1, d_model),
+            activation(),
+            nn.Linear(d_model, d_model),
+        )
+
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            batch_first=True,
+        )
+
+        self.to_gamma_beta = nn.Linear(d_model, 2 * d_model)
+        self.token_unproj = nn.Linear(d_model, self.token_in_dim)
+
+        self.mixer = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=True)
+        self.activation = activation()
+        self.norm = norm(out_channels) if norm is not None else None
+        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x, t):
+        """
+        x: (B,Cin,H,W) 
+        t: (B,) or (B,1) 
+        """
+        B, C, H, W = x.shape
+        assert C == self.in_channels, f"Expected Cin={self.in_channels}, got {C}"
+
+        # --- coords (resolution-invariant) ---
+        h_coords = torch.linspace(0, 1, H, device=x.device).unsqueeze(1).repeat(1, W)
+        w_coords = torch.linspace(0, 1, W, device=x.device).unsqueeze(0).repeat(H, 1)
+        coords_2d = torch.stack([h_coords, w_coords], dim=-1)              # (H,W,2)
+        coords_2d = coords_2d.unsqueeze(0).expand(B, -1, -1, -1)           # (B,H,W,2)
+        coords_2d = coords_2d.reshape(B * H * W, 2)                         # (BHW,2)
+
+        # --- basis values ---
+        basis = self.mlp(coords_2d)                                        # (BHW, m1*m2)
+        basis = basis.view(B, H, W, self.m1, self.m2)                      # (B,H,W,m1,m2)
+
+        # --- forward transform: x -> xhat ---
+        xc = torch.complex(x, torch.zeros_like(x))                         # (B,Cin,H,W)
+        xhat = torch.einsum("bchw,bhwmn->bcmn", xc, basis)                 # (B,Cin,m1,m2)
+
+        # --- spectral mixing Cin -> Cout ---
+        
+        xhat = torch.einsum("bimn,oimn->bomn", xhat, self.learned_weights)  # (B,Cout,m1,m2) complex
+
+        # --- prepare tokens for attention (real) ---
+        # (B, Cout, m1, m2) complex -> (B, m1*m2, 2*Cout) real
+        xhat_ri = torch.view_as_real(xhat)                                  # (B,Cout,m1,m2,2)
+        xhat_tokens = xhat_ri.permute(0, 2, 3, 1, 4).reshape(
+            B, self.m1 * self.m2, 2 * self.out_channels
+        )                                                                   # (B,N,2*Cout)
+
+        tok = self.token_proj(xhat_tokens)                                  # (B,N,d_model)
+
+        # --- build timestep query ---
+        if t.ndim == 1:
+            t_in = t[:, None]                                               # (B,1)
+        else:
+            t_in = t                                                        # (B,1) expected
+        q = self.time_proj(t_in).unsqueeze(1)                                # (B,1,d_model)
+
+        # --- cross attention: Q=timestep, K/V=tokens ---
+        ctx, _ = self.cross_attn(query=q, key=tok, value=tok)                # (B,1,d_model)
+
+        # --- FiLM-modulate tokens with context ---
+        gamma_beta = self.to_gamma_beta(ctx)                                 # (B,1,2*d_model)
+        gamma, beta = gamma_beta.chunk(2, dim=-1)                            # each (B,1,d_model)
+        tok = tok * (1.0 + gamma) + beta                                     # broadcast over N
+
+        # --- back to complex mode tensor ---
+        xhat_tokens2 = self.token_unproj(tok)                                # (B,N,2*Cout)
+        xhat_ri2 = xhat_tokens2.view(B, self.m1, self.m2, self.out_channels, 2).permute(
+            0, 3, 1, 2, 4
+        )                                                                    # (B,Cout,m1,m2,2)
+        xhat2 = torch.complex(xhat_ri2[..., 0], xhat_ri2[..., 1])            # (B,Cout,m1,m2)
+
+        # --- inverse transform ---
+        x_rec = torch.einsum("bcmn,bhwmn->bchw", xhat2, basis.conj())        # (B,Cout,H,W)
+        x_rec = x_rec.real * (1.0 / (H * W))
+
+        # --- mixer + residual ---
+        out = self.mixer(x_rec)
+        out = self.norm(out) if self.norm is not None else out
+        out = self.activation(out)
+
+        out = out + self.shortcut(x)
+        out = self.activation(out)
+        return out

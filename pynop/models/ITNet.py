@@ -57,3 +57,56 @@ class LITNet(nn.Module):
         x = self.projection(x)
 
         return x
+
+class LITNetTime(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        modes: Union[int, Sequence[int]],
+        hidden_channels: Sequence[int],
+        block: Callable,
+        mlp_layers: int = 2,
+        mpl_dim: int = 64,
+        activation: Callable = nn.GELU,
+        norm: Callable = LayerNorm2d,
+        **block_kwargs,
+    ):
+        super().__init__()
+        assert isinstance(hidden_channels, abc.Sequence), "hidden_channels must be a sequence"
+
+        self.lifting = nn.Conv2d(in_channels, hidden_channels[0], 1, bias=True)
+        self.ops = nn.ModuleList()
+
+        m1 = modes if isinstance(modes, int) else modes[0]
+        m2 = modes if isinstance(modes, int) else modes[1]
+
+        for i, ch in enumerate(hidden_channels):
+            cin = hidden_channels[0] if i == 0 else hidden_channels[i - 1]
+            self.ops.append(
+                block(
+                    in_channels=cin,
+                    out_channels=ch,
+                    m1=m1,
+                    m2=m2,
+                    mlp_hidden_dim=mpl_dim,
+                    mlp_num_layers=mlp_layers,
+                    activation=activation,
+                    norm=norm,
+                    **block_kwargs,
+                )
+            )
+
+        self.projection = nn.Conv2d(hidden_channels[-1], out_channels, 1, bias=True)
+
+    def forward(self, x, t):
+        """
+        x: (B,C,H,W)
+        t: (B,) or (B,1) 
+        """
+        x = self.lifting(x)
+        for op in self.ops:
+            x = op(x, t=t)
+        x = self.projection(x)
+        return x
+

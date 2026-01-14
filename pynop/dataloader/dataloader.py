@@ -744,3 +744,78 @@ class UnrolledNSDataset(Dataset):
         x = torch.from_numpy(seq[:-1]).float()
         y = torch.from_numpy(seq[1:]).float()
         return x, y
+    
+
+class UnrolledH5DatasetWithTime(Dataset):
+    """
+    Unrolled multi-step dataset for PDEBench HDF5 layout:
+      <sid>/data: (T, H, W, C)
+      <sid>/grid/t: (T,)
+
+    Returns sliding windows of length T_unroll:
+      input_tensor  = seq[0 : T_unroll-1]  -> (T_unroll-1, C, H, W)
+      target_tensor = seq[1 : T_unroll]    -> (T_unroll-1, C, H, W)
+      t_in          = t[0 : T_unroll-1]    -> (T_unroll-1,)
+      t_out         = t[1 : T_unroll]      -> (T_unroll-1,)
+      dt            = t_out - t_in         -> (T_unroll-1,)
+    """
+
+    def __init__(self, h5_path, T_unroll=10, max_sims=None, return_dt=True):
+        super().__init__()
+        self.h5_path = str(h5_path)
+        self.T_unroll = T_unroll
+        self.return_dt = return_dt
+
+        self.samples = []
+        self.sample_ids = []
+        self._file = None
+
+        with h5py.File(self.h5_path, "r") as f:
+            all_sids = sorted(list(f.keys()))
+            if max_sims is not None:
+                all_sids = all_sids[:max_sims]
+
+            for sid in all_sids:
+                if "data" not in f[sid] or "grid" not in f[sid] or "t" not in f[sid]["grid"]:
+                    continue
+
+                T = f[sid]["data"].shape[0]
+                if T < T_unroll:
+                    print(f"Skipping sample {sid}: T={T} < T_unroll={T_unroll}")
+                    continue
+
+                self.sample_ids.append(sid)
+                for t0 in range(T - T_unroll):
+                    self.samples.append((sid, t0))
+
+        print(f"Using {len(self.sample_ids)} simulations from {os.path.basename(self.h5_path)}")
+        print(f"Total unrolled windows: {len(self.samples)}")
+
+    def _get_file(self):
+        if self._file is None:
+            self._file = h5py.File(self.h5_path, "r")
+        return self._file
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sid, t0 = self.samples[idx]
+        f = self._get_file()
+
+        seq = f[sid]["data"][t0 : t0 + self.T_unroll]
+        t = f[sid]["grid"]["t"][t0 : t0 + self.T_unroll]
+
+        seq = np.moveaxis(seq, -1, 1)
+
+        x_in  = torch.from_numpy(seq[:-1]).float() 
+        x_out = torch.from_numpy(seq[1:]).float()
+
+        t_in  = torch.from_numpy(t[:-1]).float()    
+        t_out = torch.from_numpy(t[1:]).float()
+
+        if self.return_dt:
+            dt = t_out - t_in
+            return x_in, x_out, t_in, t_out, dt
+
+        return x_in, x_out, t_in, t_out

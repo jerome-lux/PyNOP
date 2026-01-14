@@ -3,7 +3,8 @@ import numpy as np
 import collections.abc as abc
 import torch
 import torch.nn as nn
-from pynop.core.blocks import FNOBlock, FNOBlockv2, UFNOBlock, ConvFNOBlock
+import torch.nn.functional as F
+from pynop.core.blocks import FNOBlock, FNOBlockv2, UFNOBlock, ConvFNOBlock, SpectralConv2d_fast
 from pynop.core.ops import CartesianEmbedding
 from pynop.core.ops import ConvLayer
 from pynop.core.norm import LayerNorm2d
@@ -153,3 +154,68 @@ class FNO(nn.Module):
         else:
             return x
 
+
+
+class FNO2d_PDEBench(nn.Module):
+    """
+    PDEBench-style FNO2d
+
+    Expects:
+      inp : [B, H, W, initial_step * C]
+      grid: [B, H, W, 2]  (x,y coords)
+
+    Returns:
+      [B, H, W, 1, C]  (one-step prediction with time axis length 1)
+    """
+
+    def __init__(self, num_channels: int, modes1: int = 12, modes2: int = 12, width: int = 20, initial_step: int = 10):
+        super().__init__()
+        self.num_channels = num_channels
+        self.modes1 = modes1
+        self.modes2 = modes2
+        self.width = width
+        self.initial_step = initial_step
+
+        self.padding = 2  
+
+        # "first 10 timesteps + 2 coords" -> lift to width
+        self.fc0 = nn.Linear(initial_step * num_channels + 2, width)
+
+        self.conv0 = SpectralConv2d_fast(width, width, modes1, modes2)
+        self.conv1 = SpectralConv2d_fast(width, width, modes1, modes2)
+        self.conv2 = SpectralConv2d_fast(width, width, modes1, modes2)
+        self.conv3 = SpectralConv2d_fast(width, width, modes1, modes2)
+
+        self.w0 = nn.Conv2d(width, width, 1)
+        self.w1 = nn.Conv2d(width, width, 1)
+        self.w2 = nn.Conv2d(width, width, 1)
+        self.w3 = nn.Conv2d(width, width, 1)
+
+        # projection back to channels
+        self.fc1 = nn.Linear(width, 128)
+        self.fc2 = nn.Linear(128, num_channels)
+
+    def forward(self, inp: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+        # inp:  [B,H,W, initial_step*C]
+        # grid: [B,H,W,2]
+        x = torch.cat((inp, grid), dim=-1)     # [B,H,W, initial_step*C + 2]
+        x = self.fc0(x)                        # [B,H,W,width]
+        x = x.permute(0, 3, 1, 2)              # [B,width,H,W]
+
+        # pad (right/bottom) like PDEBench
+        x = F.pad(x, [0, self.padding, 0, self.padding])
+
+        x = F.gelu(self.conv0(x) + self.w0(x))
+        x = F.gelu(self.conv1(x) + self.w1(x))
+        x = F.gelu(self.conv2(x) + self.w2(x))
+        x = self.conv3(x) + self.w3(x)
+
+        # unpad
+        x = x[..., : -self.padding, : -self.padding]   # [B,width,H,W]
+        x = x.permute(0, 2, 3, 1)                      # [B,H,W,width]
+
+        x = self.fc1(x)
+        x = F.gelu(x)
+        x = self.fc2(x)                                # [B,H,W,C]
+
+        return x.unsqueeze(-2)                          # [B,H,W,1,C]

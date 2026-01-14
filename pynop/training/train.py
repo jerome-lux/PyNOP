@@ -8,11 +8,10 @@ from tqdm.auto import tqdm
 from .metrics import AverageMeter
 from .loss import G_GANLoss, D_GANLoss, ZeroCenteredGradientPenalty, diffusion_loss
 import math
+from torch.cuda.amp import autocast, GradScaler
 
 from torch.utils.tensorboard import SummaryWriter
-
-import torch
-import torch.nn.functional as F
+import numpy as np
 
 
 def train_step(model, inputs, targets, loss_fn, optimizer, lossweights=1.0):
@@ -1276,3 +1275,924 @@ def train_warmup(
                 best_val_loss = avg_val
                 torch.save(model.state_dict(), Path(savepath) / "best_val_model.pth")
             writer.add_scalar("val_loss", avg_val, epoch + 1)
+
+
+def train_time_unrolled(
+    model,
+    dataloader,
+    epochs: int,
+    optimizer,
+    savepath,
+    loss_fn: Callable = F.mse_loss,
+    detach_every_k: int = 4,
+    test_loader=None,
+    device = None,
+    scheduler = None,
+    iterations = None,
+    teacher_forcing: str = "linear",  
+    grad_clip = 1.0,
+):
+    """
+    Expects dataloader batch from UnrolledH5DatasetWithTime:
+      (x_in, x_out, t_in, t_out)   OR   (x_in, x_out, t_in, t_out, dt)
+
+    Shapes:
+      x_in :  (B, T, C, H, W)   where T = T_unroll-1
+      x_out:  (B, T, C, H, W)
+      t_in :  (B, T) or (B, T, 1)  (time associated with x_in steps)
+    Model API:
+      model(x, t) where x=(B,C,H,W), t=(B,1) (or (B,))
+    """
+
+    os.makedirs(savepath, exist_ok=True)
+    writer = SummaryWriter(savepath)
+
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    best_train = float("inf")
+    best_val = float("inf")
+
+    if iterations is None:
+        iterations = len(dataloader)
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        n_samples = 0
+
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} [train]", total=iterations, leave=True)
+
+        for it, batch in enumerate(pbar):
+            if len(batch) == 5:
+                x_in, x_out, t_in, t_out, dt = batch  
+            else:
+                x_in, x_out, t_in, t_out = batch
+
+            x_in = x_in.to(device)    
+            x_out = x_out.to(device)   
+            t_in = t_in.to(device)     
+
+            B, T, C, H, W = x_in.shape
+
+            if t_in.dim() == 2:
+                t_in = t_in.unsqueeze(-1)
+
+            if teacher_forcing == "linear":
+                tf_steps = int(T * (1.0 - epoch / max(1, epochs - 1)))
+            elif teacher_forcing == "none":
+                tf_steps = 0
+            else:
+                raise ValueError(f"teacher_forcing must be 'linear' or 'none', got {teacher_forcing}")
+
+            optimizer.zero_grad(set_to_none=True)
+
+            loss = 0.0
+
+            # step 0 always uses ground truth input
+            pred = model(x_in[:, 0], t_in[:, 0])  
+            loss = loss + loss_fn(pred, x_out[:, 0])
+
+            # rollout
+            for k in range(1, T):
+                if k < tf_steps:
+                    # teacher forcing: use true state at this step
+                    pred = model(x_in[:, k], t_in[:, k])
+                else:
+                    # autoregressive: feed previous prediction, but advance time
+                    pred = model(pred, t_in[:, k])
+
+                loss = loss + loss_fn(pred, x_out[:, k])
+
+                if detach_every_k is not None and detach_every_k > 0 and (k % detach_every_k) == 0:
+                    pred = pred.detach()
+
+            loss = loss / T
+
+            loss.backward()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+
+            bs = x_in.size(0)
+            running_loss += loss.item() * bs
+            n_samples += bs
+
+            avg = running_loss / max(1, n_samples)
+            pbar.set_postfix(loss=avg, tf_steps=tf_steps, lr=optimizer.param_groups[0]["lr"])
+
+            if it + 1 >= iterations:
+                break
+
+        train_loss = running_loss / max(1, n_samples)
+        writer.add_scalar("loss/train", train_loss, epoch + 1)
+        writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch + 1)
+
+        # scheduler
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(train_loss)
+            else:
+                scheduler.step()
+
+        # save best train
+        if train_loss < best_train:
+            best_train = train_loss
+            torch.save(model.state_dict(), Path(savepath) / "best_train_model.pth")
+
+        # validation (pure autoregressive rollout)
+        if test_loader is not None:
+            model.eval()
+            val_running = 0.0
+            val_n = 0
+
+            with torch.no_grad():
+                vpbar = tqdm(test_loader, desc=f"Epoch {epoch+1}/{epochs} [val]", leave=True)
+
+                for batch in vpbar:
+                    if len(batch) == 5:
+                        x_in, x_out, t_in, t_out, dt = batch
+                    else:
+                        x_in, x_out, t_in, t_out = batch
+
+                    x_in = x_in.to(device)
+                    x_out = x_out.to(device)
+                    t_in = t_in.to(device)
+
+                    B, T, C, H, W = x_in.shape
+                    if t_in.dim() == 2:
+                        t_in = t_in.unsqueeze(-1)
+
+                    vloss = 0.0
+
+                    pred = model(x_in[:, 0], t_in[:, 0])
+                    vloss = vloss + loss_fn(pred, x_out[:, 0])
+
+                    for k in range(1, T):
+                        pred = model(pred, t_in[:, k])  # AR
+                        vloss = vloss + loss_fn(pred, x_out[:, k])
+
+                    vloss = vloss / T
+
+                    bs = x_in.size(0)
+                    val_running += vloss.item() * bs
+                    val_n += bs
+                    vpbar.set_postfix(val_loss=val_running / max(1, val_n))
+
+            val_loss = val_running / max(1, val_n)
+            writer.add_scalar("loss/val", val_loss, epoch + 1)
+
+            if val_loss < best_val:
+                best_val = val_loss
+                torch.save(model.state_dict(), Path(savepath) / "best_val_model.pth")
+
+    writer.close()
+
+
+#PdeBench
+
+# def train_one_epoch(model, loader, optimizer, device, initial_step=10, t_train=101):
+#     model.train()
+#     loss_fn = nn.MSELoss(reduction="mean")
+
+#     step_loss_sum = 0.0
+#     full_loss_sum = 0.0
+#     n_batches = 0
+
+#     # pbar = tqdm(loader, desc="Train", leave=False)
+
+#     for xx, yy, grid in loader:
+#         xx = xx.to(device)      # [B,X,Y,initial_step,C]
+#         yy = yy.to(device)      # [B,X,Y,T,C]
+#         grid = grid.to(device)  # [B,X,Y,2]
+
+#         B, X, Y, t_init, C = xx.shape
+#         T = yy.shape[-2]
+#         t_train_eff = min(t_train, T)
+
+#         loss = 0.0
+#         pred = yy[..., :initial_step, :]  
+
+#         # autoregressive rollout loss
+#         for t in range(initial_step, t_train_eff):
+#             inp = xx.reshape(B, X, Y, t_init * C)     # [B,X,Y,initial_step*C]
+#             target = yy[..., t:t+1, :]                # [B,X,Y,1,C]
+#             im = model(inp, grid)                     # [B,X,Y,1,C]
+
+#             loss = loss + loss_fn(im.reshape(B, -1), target.reshape(B, -1))
+
+#             pred = torch.cat((pred, im), dim=-2)      # append along time axis
+#             # xx = torch.cat((xx[..., 1:, :], im), dim=-2)  # slide window
+#             xx = torch.cat((xx[..., 1:, :], im.detach()), dim=-2)
+
+#         optimizer.zero_grad(set_to_none=True)
+#         # loss.backward()
+#         # optimizer.step()
+#         from torch.cuda.amp import autocast, GradScaler
+#         scaler = GradScaler()
+#         # optimizer.zero_grad(set_to_none=True)
+
+#         with autocast():
+#             im = model(inp, grid)
+#             loss = loss + loss_fn(im.reshape(B, -1), target.reshape(B, -1))
+
+#         scaler.scale(loss).backward()
+#         scaler.step(optimizer)
+#         scaler.update()
+
+#         # "full" loss over [0:t_train_eff]
+#         with torch.no_grad():
+#             yy_cut = yy[..., :t_train_eff, :]
+#             full = loss_fn(pred.reshape(B, -1), yy_cut.reshape(B, -1))
+
+#         step_loss_sum += float(loss.detach())
+#         full_loss_sum += float(full.detach())
+#         # pbar.set_postfix(loss=float(loss.detach()))
+
+#     n_batches = len(loader)
+
+#     return step_loss_sum / max(n_batches, 1), full_loss_sum / max(n_batches, 1)
+
+def train_one_epoch(model, loader, optimizer, device, initial_step=10, t_train=101):
+    model.train()
+    loss_fn = nn.MSELoss(reduction="mean")
+
+    step_loss_sum = 0.0
+    full_loss_sum = 0.0
+
+    for xx, yy, grid in loader:
+        xx = xx.to(device)     
+        yy = yy.to(device)      
+        grid = grid.to(device)  
+
+        B, X, Y, t_init, C = xx.shape
+        T = yy.shape[-2]
+        t_train_eff = min(t_train, T)
+
+        loss = 0.0
+        pred = yy[..., :initial_step, :]  
+
+        for t in range(initial_step, t_train_eff):
+            inp = xx.reshape(B, X, Y, t_init * C)
+            target = yy[..., t:t+1, :]
+
+            im = model(inp, grid)
+            loss = loss + loss_fn(im.reshape(B, -1), target.reshape(B, -1))
+
+            pred = torch.cat((pred, im), dim=-2)
+            xx = torch.cat((xx[..., 1:, :], im), dim=-2)  
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            yy_cut = yy[..., :t_train_eff, :]
+            full = loss_fn(pred.reshape(B, -1), yy_cut.reshape(B, -1))
+
+        step_loss_sum += float(loss.detach())
+        full_loss_sum += float(full.detach())
+
+    n_batches = len(loader)
+    return step_loss_sum / max(n_batches, 1), full_loss_sum / max(n_batches, 1)
+
+
+from contextlib import nullcontext
+
+def train_one_epoch_tbptt(
+    model, loader, optimizer, device,
+    initial_step=10, t_train=101,
+    tbptt_k=5,                 
+    amp=True,                
+    scaler=None,               
+):
+    model.train()
+    loss_fn = nn.MSELoss(reduction="mean")
+
+    step_loss_sum = 0.0
+    full_loss_sum = 0.0
+    n_batches = 0
+
+    autocast = torch.cuda.amp.autocast if (amp and device.type == "cuda") else nullcontext
+
+    for xx, yy, grid in loader:
+        xx = xx.to(device)      
+        yy = yy.to(device)      
+        grid = grid.to(device)  
+
+        B, X, Y, t_init, C = xx.shape
+        T = yy.shape[-2]
+        t_train_eff = min(t_train, T)
+
+        pred = yy[..., :initial_step, :] 
+        full_loss = None
+
+        optimizer.zero_grad(set_to_none=True)
+        chunk_loss = 0.0
+        chunk_count = 0
+
+        for t in range(initial_step, t_train_eff):
+            inp = xx.reshape(B, X, Y, t_init * C)
+            target = yy[..., t:t+1, :]
+            with autocast():
+                with torch.cuda.amp.autocast(enabled=False):
+                    im = model(inp.float(), grid.float())  
+                loss_t = loss_fn(im.reshape(B, -1), target.reshape(B, -1))
+            pred = torch.cat((pred, im), dim=-2)
+            xx = torch.cat((xx[..., 1:, :], im), dim=-2)
+
+            chunk_loss = chunk_loss + loss_t
+            chunk_count += 1
+
+            if chunk_count == tbptt_k or t == (t_train_eff - 1):
+                if scaler is None:
+                    chunk_loss.backward()
+                    optimizer.step()
+                else:
+                    scaler.scale(chunk_loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+
+                optimizer.zero_grad(set_to_none=True)
+
+                xx = xx.detach()
+                pred = pred.detach()
+
+                chunk_loss = 0.0
+                chunk_count = 0
+
+        # full loss for reporting (no grad)
+        with torch.no_grad():
+            yy_cut = yy[..., :t_train_eff, :]
+            full_loss = loss_fn(pred.reshape(B, -1), yy_cut.reshape(B, -1))
+
+        step_loss_sum += float(full_loss) 
+        full_loss_sum += float(full_loss)
+        n_batches += 1
+
+    return step_loss_sum / max(n_batches, 1), full_loss_sum / max(n_batches, 1)
+
+@torch.no_grad()
+def validate(model, loader, device, initial_step=10, t_train=101):
+    model.eval()
+    loss_fn = nn.MSELoss(reduction="mean")
+
+    step_loss_sum = 0.0
+    full_loss_sum = 0.0
+    n_batches = 0
+
+    for xx, yy, grid in loader:
+        xx = xx.to(device)
+        yy = yy.to(device)
+        grid = grid.to(device)
+
+        B, X, Y, t_init, C = xx.shape
+        T = yy.shape[-2]
+        t_train_eff = min(t_train, T)
+
+        loss = 0.0
+        pred = yy[..., :initial_step, :]
+
+        for t in range(initial_step, T):
+            inp = xx.reshape(B, X, Y, t_init * C)
+            target = yy[..., t:t+1, :]
+            
+            im = model(inp, grid)
+
+            loss = loss + loss_fn(im.reshape(B, -1), target.reshape(B, -1))
+            pred = torch.cat((pred, im), dim=-2)
+            xx = torch.cat((xx[..., 1:, :], im), dim=-2)
+
+        pred_cut = pred[..., initial_step:t_train_eff, :]
+        yy_cut = yy[..., initial_step:t_train_eff, :]
+        full = loss_fn(pred_cut.reshape(B, -1), yy_cut.reshape(B, -1))
+
+        step_loss_sum += float(loss)
+        full_loss_sum += float(full)
+    n_batches = len(loader)
+
+    return step_loss_sum / max(n_batches, 1), full_loss_sum / max(n_batches, 1)
+
+from tqdm import trange
+
+def fit_like_pdebench_tbptt(
+    model, train_loader, val_loader, device,
+    epochs=500, lr=1e-3, weight_decay=1e-4,
+    scheduler_step=100, scheduler_gamma=0.5,
+    model_update=10, initial_step=10, t_train=101,
+    tbptt_k=5, amp=True,
+    ckpt_path="ckpt.pt", save_history_path=None,
+):
+    model.to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    sch = torch.optim.lr_scheduler.StepLR(opt, step_size=scheduler_step, gamma=scheduler_gamma)
+    scaler = torch.cuda.amp.GradScaler(enabled=(amp and device.type=="cuda"))
+
+    history = {"epoch": [], "train_full": [], "val_full": [], "lr": []}
+    best_val, best_epoch = float("inf"), -1
+
+    for ep in range(epochs):
+        tr_step, tr_full = train_one_epoch_tbptt(
+            model, train_loader, opt, device,
+            initial_step=initial_step, t_train=t_train,
+            tbptt_k=tbptt_k, amp=amp, scaler=scaler,
+        )
+
+        if ep % model_update == 0:
+            va_step, va_full = validate(model, val_loader, device, initial_step=initial_step, t_train=t_train)
+
+            history["epoch"].append(ep)
+            history["train_full"].append(float(tr_full))
+            history["val_full"].append(float(va_full))
+            history["lr"].append(float(opt.param_groups[0]["lr"]))
+
+            if va_full < best_val:
+                best_val, best_epoch = va_full, ep
+                torch.save({"epoch": ep, "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": opt.state_dict(), "loss": best_val}, ckpt_path)
+
+            if save_history_path is not None:
+                import numpy as np
+                np.savez(save_history_path, **{k: np.array(v) for k, v in history.items()})
+
+        sch.step()
+
+    return best_val, best_epoch, history
+
+def fit_fno2d_pdebench(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    epochs=500,
+    lr=1e-3,
+    weight_decay=1e-4,
+    scheduler_step=100,
+    scheduler_gamma=0.5,
+    model_update=10,
+    initial_step=10,
+    t_train=101,
+    ckpt_path="2D_diff-react_FNO.pt",
+    save_history_path=None,
+):
+    model.to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=scheduler_step, gamma=scheduler_gamma
+    )
+
+    best_val = float("inf")
+    best_epoch = -1
+
+    history = {
+        "epoch": [],
+        "lr": [],
+        "train_step": [],
+        "train_full": [],
+        "val_step": [],
+        "val_full": [],
+    }
+
+    total_steps = epochs * len(train_loader)
+    pbar = tqdm(total=total_steps, desc="Training", dynamic_ncols=True)
+
+    global_step = 0
+    for ep in range(epochs):
+        tr_step, tr_full = train_one_epoch(
+            model, train_loader, optimizer, device,
+            initial_step=initial_step, t_train=t_train
+        )
+
+        pbar.update(len(train_loader))
+        global_step += len(train_loader)
+
+        if ep % model_update == 0:
+            va_step, va_full = validate(
+                model, val_loader, device,
+                initial_step=initial_step, t_train=t_train
+            )
+
+            cur_lr = optimizer.param_groups[0]["lr"]
+
+            history["epoch"].append(ep)
+            history["lr"].append(cur_lr)
+            history["train_step"].append(tr_step)
+            history["train_full"].append(tr_full)
+            history["val_step"].append(va_step)
+            history["val_full"].append(va_full)
+
+            if va_full < best_val:
+                best_val = va_full
+                best_epoch = ep
+                torch.save(
+                    {
+                        "epoch": ep,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "loss": best_val,
+                    },
+                    ckpt_path,
+                )
+
+            pbar.set_postfix(
+                ep=ep,
+                lr=f"{cur_lr:.1e}",
+                tr=f"{tr_full:.2e}",
+                va=f"{va_full:.2e}",
+                best=f"{best_val:.2e}",
+            )
+
+            if save_history_path is not None:
+                np.savez(
+                    str(save_history_path),
+                    epoch=np.array(history["epoch"]),
+                    lr=np.array(history["lr"]),
+                    train_step=np.array(history["train_step"]),
+                    train_full=np.array(history["train_full"]),
+                    val_step=np.array(history["val_step"]),
+                    val_full=np.array(history["val_full"]),
+                )
+
+        scheduler.step()
+
+    pbar.close()
+    return best_val, best_epoch, history
+
+from typing import Callable, Optional, Dict
+from tqdm.auto import tqdm
+
+
+def _rollout_loss_runA(
+    model,
+    xx_init,    
+    yy_full,    
+    grid,       
+    *,
+    T_unroll: int,
+    initial_step: int,
+    loss_fn: Callable = F.mse_loss,
+    use_nrmse: bool = False,
+    eps: float = 1e-12,
+    teacher_forcing_prob: float = 0.0,
+    detach_every_k: int = 0,
+):
+    B, X, Y, init, C = xx_init.shape
+    T = yy_full.shape[-2]
+    assert init == initial_step, f"xx_init has init={init}, but initial_step={initial_step}"
+
+    t0 = initial_step
+    t1 = min(T, t0 + T_unroll)
+    steps = t1 - t0
+    if steps <= 0:
+        raise ValueError(f"No steps to unroll: initial_step={initial_step}, T={T}, T_unroll={T_unroll}")
+
+    state = xx_init 
+
+    preds = []
+    targets = []
+
+    for k, t in enumerate(range(t0, t1)):
+        inp = state.reshape(B, X, Y, init * C)   
+        im = model(inp, grid)                    
+
+        if im.ndim == 4:                          
+            im = im.unsqueeze(-2)
+        if im.shape[-2] != 1:
+            raise RuntimeError(f"Model must output [B,X,Y,1,C], got {im.shape}")
+
+        preds.append(im)                         
+        targets.append(yy_full[..., t:t+1, :])   
+
+        # scheduled teacher forcing
+        if teacher_forcing_prob > 0.0 and torch.rand(()) < teacher_forcing_prob:
+            state = yy_full[..., (t - init + 1):(t + 1), :].detach()  
+        else:
+            state = torch.cat([state[..., 1:, :], im], dim=-2)
+
+        if detach_every_k and ((k + 1) % detach_every_k == 0):
+            state = state.detach()
+
+    pred = torch.cat(preds, dim=-2)    
+    targ = torch.cat(targets, dim=-2)  
+
+    if not use_nrmse:
+        return loss_fn(pred, targ)
+
+    num = torch.mean((pred - targ) ** 2)
+    den = torch.mean(targ ** 2)
+    return torch.sqrt(num / (den + eps))
+
+
+@torch.no_grad()
+def validate_runA(
+    model,
+    loader,
+    device,
+    *,
+    T_unroll: int,
+    initial_step: int,
+    loss_fn: Callable = F.mse_loss,
+    use_nrmse: bool = False,
+):
+    model.eval()
+    losses = []
+    for xx_init, yy_full, grid in loader:
+        xx_init = xx_init.to(device)
+        yy_full = yy_full.to(device)
+        grid = grid.to(device)
+
+        loss = _rollout_loss_runA(
+            model, xx_init, yy_full, grid,
+            T_unroll=T_unroll,
+            initial_step=initial_step,
+            loss_fn=loss_fn,
+            use_nrmse=use_nrmse,
+            teacher_forcing_prob=0.0,  
+            detach_every_k=0,
+        )
+        losses.append(float(loss))
+    return float(np.mean(losses)) if losses else float("nan")
+
+def tf_prob_sigmoid(ep, epochs, p_start, p_end, mid=0.35, sharp=12.0):
+    if epochs <= 1:
+        return p_end
+    t = ep / (epochs - 1)             
+    s = 1.0 / (1.0 + math.exp(sharp * (t - mid)))  
+    return p_end + (p_start - p_end) * s
+
+def train_runA_with_history(
+    model,
+    train_loader,
+    epochs: int,
+    optimizer,
+    savepath,
+    *,
+    device=None,
+    test_loader=None,
+    scheduler=None,
+    loss_fn: Callable = F.mse_loss,
+    T_unroll: int = 20,
+    initial_step: int = 1,                
+    use_nrmse: bool = False,              
+    detach_every_k: int = 0,              
+    tf_prob_start: float = 0.0,
+    tf_prob_end: float = 0.0,
+    validate_every: int = 1,
+    save_history_path: Optional[str | Path] = None,
+):
+    """
+    Run-A style training:
+      - dataloader yields (xx_init [B,X,Y,init,C], yy_full [B,X,Y,T,C], grid [B,X,Y,2])
+      - optimize rollout loss over T_unroll steps starting at t=initial_step
+
+    Returns:
+      history dict with epoch/train/val/lr
+    """
+    savepath = Path(savepath)
+    savepath.mkdir(parents=True, exist_ok=True)
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model.to(device)
+
+    history: Dict[str, list] = {"epoch": [], "train": [], "val": [], "lr": []}
+    best_val = float("inf")
+
+    epoch_bar = tqdm(range(epochs), desc="Epochs", dynamic_ncols=True)
+
+    for ep in epoch_bar:
+        model.train()
+
+        # # linear schedule for teacher forcing probability
+        # if epochs > 1:
+        #     tf_prob = tf_prob_start + (tf_prob_end - tf_prob_start) * (ep / (epochs - 1))
+        # else:
+        #     tf_prob = tf_prob_end
+        tf_prob = tf_prob_sigmoid(
+            ep, epochs,
+            tf_prob_start, tf_prob_end,
+            mid=0.3, sharp=14.0
+        )
+
+        train_pbar = tqdm(train_loader, desc=f"Train {ep+1}/{epochs}", leave=False, dynamic_ncols=True)
+
+        running = []
+        for xx_init, yy_full, grid in train_pbar:
+            xx_init = xx_init.to(device)
+            yy_full = yy_full.to(device)
+            grid = grid.to(device)
+
+            loss = _rollout_loss_runA(
+                model, xx_init, yy_full, grid,
+                T_unroll=T_unroll,
+                initial_step=initial_step,
+                loss_fn=loss_fn,
+                use_nrmse=use_nrmse,
+                teacher_forcing_prob=tf_prob,
+                detach_every_k=detach_every_k,
+            )
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            running.append(float(loss))
+            train_pbar.set_postfix(
+                loss=float(np.mean(running)),
+                lr=float(optimizer.param_groups[0]["lr"]),
+                tf=float(tf_prob),
+            )
+
+        train_loss = float(np.mean(running)) if running else float("nan")
+
+        # # scheduler step
+        # if scheduler is not None:
+        #     # ReduceLROnPlateau expects a metric
+        #     if hasattr(scheduler, "step") and scheduler.__class__.__name__ == "ReduceLROnPlateau":
+        #         scheduler.step(train_loss)
+        #     else:
+        #         scheduler.step()
+
+        # validation
+        val_loss = None
+        if test_loader is not None and ((ep + 1) % validate_every == 0):
+            val_loss = validate_runA(
+                model, test_loader, device,
+                T_unroll=T_unroll,
+                initial_step=initial_step,
+                loss_fn=loss_fn,
+                use_nrmse=use_nrmse,
+            )
+            if scheduler is not None and scheduler.__class__.__name__ == "ReduceLROnPlateau":
+                scheduler.step(val_loss)
+
+            if val_loss < best_val:
+                best_val = val_loss
+                torch.save(model.state_dict(), savepath / "best_val_model.pth")
+
+        torch.save(model.state_dict(), savepath / "last_model.pth")
+
+        history["epoch"].append(ep + 1)
+        history["train"].append(train_loss)
+        history["val"].append(val_loss if val_loss is not None else np.nan)
+        history["lr"].append(float(optimizer.param_groups[0]["lr"]))
+
+        if save_history_path is not None:
+            save_history_path = Path(save_history_path)
+            np.savez(
+                save_history_path,
+                epoch=np.array(history["epoch"]),
+                train=np.array(history["train"]),
+                val=np.array(history["val"]),
+                lr=np.array(history["lr"]),
+            )
+
+        epoch_bar.set_postfix(
+            train=train_loss,
+            val=(val_loss if val_loss is not None else np.nan),
+            lr=float(optimizer.param_groups[0]["lr"]),
+        )
+
+    return history
+
+
+def train_one_epoch_ar_tbptt(
+    model, loader, optimizer, device,
+    initial_step=10, t_train=101, tbptt_k=5,
+):
+    model.train()
+    loss_fn = nn.MSELoss(reduction="mean")
+
+    epoch_loss_sum = 0.0
+    epoch_steps = 0
+
+    for xx, yy, grid in loader:
+        xx = xx.to(device)
+        yy = yy.to(device)
+        grid = grid.to(device)
+
+        B, X, Y, t_init, C = xx.shape
+        T = yy.shape[-2]
+        t_train_eff = min(t_train, T)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        chunk_loss = 0.0
+        chunk_count = 0
+
+        for t in range(initial_step, t_train_eff):
+            inp = xx.reshape(B, X, Y, t_init * C)
+            target = yy[..., t:t+1, :]
+
+            im = model(inp, grid)
+            if im.ndim == 4:
+                im = im.unsqueeze(-2)
+
+            loss_t = loss_fn(im.reshape(B, -1), target.reshape(B, -1))
+            chunk_loss = chunk_loss + loss_t
+            chunk_count += 1
+
+            xx = torch.cat((xx[..., 1:, :], im), dim=-2)
+
+            if (chunk_count == tbptt_k) or (t == t_train_eff - 1):
+                (chunk_loss / chunk_count).backward()
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+                xx = xx.detach()
+
+                epoch_loss_sum += float(chunk_loss.detach())
+                epoch_steps += chunk_count
+
+                chunk_loss = 0.0
+                chunk_count = 0
+
+    return epoch_loss_sum / max(epoch_steps, 1)
+
+
+def fit_with_warmup_tbptt(
+    model, train_loader, val_loader, device,
+    *,
+    epochs=200,
+    warmup_epochs=10,
+    warmup_start_factor=0.1,
+    initial_step=10,
+    t_train=101,
+    tbptt_k=5,
+    lr=1e-3,
+    weight_decay=1e-4,
+    model_update=10,
+    ckpt_path="best.pt",
+    save_history_path=None,
+):
+    model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=10
+    )
+
+    ckpt_path = Path(ckpt_path)
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
+    history = {"epoch": [], "lr": [], "train": [], "val": []}
+    best_val = float("inf")
+
+    base_lr = lr
+    start_lr = base_lr * warmup_start_factor
+
+    scaler = None
+
+    for ep in tqdm(range(epochs), desc="Epochs", dynamic_ncols=True):
+        if warmup_epochs > 0 and ep < warmup_epochs:
+            alpha = (ep + 1) / warmup_epochs
+            lr_now = start_lr + alpha * (base_lr - start_lr)
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr_now
+
+        tr = train_one_epoch_ar_tbptt(
+            model, train_loader, optimizer, device,
+            initial_step=initial_step, t_train=t_train, tbptt_k=tbptt_k
+        )
+
+        if ep % model_update == 0:
+            va_step, va_full = validate(
+                model, val_loader, device,
+                initial_step=initial_step, t_train=t_train
+            )
+            va = va_full  
+
+            cur_lr = optimizer.param_groups[0]["lr"]
+            history["epoch"].append(ep)
+            history["lr"].append(cur_lr)
+            history["train"].append(tr)
+            history["val"].append(va)
+
+            if not (warmup_epochs > 0 and ep < warmup_epochs):
+                plateau.step(va)
+
+            if va < best_val:
+                best_val = va
+                torch.save(
+                    {
+                        "epoch": ep,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "loss": best_val,
+                    },
+                    ckpt_path,
+                )
+
+            if save_history_path is not None:
+                np.savez(
+                    str(save_history_path),
+                    epoch=np.array(history["epoch"]),
+                    lr=np.array(history["lr"]),
+                    train=np.array(history["train"]),
+                    val=np.array(history["val"]),
+                )
+
+    return history
