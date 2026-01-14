@@ -33,7 +33,7 @@ class PairedTimeSeriesDataset(Dataset):
     ):
         """
         Args:
-            series_data_dir (str): Directory containing time series XXXX.npy files (each [Nt, ...]).
+            series_data_dir (str): Directory containing time series XXXX.npy files (each [Nt, ...] or [..., Nt]).
             static_field_dir (str): Directory containing static field YYYY.npy files (each [H, W]).
                                     It's assumed XXXX and YYYY identifiers match.
             t_n (int): Number of timesteps for unrolling (sequence length).
@@ -51,6 +51,10 @@ class PairedTimeSeriesDataset(Dataset):
         self.t_dim = 0 if time_first else -1  # Time dimension index
         self.transform = transform
         self.expected_channels_from_user = expected_channels_from_user
+
+        assert (
+            t_n > 1
+        ), "The number of time steps must be > 1: we need at least the input f(t_i) and one target f(t_{i+1})"
 
         self.samples_info = []  # List of tuples: (series_filepath, static_field_filepath, start_slice_index)
 

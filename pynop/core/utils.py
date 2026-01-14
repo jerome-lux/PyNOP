@@ -6,6 +6,17 @@ import torch
 import torch.nn.functional as F
 
 
+def add_noise(u, noise_level=1e-3, positive=True):
+    if noise_level <= 0:
+        return u
+    noise = torch.randn_like(u) * noise_level
+    u_noisy = u + noise
+    if positive:
+        return torch.clamp(u_noisy, min=0.0)
+    else:
+        return u_noisy
+
+
 def make_tuple(value, n):
     # should test if "value" is iterable instead?
     if not isinstance(value, Sequence) or isinstance(value, str):
