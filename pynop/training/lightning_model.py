@@ -9,7 +9,8 @@ import json
 from typing import Any
 from torchmetrics import MeanMetric
 from attr import dataclass
-from pynop import ITBlock, add_noise
+from pynop.core.blocks import ITBlock
+from pynop.core.utils import add_noise
 
 default_scheduler_config = [
     {

@@ -4,7 +4,7 @@ import collections.abc as abc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pynop.core.blocks import FNOBlock, FNOBlockv2, UFNOBlock, ConvFNOBlock, SpectralConv2d_fast
+from pynop.core.blocks import FNOBlock, FNOBlockv2, UFNOBlock, ConvFNOBlock, SpectralConv2d
 from pynop.core.ops import CartesianEmbedding
 from pynop.core.ops import ConvLayer
 from pynop.core.norm import LayerNorm2d
