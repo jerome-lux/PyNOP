@@ -651,16 +651,10 @@ class SinusoidalEmbedding(nn.Module):
         # Resulting shape (H, W, 2, num_frequencies * 2)
         grid_embeddings = torch.cat([sin_vals, cos_vals], dim=-1)
 
-        # Rearrange dimensions to have embedding channels after the batch
-        # From (H, W, 2, num_frequencies * 2) to (2 * num_frequencies * 2, H, W)
-        # then (B, 2 * num_frequencies * 2, H, W)
-        # permute(2, 3, 0, 1) -> (2, num_frequencies * 2, H, W)
-        # reshape(1, -1, height, width) -> (1, total_embedding_channels, H, W)
         grid_embeddings = grid_embeddings.permute(2, 3, 0, 1).reshape(
             1, -1, height, width
         )  # Shape (1, num_frequencies * 4, H, W)
 
-        # Expand over the batch dimension
         grid_embeddings = grid_embeddings.expand(batch_size, -1, -1, -1)  # Shape (B, num_frequencies * 4, H, W)
 
         # Concatenate with the input tensor
@@ -668,6 +662,28 @@ class SinusoidalEmbedding(nn.Module):
         output = torch.cat([x, grid_embeddings], dim=1)
 
         return output
+
+
+def sin_positional_encoding_2d(d_model, H, W, basis=10000.0, device="cpu"):
+    if d_model % 4 != 0:
+        raise ValueError("d_model doit être divisible par 4")
+    d_half = d_model // 2
+
+    y_coords = torch.arange(H, device=device).float().unsqueeze(1)
+    x_coords = torch.arange(W, device=device).float().unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, d_half, 2, device=device).float() * -(math.log(basis) / d_half))
+
+    pe_y = torch.zeros(d_half, H, W, device=device)
+    pe_y[0::2, :, :] = torch.sin(y_coords * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
+    pe_y[1::2, :, :] = torch.cos(y_coords * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
+
+    pe_x = torch.zeros(d_half, H, W, device=device)
+    pe_x[0::2, :, :] = torch.sin(x_coords * div_term).transpose(0, 1).unsqueeze(1).repeat(1, H, 1)
+    pe_x[1::2, :, :] = torch.cos(x_coords * div_term).transpose(0, 1).unsqueeze(1).repeat(1, H, 1)
+
+    pe = torch.cat([pe_y, pe_x], dim=0)  # [d_model, H, W]
+    pe = pe.view(d_model, -1).transpose(0, 1)  # [H*W, d_model]
+    return pe.unsqueeze(0)  # [1, H*W, d_model]
 
 
 class Attention(nn.Module):
@@ -696,8 +712,8 @@ class Attention(nn.Module):
 
     def forward(self, Q, V, K):
         Q = self.split_heads(self.wq(Q))
-        K = self.split_heads(self.wk(V))
-        V = self.split_heads(self.wv(K))
+        K = self.split_heads(self.wk(K))
+        V = self.split_heads(self.wv(V))
 
         attention_scores = torch.matmul(Q, K.transpose(-2, -1))
         attention_scores = attention_scores / (self.head_dim**0.5)
@@ -737,8 +753,8 @@ class ComplexAttention(nn.Module):
 
     def forward(self, Q, V, K):
         Q = self.split_heads(self.wq(Q))
-        K = self.split_heads(self.wk(V))
-        V = self.split_heads(self.wv(K))
+        K = self.split_heads(self.wk(K))
+        V = self.split_heads(self.wv(V))
 
         # Produit scalaire Hermitien pour le score: Q @ K^H
         attention_scores = torch.matmul(Q, K.transpose(-2, -1).conj())
