@@ -9,9 +9,8 @@ from torchvision.ops import SqueezeExcitation
 
 from .utils import make_tuple
 from .ops import *
-from .norm import AdaptiveLayerNorm, LayerNorm2d, ComplexLayerNorm
+from .norm import AdaptiveLayerNorm, LayerNorm2d, AdaptiveLayerNorm
 from .loss import ortho_loss
-from .activations import ModReLU
 
 # TODO: implement FNO block with  differential kernels (i.e. conv when the kernel is rescaled by 1/h and the mean is substracted)
 # It would allows to capture the high frequencies while keeping the resolution invariance, far better and more grounded than  the U-FNO! see neuralop for an implementation
@@ -1139,7 +1138,7 @@ class SepLITBlock(nn.Module):
         mlp_hidden_dim=64,
         mlp_num_layers=2,
         activation=nn.GELU,
-        norm=LayerNorm2d,
+        norm=AdaptiveLayerNorm,
     ):
         """
         Initializes the module.
@@ -1298,7 +1297,7 @@ class SepNLITBlock(nn.Module):
         mlp_hidden_dim=64,
         mlp_num_layers=2,
         activation=nn.GELU,
-        norm=LayerNorm2d,
+        norm=AdaptiveLayerNorm,
     ):
         """
         Initializes the module.
@@ -1503,7 +1502,7 @@ class ParametricITBlock(nn.Module):
         m1 (int): Number of modes in height dimension (u) in the basis
         m2 (int): Number of modes in the width dimension (v) in the basis
         activation (callable, optional): Activation function to use. Default is nn.GELU.
-        norm (callable, optional): Normalization layer to use. Default is LayerNorm2d.
+        norm (callable, optional): Normalization layer to use. Default is AdaptiveLayerNorm.
         dim (int, optional): Spatial dimensionality (default is 2 for 2d problems).
 
     Forward Args:
@@ -1523,7 +1522,7 @@ class ParametricITBlock(nn.Module):
         out_channels,
         complex=False,
         activation=nn.GELU,
-        norm=LayerNorm2d,
+        norm=AdaptiveLayerNorm,
         dim=2,
     ):
 
@@ -1567,7 +1566,7 @@ class ParametricITBlock(nn.Module):
         # Activation & normalization
         self.activation = activation()
         if norm is not None:
-            self.norm = norm(out_channels)
+            self.norm = norm(out_channels, channel_first=False)
         else:
             self.norm = None
 
@@ -1575,13 +1574,15 @@ class ParametricITBlock(nn.Module):
         # 1x1 Conv to potentially change input channels to output channels
         self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
-    def forward(self, x, fwd_basis):
+    def forward(self, x, fwd_basis, cond=None):
         """
         Performs the forward pass of the module for variable resolution input.
 
         Args:
             x (torch.Tensor): Input tensor of shape (B, C, H, W).
                                 H and W may vary.
+            fwd_basis: basis for forward IT tranform
+            cond: contionning variable (e.g. time) passed to the norm layer
 
         Returns:
             torch.Tensor: Output tensor of shape (B, C, H_out, W_out), real part.
@@ -1608,7 +1609,7 @@ class ParametricITBlock(nn.Module):
 
         # Mixing channels
         output = self.mixer(x_rec)
-        output = self.norm(output) if self.norm is not None else output
+        output = self.norm(output, cond) if self.norm is not None else output
         output = self.activation(output)
         output = output + self.shortcut(x)
         output = self.activation(output)
@@ -1637,7 +1638,7 @@ class ITBlock(nn.Module):
         mlp_hidden_dim (int, optional): Hidden dimension of the MLPs learning the bases. Default is 64.
         mlp_num_layers (int, optional): Number of hidden layers in the MLPs learning the bases. Default is 2.
         activation (callable, optional): Activation function to use. Default is nn.GELU.
-        norm (callable, optional): Normalization layer to use. Default is LayerNorm2d.
+        norm (callable, optional): Normalization layer to use. Default is AdaptiveLayerNorm.
         resampling (str, optional): If "down" or "up", resample the output by a factor of 2. Default is None.
         compute_ortho_loss (bool, optional): If True, compute orthogonality loss for basis functions. Default is True.
         sampling (int, optional): Number of spatial points to sample for orthogonality loss. Default is 2048.
@@ -1661,7 +1662,7 @@ class ITBlock(nn.Module):
         mlp_hidden_dim=64,
         mlp_num_layers=2,
         activation=nn.GELU,
-        norm=LayerNorm2d,
+        norm=AdaptiveLayerNorm,
         resampling=None,
         compute_ortho_loss=True,
         sampling=2048,
@@ -1720,7 +1721,7 @@ class ITBlock(nn.Module):
         # Activation & normalization
         self.activation = activation()
         if norm is not None:
-            self.norm = norm(out_channels)
+            self.norm = norm(out_channels, channel_first=False)
         else:
             self.norm = None
 
@@ -1728,7 +1729,7 @@ class ITBlock(nn.Module):
         # 1x1 Conv to potentially change input channels to output channels
         self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
-    def forward(self, x):
+    def forward(self, x, cond=None):
         """
         Performs the forward pass of the module for variable resolution input.
 
@@ -1806,7 +1807,7 @@ class ITBlock(nn.Module):
 
         # Mixing channels
         output = self.mixer(x_rec)
-        output = self.norm(output) if self.norm is not None else output
+        output = self.norm(output, cond) if self.norm is not None else output
         output = self.activation(output)
 
         # Shortcut connection
@@ -1840,7 +1841,7 @@ class RITBlock(nn.Module):
         mlp_hidden_dim (int, optional): Hidden dimension of the MLPs learning the bases. Default is 64.
         mlp_num_layers (int, optional): Number of hidden layers in the MLPs learning the bases. Default is 2.
         activation (callable, optional): Activation function to use. Default is nn.GELU.
-        norm (callable, optional): Normalization layer to use. Default is LayerNorm2d.
+        norm (callable, optional): Normalization layer to use. Default is AdaptiveLayerNorm.
         resampling (str, optional): If "down" or "up", resample the output by a factor of 2. Default is None.
         compute_ortho_loss (bool, optional): If True, compute orthogonality loss for basis functions. Default is True.
         sampling (int, optional): Number of spatial points to sample for orthogonality loss. Default is 2048.
@@ -1864,7 +1865,7 @@ class RITBlock(nn.Module):
         mlp_hidden_dim=64,
         mlp_num_layers=2,
         activation=nn.GELU,
-        norm=LayerNorm2d,
+        norm=AdaptiveLayerNorm,
         resampling=None,
         compute_ortho_loss=True,
         sampling=2048,
@@ -1920,7 +1921,7 @@ class RITBlock(nn.Module):
         # Activation & normalization
         self.activation = activation()
         if norm is not None:
-            self.norm = norm(out_channels)
+            self.norm = norm(out_channels, channel_first=False)
         else:
             self.norm = None
 
@@ -1928,7 +1929,7 @@ class RITBlock(nn.Module):
         # 1x1 Conv to potentially change input channels to output channels
         self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
-    def forward(self, x):
+    def forward(self, x, cond=None):
         """
         Performs the forward pass of the module for variable resolution input.
 
@@ -2000,7 +2001,7 @@ class RITBlock(nn.Module):
 
         # Mixing channels
         output = self.mixer(x_rec)
-        output = self.norm(output) if self.norm is not None else output
+        output = self.norm(output, cond) if self.norm is not None else output
         output = self.activation(output)
 
         # Shortcut connection
@@ -2065,7 +2066,7 @@ class AttentionITBlock(nn.Module):
         num_heads=2,
         nonlinear=True,
         activation=nn.GELU,
-        norm=LayerNorm2d,
+        norm=AdaptiveLayerNorm,
         resampling=None,
         compute_ortho_loss=True,
         sampling=2048,
@@ -2120,7 +2121,7 @@ class AttentionITBlock(nn.Module):
         # Activation & normalization
         self.activation = activation()
         if norm is not None:
-            self.norm = norm(out_channels)
+            self.norm = norm(out_channels, channel_first=False)
         else:
             self.norm = None
 
@@ -2128,7 +2129,7 @@ class AttentionITBlock(nn.Module):
         # 1x1 Conv to potentially change input channels to output channels
         self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
-    def forward(self, x, basis):
+    def forward(self, x, basis, cond=None):
         """
         Performs the forward pass of the module for variable resolution input.
 
@@ -2167,7 +2168,7 @@ class AttentionITBlock(nn.Module):
 
         # Mixing channels
         output = self.mixer(x_rec)
-        output = self.norm(output) if self.norm is not None else output
+        output = self.norm(output, cond) if self.norm is not None else output
         output = self.activation(output)
         output = output + self.shortcut(x)
         output = self.activation(output)

@@ -38,9 +38,12 @@ class TrainingSchedule:
     ortho_weight: float = 1
     ortho_mode: str = "model"
     noise_level: float = 0  # no noise if 0
+    time_normalization: float = 1
 
 
 class ITModel(pl.LightningModule):
+
+    # Implement time conditioning
 
     def __init__(
         self,
@@ -101,6 +104,8 @@ class ITModel(pl.LightningModule):
         inputs, time_idx = batch
         B, T_unroll, C, H, W = inputs.shape
 
+        time_idx = (1 + time_idx) / self.train_config.time_normalization
+
         epoch = self.current_epoch
         max_AR_steps = int(min(T_unroll - 1, self.train_config.max_autoregressive_steps))
         min_AR_steps = max(self.train_config.min_autoregressive_steps, 1)
@@ -123,7 +128,7 @@ class ITModel(pl.LightningModule):
         loss = 0.0
 
         # First prediction - always teacher forcing.
-        preds = self.model(inputs[:, 0, ...])
+        preds = self.model(inputs[:, 0, ...], time_idx)
 
         if preds.dim() == 5 and preds.shape[1] == 1:
             preds = preds.squeeze(1)
@@ -135,10 +140,12 @@ class ITModel(pl.LightningModule):
 
             if t < threshold:
                 # TEACHER FORCING:
-                preds = self.model(add_noise(inputs[:, t, ...], self.train_config.noise_level, positive=False))
+                preds = self.model(
+                    add_noise(inputs[:, t, ...], self.train_config.noise_level, positive=False), time_idx
+                )
             else:
                 # AUTOREGRESSIVE:
-                preds = self.model(preds)
+                preds = self.model(preds, time_idx)
                 if preds.dim() == 5 and preds.shape[1] == 1:
                     preds = preds.squeeze(1)
 
@@ -182,6 +189,7 @@ class ITModel(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         inputs, time_idx = batch
         B, T_unroll, C, H, W = inputs.shape
+        time_idx = (1 + time_idx) / self.train_config.time_normalization
 
         self.model.compute_ortho_loss = False
 
@@ -205,7 +213,7 @@ class ITModel(pl.LightningModule):
         loss = 0.0
 
         # First prediction - always teacher forcing
-        preds = self.model(inputs[:, 0, ...])  # predict next time step -> should be B, C, H, W
+        preds = self.model(inputs[:, 0, ...], time_idx)  # predict next time step -> should be B, C, H, W
         if preds.dim() == 5 and preds.shape[1] == 1:
             preds = preds.squeeze(1)
 
@@ -216,10 +224,10 @@ class ITModel(pl.LightningModule):
 
             if t < threshold:
                 # TEACHER FORCING:
-                preds = self.model(inputs[:, t, ...])
+                preds = self.model(inputs[:, t, ...], time_idx)
             else:
                 # AUTOREGRESSIVE:
-                preds = self.model(preds)
+                preds = self.model(preds, time_idx)
 
                 if preds.dim() == 5 and preds.shape[1] == 1:
                     preds = preds.squeeze(1)
@@ -301,6 +309,7 @@ class LNOModel(pl.LightningModule):
 
         inputs, time_idx = batch
         B, T_unroll, C, H, W = inputs.shape
+        time_idx = (1 + time_idx) / self.train_config.time_normalization
 
         epoch = self.current_epoch
         max_AR_steps = int(min(T_unroll - 1, self.train_config.max_autoregressive_steps))
@@ -365,6 +374,7 @@ class LNOModel(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         inputs, time_idx = batch
         B, T_unroll, C, H, W = inputs.shape
+        time_idx = (1 + time_idx) / self.train_config.time_normalization
 
         epoch = self.current_epoch
         max_AR_steps = min(T_unroll - 1, self.train_config.max_autoregressive_steps)
@@ -386,7 +396,7 @@ class LNOModel(pl.LightningModule):
         loss = 0.0
 
         # First prediction - always teacher forcing
-        preds = self.model(inputs[:, 0, ...])  # predict next time step -> should be B, C, H, W
+        preds = self.model(inputs[:, 0, ...], time_idx)  # predict next time step -> should be B, C, H, W
         if preds.dim() == 5 and preds.shape[1] == 1:
             preds = preds.squeeze(1)
 
@@ -397,10 +407,10 @@ class LNOModel(pl.LightningModule):
 
             if t < threshold:
                 # TEACHER FORCING:
-                preds = self.model(inputs[:, t, ...])
+                preds = self.model(inputs[:, t, ...], time_idx)
             else:
                 # AUTOREGRESSIVE:
-                preds = self.model(preds)
+                preds = self.model(preds, time_idx)
 
                 if preds.dim() == 5 and preds.shape[1] == 1:
                     preds = preds.squeeze(1)

@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Union, Sequence, Callable
 import collections.abc as abc
-from pynop.core.norm import LayerNorm2d
+from pynop.core.norm import AdaptiveLayerNorm, LayerNorm2d
 from pynop.core.blocks import ITBlock, ComplexMLPBlock, ParametricITBlock
 from pynop.core.ops import CartesianEmbedding
 from pynop.core.loss import ortho_loss
@@ -24,7 +24,7 @@ class LITNet(nn.Module):
         mlp_dim: int = 64,
         nonlinear=True,
         activation: Callable = nn.GELU,
-        norm: Callable = LayerNorm2d,
+        norm: Callable = AdaptiveLayerNorm,
         fixed_pos_encoding: bool = True,
         ortho_loss_mode="QR",
     ):
@@ -62,7 +62,7 @@ class LITNet(nn.Module):
 
         self.projection = nn.Conv2d(hidden_channels[-1], out_channels, 1, bias=True)
 
-    def forward(self, x):
+    def forward(self, x, cond=None):
 
         if self.fixed_pos_encoding:
             x = self.grid_encoding(x)
@@ -70,7 +70,7 @@ class LITNet(nn.Module):
         x = self.lifting(x)
 
         for op in self.ops:
-            x = op(x)
+            x = op(x, cond)
 
         x = self.projection(x)
 
@@ -90,9 +90,9 @@ class SharedLITNet(nn.Module):
         mlp_dim: int = 64,
         nonlinear=True,
         activation: Callable = nn.GELU,
-        norm: Callable = LayerNorm2d,
+        norm: Callable = AdaptiveLayerNorm,
         fixed_pos_encoding: bool = True,
-        ortho_loss_mode="QR",
+        ortho_loss_mode="fro",
         ortho_loss_sampling=2048,
         compute_ortho_loss=True,
     ):
@@ -143,7 +143,7 @@ class SharedLITNet(nn.Module):
 
         self.projection = nn.Conv2d(hidden_channels[-1], out_channels, 1, bias=True)
 
-    def forward(self, x):
+    def forward(self, x, cond):
 
         if self.fixed_pos_encoding:
             x = self.grid_encoding(x)
@@ -168,14 +168,16 @@ class SharedLITNet(nn.Module):
 
         basis = self.basis_generator(x_in)  # -> (B*H*W, m1*m2)
         basis = basis.view(B, H, W, self.m1, self.m2)
-        basis = gs_orthogonalization(basis)
+
         # basis = F.normalize(basis, p=2, dim=(1, 2))
+        norm_factor = torch.sqrt(torch.sum(torch.abs(basis) ** 2, dim=(1, 2), keepdim=True))
+        basis = basis / (norm_factor + 1e-6)
 
         if self.compute_ortho_loss:
             self.ortho_loss = ortho_loss(basis, n_samples=self.ortho_loss_sampling, mode=self.ortho_loss_mode)
 
         for op in self.ops:
-            x = op(x, basis)
+            x = op(x, fwd_basis=basis, cond=cond)
 
         x = self.projection(x)
 

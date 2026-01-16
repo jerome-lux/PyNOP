@@ -15,15 +15,18 @@ def gs_orthogonalization(X, n_iter=5, eps=1e-6):
     HW = H * W
     X = X.reshape(B, HW, M)
 
+    X = F.normalize(X, dim=1)
+
     # Gram
     if X.is_complex():
         G = torch.matmul(X.conj().transpose(-2, -1), X) / HW  # [B, M, M]
     else:
         G = torch.matmul(X.transpose(-2, -1), X) / HW  # [B, M, M]
 
-    # Normalisation pour stabilité
-    trace = torch.diagonal(G, dim1=-2, dim2=-1).sum(-1, keepdim=True)
-    G = G / trace.unsqueeze(-1)
+    norm_factor = torch.diagonal(G, dim1=-2, dim2=-1).sum(-1, keepdim=True).unsqueeze(-1)
+    # norm_factor = torch.linalg.norm(G, ord="fro", dim=(-2, -1), keepdim=True)
+    # norm_factor = torch.linalg.matrix_norm(G, ord=2).view(B, 1, 1)
+    G = G / (norm_factor + eps)
 
     Identity = torch.eye(M, device=X.device, dtype=X.dtype).unsqueeze(0)
 
@@ -35,10 +38,11 @@ def gs_orthogonalization(X, n_iter=5, eps=1e-6):
         Y = Y @ T
         Z = T @ Z
 
-    G_inv_sqrt = Z / torch.sqrt(trace).unsqueeze(-1)
-    X_out = X @ G_inv_sqrt
+    G = Z / torch.sqrt(norm_factor + eps)
+    X_out = X @ G
+    norm = torch.sqrt(torch.sum(torch.abs(X_out) ** 2, dim=1, keepdim=True))
+    X_out = X_out / (norm + eps)
     X_out = X_out.reshape(B, H, W, m1, m2)
-
     return X_out
 
 

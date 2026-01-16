@@ -5,58 +5,7 @@ import numpy as np
 from tqdm import tqdm
 
 
-class HDF5Dataset(Dataset):
-    def __init__(self, hdf5_path, data_key="data", timesteps=None):
-
-        super().__init__()
-        self.hdf5_path = hdf5_path
-        self.data_key = data_key
-        self.h5file = None
-        self.timesteps = timesteps
-
-        with h5py.File(self.hdf5_path, "r") as h5_object:
-            self.sample_ids = list(h5_object.keys())
-            self.num_samples = len(self.sample_ids)
-
-            if self.num_samples > 0:
-                first_id = self.sample_ids[0]
-                self.data_shape = h5_object[first_id][self.data_key].shape
-                print(f"Dataset initialisé. Nombre d'échantillons: {self.num_samples}")
-                print(f"Shape par échantillon: {self.data_shape}")
-
-            else:
-                print(f"hdf5 file {hdf5_path}  is empty")
-        if self.timesteps is not None:
-            if self.timesteps > self.data_shape[0]:
-                raise ValueError(
-                    f"Number of timesteps ({self.timesteps}) greater than the full number of time steps ({self.data_shape[0]})."
-                )
-
-    def __len__(self):
-
-        return self.num_samples
-
-    def __getitem__(self, idx):
-
-        if self.h5file is None:
-            self.h5file = h5py.File(self.hdf5_path, "r")
-
-        sample_id = self.sample_ids[idx]
-        dataset = self.h5file[sample_id][self.data_key]
-        nt = dataset.shape[0]
-
-        # Return data[t0, t0+timesteps, ...], t0, dataset idx
-        if self.timesteps is not None:
-            max_start = nt - self.timesteps
-            start_index = np.random.randint(0, max_start + 1)
-            # 3. Définir l'indice de fin (stop)
-            stop_index = start_index + self.timesteps
-            return torch.from_numpy(dataset[start_index:stop_index, :, :, :]), start_index, idx
-        else:
-            return torch.from_numpy(dataset[:]), 0, idx
-
-
-class UnrolledH5Dataset(Dataset):
+class PDEBenchDataSet(Dataset):
     """
     Loads simulation data from an HDF5 file and generates time-unrolled windows.
     Optionally loads the entire dataset into RAM for faster training.
@@ -69,7 +18,6 @@ class UnrolledH5Dataset(Dataset):
         is expected to represent a single simulation run, containing a 'data' key.
     T_unroll : int, optional
         The length of the time window (number of timesteps) to extract from each simulation.
-        Defaults to 10.
     step : int, optional
         The stride (step size) used when generating consecutive time windows from a simulation.
         If None, `step` defaults to `T_unroll`, resulting in non-overlapping windows.
@@ -154,4 +102,4 @@ class UnrolledH5Dataset(Dataset):
             # (T, X, Y, C) -> (T, C, X, Y)
             fields = torch.from_numpy(np.moveaxis(fields, -1, 1)).float()
 
-        return fields, t0
+        return fields, torch.Tensor([t0])

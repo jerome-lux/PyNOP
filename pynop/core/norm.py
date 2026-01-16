@@ -21,27 +21,60 @@ class LayerNorm2d(nn.LayerNorm):
         return x
 
 
-class TimeConditionedLayerNorm(nn.Module):
-    """Conditional LayerNorm, to be used with time conditioning for example.
-    inspired from https://github.com/camlab-ethz/poseidon/blob/main/scOT/model.py#L135"""
-
-    def __init__(self, dim, eps=1e-5):
+class AdaptiveLayerNorm(nn.Module):
+    def __init__(
+        self,
+        normalized_shape,
+        cond_dim=1,
+        channel_first=True,
+        eps=1e-5,
+        hidden_dim=64,
+        activation=nn.GELU,
+    ):
+        """
+        LayerNorm for tensors with 2 spatial dimensions [B, C, H, W]
+        Args:
+            normalized_shape (int): dimension C à normaliser
+            cond_dim (int): dimension du conditionneur
+            eps (float): epsilon LayerNorm
+            affine (bool): si False, désactive gamma/beta adaptatifs
+        """
         super().__init__()
-        self.eps = eps
-        self.weight = nn.Linear(1, dim)
-        self.bias = nn.Linear(1, dim)
+        self.channel_first = channel_first
 
-    def forward(self, x, time):
-        mean = x.mean(dim=1, keepdim=True)
-        var = (x**2).mean(dim=1, keepdim=True) - mean**2
-        x = (x - mean) / (var + self.eps).sqrt()
-        weight = self.weight(time)
-        bias = self.bias(time)
-        dims_to_unsqueeze = x.dim() - weight.dim()
-        for _ in range(dims_to_unsqueeze):
-            weight = weight.unsqueeze(-1)
-            bias = bias.unsqueeze(-1)
-        return weight * x + bias
+        self.norm = nn.LayerNorm(normalized_shape, eps=eps, elementwise_affine=False)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(cond_dim, hidden_dim),
+            activation(),
+            nn.Linear(hidden_dim, 2 * normalized_shape),
+        )
+
+    def forward(self, x, cond=None):
+        """
+        x: [B, ..., C]
+        cond: [B, D] if cond is None, it returns classic LayerNorm
+        """
+        if not self.channel_first:
+            x = x.moveaxis(1, -1)
+
+        x_norm = self.norm(x)
+
+        if cond is None:
+            return x_norm
+
+        gamma_beta = self.mlp(cond)  # [B, 2C]
+        gamma, beta = gamma_beta.chunk(2, dim=-1)
+
+        while gamma.dim() < x_norm.dim():
+            gamma = gamma.unsqueeze(1)
+            beta = beta.unsqueeze(1)
+
+        x_norm = (1 + gamma) * x_norm + beta
+        if not self.channel_first:
+            x_norm = x_norm.moveaxis(-1, 1)
+
+        return x_norm
 
 
 class ComplexLayerNorm(nn.Module):
@@ -55,53 +88,6 @@ class ComplexLayerNorm(nn.Module):
         power = z.real**2 + z.imag**2
         rms = torch.sqrt(power.mean(dim=self.dim, keepdim=True) + self.eps)
         return z / rms
-
-
-class AdaptiveLayerNorm(nn.Module):
-    def __init__(
-        self,
-        normalized_shape,
-        cond_dim,
-        eps=1e-5,
-        hidden_dim=None,
-        activation=nn.GELU,
-    ):
-        """
-        Args:
-            normalized_shape (int): dimension C à normaliser
-            cond_dim (int): dimension du conditionneur
-            eps (float): epsilon LayerNorm
-            affine (bool): si False, désactive gamma/beta adaptatifs
-        """
-        super().__init__()
-
-        self.norm = nn.LayerNorm(normalized_shape, eps=eps, elementwise_affine=False)
-
-        hidden_dim = hidden_dim or cond_dim
-        self.mlp = nn.Sequential(
-            nn.Linear(cond_dim, hidden_dim),
-            activation(),
-            nn.Linear(hidden_dim, 2 * normalized_shape),
-        )
-
-    def forward(self, x, cond=None):
-        """
-        x: [B, ..., C]
-        cond: [B, D] if cond is None, it returns classic LayerNorm
-        """
-        x_norm = self.norm(x)
-
-        if cond is None:
-            return x_norm
-
-        gamma_beta = self.mlp(cond)  # [B, 2C]
-        gamma, beta = gamma_beta.chunk(2, dim=-1)
-
-        while gamma.dim() < x_norm.dim():
-            gamma = gamma.unsqueeze(1)
-            beta = beta.unsqueeze(1)
-
-        return (1 + gamma) * x_norm + beta
 
 
 class RMSNorm2d(nn.RMSNorm):

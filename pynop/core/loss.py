@@ -149,7 +149,7 @@ def diffusion_loss(c_pred, ct, dt, diffusivity, x_coords, y_coords, time_derivat
     return torch.mean(residual**2)
 
 
-def ortho_loss(basis, n_samples=2048, normalize=False, mode="MSE"):
+def ortho_loss(basis, n_samples=2048, normalize=True, mode="MSE"):
     """
     compute
     - A loss based on the QR decomposition if mode=="QR"
@@ -175,7 +175,7 @@ def ortho_loss(basis, n_samples=2048, normalize=False, mode="MSE"):
         gram = torch.matmul(sampled_basis.transpose(-2, -1), sampled_basis)
 
     if normalize:
-        gram = gram * ((H * W) / n_samples)  # because the basis are normalized over H*W
+        gram = gram * ((H * W) / n_samples)
     else:
         gram = gram / n_samples
 
@@ -186,4 +186,6 @@ def ortho_loss(basis, n_samples=2048, normalize=False, mode="MSE"):
     else:
         ortho_loss = torch.mean(torch.abs(gram - identity) ** 2)
 
-    return ortho_loss
+    off_diag = gram - torch.diag_embed(torch.diagonal(gram, dim1=-2, dim2=-1))
+
+    return off_diag.abs().mean()

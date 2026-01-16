@@ -12,6 +12,7 @@ from pynop.core.utils import gs_orthogonalization
 class ITLNO(nn.Module):
     """
     Forward IT, self attention x N then inverse transform
+    Use real basis only
     """
 
     def __init__(
@@ -214,18 +215,18 @@ class TLNO(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, inputs, cond=None):
+    def forward(self, x, cond=None):
 
-        B, C, H, W = inputs.shape
-        h_coords_map = torch.linspace(0, 1, H, device=inputs.device).view(H, 1, 1).repeat(1, W, 1)
-        w_coords_map = torch.linspace(0, 1, W, device=inputs.device).view(1, W, 1).repeat(H, 1, 1)
+        B, C, H, W = x.shape
+        h_coords_map = torch.linspace(0, 1, H, device=x.device).view(H, 1, 1).repeat(1, W, 1)
+        w_coords_map = torch.linspace(0, 1, W, device=x.device).view(1, W, 1).repeat(H, 1, 1)
         coords_2d_base = torch.concat([h_coords_map, w_coords_map], dim=-1)
         coordinates = coords_2d_base.unsqueeze(0).repeat(B, 1, 1, 1)  # B H W 2
         coordinates = coordinates.contiguous().reshape(B, H * W, 2)
-        inputs = inputs.permute(0, 2, 3, 1).contiguous().reshape(B, H * W, C)
+        x = x.permute(0, 2, 3, 1).contiguous().reshape(B, H * W, C)
 
         x = self.trunk_projector(coordinates)
-        y = self.branch_projector(inputs)
+        y = self.branch_projector(x)
 
         score = self.attention_projector(x)
         score_encode = torch.softmax(score, dim=1)
