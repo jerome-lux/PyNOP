@@ -718,7 +718,6 @@ class Attention(nn.Module):
         attention_scores = torch.matmul(Q, K.transpose(-2, -1))
         attention_scores = attention_scores / (self.head_dim**0.5)
 
-        attention_scores = attention_scores
         attention_weights = F.softmax(attention_scores, dim=-1)
 
         weighted_output = torch.matmul(attention_weights, V)

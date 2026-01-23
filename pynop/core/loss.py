@@ -149,6 +149,51 @@ def diffusion_loss(c_pred, ct, dt, diffusivity, x_coords, y_coords, time_derivat
     return torch.mean(residual**2)
 
 
+class nMSELoss(nn.Module):
+    """
+    Compute the normalized MSE Loss per channel
+    """
+
+    def __init__(self, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, pred, target):
+
+        spatial_dims = tuple(range(2, pred.ndim))
+
+        # per channel - MSE
+        mse_per_channel = torch.mean((pred - target) ** 2, dim=spatial_dims)
+        norm = torch.mean(target**2, dim=spatial_dims)
+        rel_mse = mse_per_channel / (norm + self.eps)
+
+        return torch.mean(rel_mse)
+
+
+class nL2Loss(torch.nn.Module):
+    """
+    Compute the normalized L2 Loss per channel
+    """
+
+    def __init__(self, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, pred, target):
+
+        pred_flat = pred.reshape(pred.shape[0], pred.shape[1], -1)
+        target_flat = target.reshape(target.shape[0], target.shape[1], -1)
+
+        diff_norms = torch.norm(pred_flat - target_flat, p=2, dim=2)  # [B, C]
+        norm = torch.norm(target_flat, p=2, dim=2)  # [B, C]
+
+        # Per channel relative error
+        rel_errors = diff_norms / (norm + self.eps)  # [B, C]
+
+        loss_per_sample = torch.mean(rel_errors, dim=1)  # [B]
+        return torch.mean(loss_per_sample)
+
+
 def ortho_loss(basis, n_samples=2048, normalize=True, mode="MSE"):
     """
     compute

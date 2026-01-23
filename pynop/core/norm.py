@@ -22,59 +22,38 @@ class LayerNorm2d(nn.LayerNorm):
 
 
 class AdaptiveLayerNorm(nn.Module):
-    def __init__(
-        self,
-        normalized_shape,
-        cond_dim=1,
-        channel_first=True,
-        eps=1e-5,
-        hidden_dim=64,
-        activation=nn.GELU,
-    ):
-        """
-        LayerNorm for tensors with 2 spatial dimensions [B, C, H, W]
-        Args:
-            normalized_shape (int): dimension C à normaliser
-            cond_dim (int): dimension du conditionneur
-            eps (float): epsilon LayerNorm
-            affine (bool): si False, désactive gamma/beta adaptatifs
-        """
+    def __init__(self, normalized_shape, cond_dim=1):
         super().__init__()
-        self.channel_first = channel_first
+        self.normalized_shape = (normalized_shape,) if isinstance(normalized_shape, int) else tuple(normalized_shape)
+        self.eps = 1e-5
 
-        self.norm = nn.LayerNorm(normalized_shape, eps=eps, elementwise_affine=False)
+        self.weight = nn.Parameter(torch.ones(self.normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(self.normalized_shape))
 
-        self.mlp = nn.Sequential(
-            nn.Linear(cond_dim, hidden_dim),
-            activation(),
-            nn.Linear(hidden_dim, 2 * normalized_shape),
-        )
+        num_features = 1
+        for s in self.normalized_shape:
+            num_features *= s
+
+        self.cond_mlp = nn.Sequential(nn.Linear(cond_dim, num_features * 2))
+        nn.init.zeros_(self.cond_mlp[0].weight)
+        nn.init.zeros_(self.cond_mlp[0].bias)
 
     def forward(self, x, cond=None):
-        """
-        x: [B, ..., C]
-        cond: [B, D] if cond is None, it returns classic LayerNorm
-        """
-        if not self.channel_first:
-            x = x.moveaxis(1, -1)
 
-        x_norm = self.norm(x)
+        x_norm = F.layer_norm(x, self.normalized_shape, eps=self.eps)
 
         if cond is None:
-            return x_norm
+            return self.weight * x_norm + self.bias
+        else:
 
-        gamma_beta = self.mlp(cond)  # [B, 2C]
-        gamma, beta = gamma_beta.chunk(2, dim=-1)
+            ada_params = self.cond_mlp(cond)
+            gamma, beta = torch.chunk(ada_params, 2, dim=-1)
 
-        while gamma.dim() < x_norm.dim():
-            gamma = gamma.unsqueeze(1)
-            beta = beta.unsqueeze(1)
+            for _ in range(x.dim() - gamma.dim()):
+                gamma = gamma.unsqueeze(1)
+                beta = beta.unsqueeze(1)
 
-        x_norm = (1 + gamma) * x_norm + beta
-        if not self.channel_first:
-            x_norm = x_norm.moveaxis(-1, 1)
-
-        return x_norm
+            return (1 + gamma) * x_norm + beta
 
 
 class ComplexLayerNorm(nn.Module):
