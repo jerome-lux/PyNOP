@@ -7,3 +7,4 @@ from .FNO import *
 from .unet import *
 from .ITNet import *
 from .LNO import *
+from .transolver import  *

@@ -1047,7 +1047,7 @@ class ComplexMLPBlock(nn.Module):
             else:
                 layers.append(activation())  # Or ReLU, LeakyReLU, etc.
 
-        for _ in range(num_layers):
+        for _ in range(num_layers-1):
             layers.append(nn.Linear(hidden_dim, hidden_dim))
             if dropout > 0.0:
                 layers.append(nn.Dropout(dropout))
@@ -1112,7 +1112,6 @@ class MLPBlock(nn.Module):
         super().__init__()
 
         layers = []
-        # The first layer takes 1 coordinate (e.g., normalized)
         layers.append(nn.Linear(in_ch, hidden_dim))
         if dropout > 0.0:
             layers.append(nn.Dropout(dropout))
@@ -1124,7 +1123,7 @@ class MLPBlock(nn.Module):
             else:
                 layers.append(activation())  # Or ReLU, LeakyReLU, etc.
 
-        for _ in range(num_layers):
+        for _ in range(num_layers-1):
             layers.append(nn.Linear(hidden_dim, hidden_dim))
             if dropout > 0.0:
                 layers.append(nn.Dropout(dropout))

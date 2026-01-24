@@ -26,10 +26,30 @@ class PDEBenchDataSet(Dataset):
     load_in_ram: bool, Default False
     split_type: "train", "val" or None (loads all)
     split_ratio: ratio for the training set
+    n_samples: maximum number of samples
     seed: for reproductibility
+
+    To generate train/val sets with distincts samples do:
+    train_set = pynop.PDEBenchDataSet(
+    datapath, T_unroll=10, step=10, load_in_ram=True, split_type="train", split_ratio=0.9, n_samples=100, seed=42
+    )
+    val_set = pynop.PDEBenchDataSet(
+        datapath, T_unroll=10, step=10, load_in_ram=True, split_type="val", split_ratio=0.9, n_samples=100, seed=42
+    )
+
     """
 
-    def __init__(self, h5_path, T_unroll=10, step=None, load_in_ram=False, split_type=None, split_ratio=0.8, seed=42):
+    def __init__(
+        self,
+        h5_path,
+        T_unroll=10,
+        step=None,
+        load_in_ram=False,
+        split_type=None,
+        split_ratio=0.8,
+        n_samples=None,
+        seed=42,
+    ):
 
         if T_unroll < 1:
             print("Warning, T_unroll must ba at least 1. Setting it to 1 to continue")
@@ -51,6 +71,9 @@ class PDEBenchDataSet(Dataset):
 
                 random.seed(seed)
                 random.shuffle(all_sample_ids)
+                if n_samples is not None:
+                    n_samples = min(len(all_sample_ids), n_samples)
+                    all_sample_ids = all_sample_ids[:n_samples]
 
                 n_train = int(len(all_sample_ids) * split_ratio)
                 if split_type == "train":
