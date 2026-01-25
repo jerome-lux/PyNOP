@@ -39,6 +39,7 @@ class TrainingSchedule:
     ortho_mode: str = "model"
     noise_level: float = 0  # no noise if 0
     time_normalization: float = 1
+    residual: bool = True  # learns f(x, t + dt) - f(x, t)
 
 
 class ITModel(pl.LightningModule):
@@ -62,7 +63,7 @@ class ITModel(pl.LightningModule):
         self.train_loss_avg = MeanMetric()
 
     def forward(self, x, training=True):
-        return self.model(x, training=training)
+        return self.model(x, training=training, residual=self.train_config.residual)
 
     def configure_optimizers(self):
 
@@ -104,7 +105,9 @@ class ITModel(pl.LightningModule):
         inputs, time_idx = batch
         B, T_unroll, C, H, W = inputs.shape
 
-        time_idx = (1 + time_idx) / self.train_config.time_normalization
+        t_norm = self.train_config.time_normalization
+        time_idx = (1 + time_idx) / t_norm
+        dt = 1.0 / t_norm
 
         epoch = self.current_epoch
         max_AR_steps = int(min(T_unroll - 1, self.train_config.max_autoregressive_steps))
@@ -126,42 +129,53 @@ class ITModel(pl.LightningModule):
         threshold = (T_unroll - 1) - AR_steps
 
         loss = 0.0
+        RMSE = 0.0
 
-        # First prediction - always teacher forcing.
-        preds = self.model(inputs[:, 0, ...], time_idx)
+        # First prediction - no noise.
+        preds = self.model(inputs[:, 0, ...], time_idx, residual=self.train_config.residual)
 
         if preds.dim() == 5 and preds.shape[1] == 1:
             preds = preds.squeeze(1)
 
         loss += self.loss_fn(preds, inputs[:, 1, ...])
-
+        with torch.no_grad():
+            RMSE += torch.sqrt(torch.mean((preds - inputs[:, 1, ...]) ** 2))
+        AR_counter = 0
         # Time unrolling
         for t in range(1, T_unroll - 1):
 
             if t < threshold:
                 # TEACHER FORCING:
                 preds = self.model(
-                    add_noise(inputs[:, t, ...], self.train_config.noise_level, positive=False), time_idx
+                    add_noise(inputs[:, t, ...], self.train_config.noise_level, positive=False),
+                    time_idx + t * dt,
+                    residual=self.train_config.residual,
                 )
             else:
                 # AUTOREGRESSIVE:
-                preds = self.model(preds, time_idx)
+                AR_counter += 1
+                preds = self.model(preds, time_idx + t * dt, residual=self.train_config.residual)
                 if preds.dim() == 5 and preds.shape[1] == 1:
                     preds = preds.squeeze(1)
 
             targets_t = inputs[:, t + 1, ...]
             loss += self.loss_fn(preds, targets_t)
+            with torch.no_grad():
+                RMSE += torch.sqrt(torch.mean((preds - targets_t) ** 2))
             # limit the gradient backpropagation to detach_every_k time steps
-            if (t % self.detach_every_k) == 0:
+            if (AR_counter % self.detach_every_k) == 0:
                 preds = preds.detach()
 
         if T_unroll > 1:
             loss = loss / (T_unroll - 1)
+            with torch.no_grad():
+                RMSE = RMSE / (T_unroll - 1)
 
         self.train_loss_avg.update(loss)
 
-        self.log("MSE", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("avg_MSE", self.train_loss_avg.compute(), prog_bar=True)
+        self.log("loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log("avg_loss", self.train_loss_avg.compute(), prog_bar=True)
+        self.log("RMSE", RMSE, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
         # orthogonal loss
         if self.train_config.orthogonality_loss:
@@ -178,10 +192,10 @@ class ITModel(pl.LightningModule):
 
             self.log("orth_loss", total_ortho_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
             total_loss = loss + self.train_config.ortho_weight * total_ortho_loss
+            self.log("total_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         else:
             total_loss = loss
 
-        self.log("loss", total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log("AR_steps", int(AR_steps), on_step=True, prog_bar=True, on_epoch=True, logger=True)
 
         return total_loss
@@ -189,7 +203,8 @@ class ITModel(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         inputs, time_idx = batch
         B, T_unroll, C, H, W = inputs.shape
-        time_idx = (1 + time_idx) / self.train_config.time_normalization
+        t_norm = self.train_config.time_normalization
+        time_idx = (1 + time_idx) / t_norm
 
         self.model.compute_ortho_loss = False
 
@@ -211,40 +226,45 @@ class ITModel(pl.LightningModule):
         threshold = (T_unroll - 1) - AR_steps
 
         loss = 0.0
+        RMSE = 0.0
 
         # First prediction - always teacher forcing
-        preds = self.model(inputs[:, 0, ...], time_idx)  # predict next time step -> should be B, C, H, W
+        preds = self.model(
+            inputs[:, 0, ...], time_idx, residual=self.train_config.residual
+        )  # predict next time step -> should be B, C, H, W
         if preds.dim() == 5 and preds.shape[1] == 1:
             preds = preds.squeeze(1)
 
         loss += self.loss_fn(preds, inputs[:, 1, ...])
+        RMSE += torch.sqrt(torch.mean((preds - inputs[:, 1, ...]) ** 2))
 
         # Time unrolling - The real batch size is B * T_unroll
+        AR_counter = 0
         for t in range(1, T_unroll - 1):
 
             if t < threshold:
                 # TEACHER FORCING:
-                preds = self.model(inputs[:, t, ...], time_idx)
+                preds = self.model(inputs[:, t, ...], time_idx + t / t_norm, residual=self.train_config.residual)
             else:
                 # AUTOREGRESSIVE:
-                preds = self.model(preds, time_idx)
+                AR_counter += 1
+                preds = self.model(preds, time_idx + t / t_norm, residual=self.train_config.residual)
 
                 if preds.dim() == 5 and preds.shape[1] == 1:
                     preds = preds.squeeze(1)
 
             targets_t = inputs[:, t + 1, ...]
             loss += self.loss_fn(preds, targets_t)
-
-            # needed in autoregressive mode to prevent the gradient going back to much.
-            if (t % self.detach_every_k) == 0:
-                preds = preds.detach()
+            RMSE += torch.sqrt(torch.mean((preds - targets_t) ** 2))
 
         if T_unroll > 1:
             loss = loss / (T_unroll - 1)
+            RMSE = RMSE / (T_unroll - 1)
 
         self.model.compute_ortho_loss = self.train_config.orthogonality_loss
 
         self.log("val_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log("RMSE", RMSE, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
         return loss
 
@@ -268,7 +288,7 @@ class LNOModel(pl.LightningModule):
         self.train_loss_avg = MeanMetric()
 
     def forward(self, x, training=True):
-        return self.model(x, training=training)
+        return self.model(x, training=training, residual=self.train_config.residual)
 
     def configure_optimizers(self):
 
@@ -309,7 +329,9 @@ class LNOModel(pl.LightningModule):
 
         inputs, time_idx = batch
         B, T_unroll, C, H, W = inputs.shape
-        time_idx = (1 + time_idx) / self.train_config.time_normalization
+        t_norm = self.train_config.time_normalization
+        time_idx = (1 + time_idx) / t_norm
+        dt = 1.0 / t_norm
 
         epoch = self.current_epoch
         max_AR_steps = int(min(T_unroll - 1, self.train_config.max_autoregressive_steps))
@@ -331,42 +353,53 @@ class LNOModel(pl.LightningModule):
         threshold = (T_unroll - 1) - AR_steps
 
         loss = 0.0
+        RMSE = 0.0
 
         # First prediction - always teacher forcing.
-        preds = self.model(inputs[:, 0, ...], time_idx)
+        preds = self.model(inputs[:, 0, ...], time_idx, residual=self.train_config.residual)
 
         if preds.dim() == 5 and preds.shape[1] == 1:
             preds = preds.squeeze(1)
 
         loss += self.loss_fn(preds, inputs[:, 1, ...])
-
+        with torch.no_grad():
+            RMSE += torch.sqrt(torch.mean((preds - inputs[:, 1, ...]) ** 2))
+        AR_counter = 0
         # Time unrolling
         for t in range(1, T_unroll - 1):
 
             if t < threshold:
                 # TEACHER FORCING:
                 preds = self.model(
-                    add_noise(inputs[:, t, ...], self.train_config.noise_level, positive=False), time_idx + t
+                    add_noise(inputs[:, t, ...], self.train_config.noise_level, positive=False),
+                    time_idx + t * dt,
+                    residual=self.train_config.residual,
                 )
             else:
                 # AUTOREGRESSIVE:
-                preds = self.model(preds, time_idx + t)
+                AR_counter += 1
+                preds = self.model(preds, time_idx + t * dt, residual=self.train_config.residual)
                 if preds.dim() == 5 and preds.shape[1] == 1:
                     preds = preds.squeeze(1)
 
             targets_t = inputs[:, t + 1, ...]
             loss += self.loss_fn(preds, targets_t)
+            with torch.no_grad():
+                RMSE += torch.sqrt(torch.mean((preds - targets_t) ** 2))
             # limit the gradient backpropagation to detach_every_k time steps
-            if (t % self.detach_every_k) == 0:
+            if AR_counter % self.detach_every_k == 0:
                 preds = preds.detach()
 
         if T_unroll > 1:
             loss = loss / (T_unroll - 1)
+            with torch.no_grad():
+                RMSE = RMSE / (T_unroll - 1)
 
         self.train_loss_avg.update(loss)
 
         self.log("loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log("avg_loss", self.train_loss_avg.compute(), prog_bar=True)
+        self.log("RMSE", RMSE, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log("AR_steps", int(AR_steps), on_step=True, prog_bar=True, on_epoch=True, logger=True)
 
         return loss
@@ -374,7 +407,8 @@ class LNOModel(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         inputs, time_idx = batch
         B, T_unroll, C, H, W = inputs.shape
-        time_idx = (1 + time_idx) / self.train_config.time_normalization
+        t_norm = self.train_config.time_normalization
+        time_idx = (1 + time_idx) / t_norm
 
         epoch = self.current_epoch
         max_AR_steps = min(T_unroll - 1, self.train_config.max_autoregressive_steps)
@@ -394,37 +428,40 @@ class LNOModel(pl.LightningModule):
         threshold = (T_unroll - 1) - AR_steps
 
         loss = 0.0
+        RMSE = 0.0
 
         # First prediction - always teacher forcing
-        preds = self.model(inputs[:, 0, ...], time_idx)  # predict next time step -> should be B, C, H, W
+        preds = self.model(
+            inputs[:, 0, ...], time_idx, residual=self.train_config.residual
+        )  # predict next time step -> should be B, C, H, W
         if preds.dim() == 5 and preds.shape[1] == 1:
             preds = preds.squeeze(1)
 
         loss += self.loss_fn(preds, inputs[:, 1, ...])
+        RMSE += torch.sqrt(torch.mean((preds - inputs[:, 1, ...]) ** 2))
 
         # Time unrolling - The real batch size is B * T_unroll
         for t in range(1, T_unroll - 1):
 
             if t < threshold:
                 # TEACHER FORCING:
-                preds = self.model(inputs[:, t, ...], time_idx)
+                preds = self.model(inputs[:, t, ...], time_idx + t / t_norm, residual=self.train_config.residual)
             else:
                 # AUTOREGRESSIVE:
-                preds = self.model(preds, time_idx)
+                preds = self.model(preds, time_idx + t / t_norm, residual=self.train_config.residual)
 
                 if preds.dim() == 5 and preds.shape[1] == 1:
                     preds = preds.squeeze(1)
 
             targets_t = inputs[:, t + 1, ...]
             loss += self.loss_fn(preds, targets_t)
-
-            # needed in autoregressive mode to prevent the gradient going back to much.
-            if (t % self.detach_every_k) == 0:
-                preds = preds.detach()
+            RMSE += torch.sqrt(torch.mean((preds - targets_t) ** 2))
 
         if T_unroll > 1:
             loss = loss / (T_unroll - 1)
+            RMSE = RMSE / (T_unroll - 1)
 
         self.log("val_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log("RMSE", RMSE, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
         return loss

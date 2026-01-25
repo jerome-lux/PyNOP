@@ -131,6 +131,10 @@ class SharedLITNet(nn.Module):
             self.grid_encoding = CartesianEmbedding()
 
         self.lifting = nn.Conv2d(in_channels, hidden_channels[0], 1, bias=True)
+        if norm is not None:
+            self.norm = norm(out_channels)
+        else:
+            self.norm = None
 
         in_ch = dim + hidden_channels[0] if nonlinear else dim
 

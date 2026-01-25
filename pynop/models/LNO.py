@@ -61,6 +61,7 @@ class ITLNO(nn.Module):
         mlp_dim: int = 128,
         activation: Callable = nn.GELU,
         mlp_activation=nn.GELU,
+        mlp_factor=4,
         dropout=0,
         compute_ortho_loss: bool = True,
         orth_loss_sampling: int = 2048,
@@ -98,7 +99,7 @@ class ITLNO(nn.Module):
                     out_ch=hidden_channels,
                     n_heads=num_heads,
                     activation=activation,
-                    mlp_dim=4 * hidden_channels,
+                    mlp_dim=mlp_factor * hidden_channels,
                     dropout=dropout,
                 )
             )

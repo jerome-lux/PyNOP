@@ -1047,7 +1047,7 @@ class ComplexMLPBlock(nn.Module):
             else:
                 layers.append(activation())  # Or ReLU, LeakyReLU, etc.
 
-        for _ in range(num_layers-1):
+        for _ in range(num_layers - 1):
             layers.append(nn.Linear(hidden_dim, hidden_dim))
             if dropout > 0.0:
                 layers.append(nn.Dropout(dropout))
@@ -1123,7 +1123,7 @@ class MLPBlock(nn.Module):
             else:
                 layers.append(activation())  # Or ReLU, LeakyReLU, etc.
 
-        for _ in range(num_layers-1):
+        for _ in range(num_layers - 1):
             layers.append(nn.Linear(hidden_dim, hidden_dim))
             if dropout > 0.0:
                 layers.append(nn.Dropout(dropout))
@@ -1566,14 +1566,7 @@ class ParametricITBlock(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-        self.alpha = nn.Parameter(
-            torch.ones(
-                1,
-                out_channels,
-                1,
-                1,
-            )
-        )
+        self.alpha = nn.Parameter(torch.ones(1, 1, 1, out_channels))
 
         # Learned parameters for multiplication in the transformed space (per channel).
         if complex:
@@ -1661,7 +1654,11 @@ class ParametricITBlock(nn.Module):
 
         # Mixing channels
         output = self.mixer(x_rec)
-        output = self.norm(output, time) if self.norm is not None else output
+        if self.norm is not None:
+            if isinstance(self.norm, AdaptiveLayerNorm):
+                output = self.norm(output, time)
+            else:
+                output = self.norm(output)
         output = self.activation(output).permute(0, 3, 1, 2)
         output = output + self.shortcut(x)
         output = self.activation(output)
@@ -1765,6 +1762,7 @@ class ITBlock(nn.Module):
 
         # Activation & normalization
         self.activation = activation()
+
         if norm is not None:
             self.norm = norm(out_channels)
         else:
@@ -1836,7 +1834,11 @@ class ITBlock(nn.Module):
         x_rec = x_rec.real * self.alpha
         # Mixing channels
         output = self.mixer(x_rec)
-        output = self.norm(output, time) if self.norm is not None else output
+        if self.norm is not None:
+            if isinstance(self.norm, AdaptiveLayerNorm):
+                output = self.norm(output, time)
+            else:
+                output = self.norm(output)
         output = self.activation(output)
         output = output.permute(0, 3, 1, 2)
         output = output + shortcut
@@ -2002,7 +2004,11 @@ class RITBlock(nn.Module):
 
         # Mixing channels
         output = self.mixer(x_rec)
-        output = self.norm(output, time) if self.norm is not None else output
+        if self.norm is not None:
+            if isinstance(self.norm, AdaptiveLayerNorm):
+                output = self.norm(output, time)
+            else:
+                output = self.norm(output)
         output = self.activation(output)
         output = output.permute(0, 3, 1, 2)
         output = output + shortcut
@@ -2241,7 +2247,7 @@ class TransolverBlock(nn.Module):
         temperature = torch.clamp(temperature, min=0.01)
         slice_weights = gumbel_softmax(self.in_project_slice(x_mid), temperature)
         slice_norm = slice_weights.sum(2)  # B H K - K number of physical tokens
-        slice_token = torch.einsum("bhnc,bhnk->bhkc", x_mid, slice_weights).contiguous() # B, num_head, K, dim_head
+        slice_token = torch.einsum("bhnc,bhnk->bhkc", x_mid, slice_weights).contiguous()  # B, num_head, K, dim_head
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
 
         q_slice_token = self.to_q(slice_token)
