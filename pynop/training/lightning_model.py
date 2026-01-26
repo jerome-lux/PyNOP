@@ -126,37 +126,30 @@ class ITModel(pl.LightningModule):
         else:
             AR_steps = 0
 
-        threshold = (T_unroll - 1) - AR_steps
+        threshold = AR_steps
 
         loss = 0.0
         RMSE = 0.0
 
-        # First prediction - no noise.
-        preds = self.model(inputs[:, 0, ...], time_idx, residual=self.train_config.residual)
-
-        if preds.dim() == 5 and preds.shape[1] == 1:
-            preds = preds.squeeze(1)
-
-        loss += self.loss_fn(preds, inputs[:, 1, ...])
-        with torch.no_grad():
-            RMSE += torch.sqrt(torch.mean((preds - inputs[:, 1, ...]) ** 2))
         AR_counter = 0
+        preds = None
         # Time unrolling
-        for t in range(1, T_unroll - 1):
+        for t in range(0, T_unroll - 1):
 
             if t < threshold:
+                # AUTOREGRESSIVE:
+                AR_counter += 1
+                if preds is None:
+                    preds = self.model(inputs[:, t, ...], time_idx, residual=self.train_config.residual)
+                preds = self.model(preds, time_idx + t * dt, residual=self.train_config.residual)
+
+            else:
                 # TEACHER FORCING:
                 preds = self.model(
                     add_noise(inputs[:, t, ...], self.train_config.noise_level, positive=False),
                     time_idx + t * dt,
                     residual=self.train_config.residual,
                 )
-            else:
-                # AUTOREGRESSIVE:
-                AR_counter += 1
-                preds = self.model(preds, time_idx + t * dt, residual=self.train_config.residual)
-                if preds.dim() == 5 and preds.shape[1] == 1:
-                    preds = preds.squeeze(1)
 
             targets_t = inputs[:, t + 1, ...]
             loss += self.loss_fn(preds, targets_t)
@@ -355,32 +348,26 @@ class LNOModel(pl.LightningModule):
         loss = 0.0
         RMSE = 0.0
 
-        # First prediction - always teacher forcing.
-        preds = self.model(inputs[:, 0, ...], time_idx, residual=self.train_config.residual)
-
-        if preds.dim() == 5 and preds.shape[1] == 1:
-            preds = preds.squeeze(1)
-
-        loss += self.loss_fn(preds, inputs[:, 1, ...])
-        with torch.no_grad():
-            RMSE += torch.sqrt(torch.mean((preds - inputs[:, 1, ...]) ** 2))
+        preds = None
         AR_counter = 0
         # Time unrolling
-        for t in range(1, T_unroll - 1):
+        for t in range(0, T_unroll - 1):
 
             if t < threshold:
+                # AUTOREGRESSIVE:
+                AR_counter += 1
+                if preds is None:
+                    preds = self.model(inputs[:, t, ...], time_idx, residual=self.train_config.residual)
+                preds = self.model(preds, time_idx + t * dt, residual=self.train_config.residual)
+                if preds.dim() == 5 and preds.shape[1] == 1:
+                    preds = preds.squeeze(1)
+            else:
                 # TEACHER FORCING:
                 preds = self.model(
                     add_noise(inputs[:, t, ...], self.train_config.noise_level, positive=False),
                     time_idx + t * dt,
                     residual=self.train_config.residual,
                 )
-            else:
-                # AUTOREGRESSIVE:
-                AR_counter += 1
-                preds = self.model(preds, time_idx + t * dt, residual=self.train_config.residual)
-                if preds.dim() == 5 and preds.shape[1] == 1:
-                    preds = preds.squeeze(1)
 
             targets_t = inputs[:, t + 1, ...]
             loss += self.loss_fn(preds, targets_t)

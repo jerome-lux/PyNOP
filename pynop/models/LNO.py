@@ -77,7 +77,8 @@ class ITLNO(nn.Module):
         self.dim = dim
         self.linear_kernel = linear_kernel
 
-        self.lifting = nn.Conv2d(in_channels, hidden_channels, 1, bias=True)
+        self.lifting = nn.Linear(in_channels, hidden_channels, bias=True)
+        self.norm = AdaptiveLayerNorm(hidden_channels)
 
         in_ch = dim if linear_kernel else dim + hidden_channels
         self.basis_generator = MLPBlock(
@@ -111,10 +112,15 @@ class ITLNO(nn.Module):
         if residual:
             shortcut = x
 
-        x = self.lifting(x)
-
-        # Forward transform
         B, C, H, W = x.shape
+
+        x = self.lifting(x.permute(0, 2, 3, 1))
+
+        if self.norm is not None:
+            if isinstance(self.norm, AdaptiveLayerNorm):
+                x = self.norm(x, time)
+            else:
+                x = self.norm(x)
 
         h_coords = torch.linspace(-1, 1, H, device=x.device)
         w_coords = torch.linspace(-1, 1, W, device=x.device)
@@ -132,7 +138,7 @@ class ITLNO(nn.Module):
         if self.linear_kernel:
             x_in = coords
         else:
-            x_in = torch.concat([coords, x.permute(0, 2, 3, 1)], dim=-1)  # (B, H, W, 2 + Cin)
+            x_in = torch.concat([coords, x], dim=-1)  # (B, H, W, 2 + Cin)
 
         # Normalization of each basis vector
         basis = self.basis_generator(x_in)  # -> (B*H*W, m1*m2)
@@ -309,7 +315,7 @@ class TLNO(nn.Module):
         trunk_input = coords.reshape(B, H * W, 2)
 
         if time is not None:
-            t = time.view(B, 1, 1).expand(-1, H * W, -1)  # VRAM: 0
+            t = time.view(B, 1, 1).expand(-1, H * W, -1)
             trunk_input = torch.cat([trunk_input, t], dim=-1)
 
         x = x.permute(0, 2, 3, 1).reshape(B, H * W, C).contiguous()
