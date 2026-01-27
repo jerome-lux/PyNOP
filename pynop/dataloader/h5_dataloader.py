@@ -5,58 +5,7 @@ import numpy as np
 from tqdm import tqdm
 
 
-class HDF5Dataset(Dataset):
-    def __init__(self, hdf5_path, data_key="data", timesteps=None):
-
-        super().__init__()
-        self.hdf5_path = hdf5_path
-        self.data_key = data_key
-        self.h5file = None
-        self.timesteps = timesteps
-
-        with h5py.File(self.hdf5_path, "r") as h5_object:
-            self.sample_ids = list(h5_object.keys())
-            self.num_samples = len(self.sample_ids)
-
-            if self.num_samples > 0:
-                first_id = self.sample_ids[0]
-                self.data_shape = h5_object[first_id][self.data_key].shape
-                print(f"Dataset initialisé. Nombre d'échantillons: {self.num_samples}")
-                print(f"Shape par échantillon: {self.data_shape}")
-
-            else:
-                print(f"hdf5 file {hdf5_path}  is empty")
-        if self.timesteps is not None:
-            if self.timesteps > self.data_shape[0]:
-                raise ValueError(
-                    f"Number of timesteps ({self.timesteps}) greater than the full number of time steps ({self.data_shape[0]})."
-                )
-
-    def __len__(self):
-
-        return self.num_samples
-
-    def __getitem__(self, idx):
-
-        if self.h5file is None:
-            self.h5file = h5py.File(self.hdf5_path, "r")
-
-        sample_id = self.sample_ids[idx]
-        dataset = self.h5file[sample_id][self.data_key]
-        nt = dataset.shape[0]
-
-        # Return data[t0, t0+timesteps, ...], t0, dataset idx
-        if self.timesteps is not None:
-            max_start = nt - self.timesteps
-            start_index = np.random.randint(0, max_start + 1)
-            # 3. Définir l'indice de fin (stop)
-            stop_index = start_index + self.timesteps
-            return torch.from_numpy(dataset[start_index:stop_index, :, :, :]), start_index, idx
-        else:
-            return torch.from_numpy(dataset[:]), 0, idx
-
-
-class UnrolledH5Dataset(Dataset):
+class PDEBenchDataSet(Dataset):
     """
     Loads simulation data from an HDF5 file and generates time-unrolled windows.
     Optionally loads the entire dataset into RAM for faster training.
@@ -69,7 +18,6 @@ class UnrolledH5Dataset(Dataset):
         is expected to represent a single simulation run, containing a 'data' key.
     T_unroll : int, optional
         The length of the time window (number of timesteps) to extract from each simulation.
-        Defaults to 10.
     step : int, optional
         The stride (step size) used when generating consecutive time windows from a simulation.
         If None, `step` defaults to `T_unroll`, resulting in non-overlapping windows.
@@ -78,10 +26,30 @@ class UnrolledH5Dataset(Dataset):
     load_in_ram: bool, Default False
     split_type: "train", "val" or None (loads all)
     split_ratio: ratio for the training set
+    n_samples: maximum number of samples
     seed: for reproductibility
+
+    To generate train/val sets with distincts samples do:
+    train_set = pynop.PDEBenchDataSet(
+    datapath, T_unroll=10, step=10, load_in_ram=True, split_type="train", split_ratio=0.9, n_samples=100, seed=42
+    )
+    val_set = pynop.PDEBenchDataSet(
+        datapath, T_unroll=10, step=10, load_in_ram=True, split_type="val", split_ratio=0.9, n_samples=100, seed=42
+    )
+
     """
 
-    def __init__(self, h5_path, T_unroll=10, step=None, load_in_ram=False, split_type=None, split_ratio=0.8, seed=42):
+    def __init__(
+        self,
+        h5_path,
+        T_unroll=10,
+        step=None,
+        load_in_ram=False,
+        split_type=None,
+        split_ratio=0.8,
+        n_samples=None,
+        seed=42,
+    ):
 
         if T_unroll < 1:
             print("Warning, T_unroll must ba at least 1. Setting it to 1 to continue")
@@ -103,6 +71,9 @@ class UnrolledH5Dataset(Dataset):
 
                 random.seed(seed)
                 random.shuffle(all_sample_ids)
+                if n_samples is not None:
+                    n_samples = min(len(all_sample_ids), n_samples)
+                    all_sample_ids = all_sample_ids[:n_samples]
 
                 n_train = int(len(all_sample_ids) * split_ratio)
                 if split_type == "train":
@@ -154,4 +125,4 @@ class UnrolledH5Dataset(Dataset):
             # (T, X, Y, C) -> (T, C, X, Y)
             fields = torch.from_numpy(np.moveaxis(fields, -1, 1)).float()
 
-        return fields, t0
+        return fields, torch.Tensor([t0])

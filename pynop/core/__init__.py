@@ -4,3 +4,4 @@ from .activations import *
 from .helper import *
 from .utils import *
 from .norm import *
+from .loss import *
