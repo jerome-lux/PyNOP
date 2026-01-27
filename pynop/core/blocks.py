@@ -1984,7 +1984,6 @@ class RITBlock(nn.Module):
             x_in = coords
         encoder_basis = self.basis_generator(x_in)  # -> (B*H*W, m1*m2)
         encoder_basis = encoder_basis.view(B, H_basis, W_basis, self.m1, self.m2)
-        print(x.shape, encoder_basis.shape)
 
         # Normalization of each basis vector
         # encoder_basis = F.normalize(encoder_basis, p=2, dim=(1, 2))
@@ -2217,7 +2216,6 @@ class TransolverBlock(nn.Module):
 
         self.ln1 = nn.LayerNorm(dim)
         self.ln2 = nn.LayerNorm(dim)
-        self.mlp = MLPBlock(in_ch=dim, out_ch=dim, hidden_dim=dim * mlp_ratio, num_layers=1, activation=activation)
         self.dropout = nn.Dropout(dropout)
         self.bias = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
         self.proj_temperature = nn.Sequential(
@@ -2260,10 +2258,72 @@ class TransolverBlock(nn.Module):
 
         # --- End of Physic Attention block
 
-        out_x = self.proj(out_x) + x
-        out_x = self.mlp(self.ln2(out_x)) + x
+        out_x = self.proj(self.ln2(out_x)) + x
 
         return out_x
+
+
+class LinearNOBlock(nn.Module):
+    """
+    See Transolver is a Linear Transformer: Revisiting Physics-Attention through the Lens of Linear Attention
+    """
+
+    def __init__(self, dim, n_tokens=64, n_heads=8, dropout=0.0, mlp_ratio=2, activation=nn.GELU):
+        super().__init__()
+        self.n_heads = n_heads
+        self.n_tokens = n_tokens
+        self.dim = dim
+        self.head_dim = dim // n_heads
+
+        assert dim % n_heads == 0, "dim must be divisible by n_heads"
+
+        self.ln1 = nn.LayerNorm(dim)
+        self.ln2 = nn.LayerNorm(dim)
+        self.mlp = MLPBlock(in_ch=dim, out_ch=dim, hidden_dim=dim * mlp_ratio, num_layers=1, activation=activation)
+        self.dropout = nn.Dropout(dropout)
+
+        # Projections
+        self.q_proj = nn.Linear(dim, n_tokens * n_heads)
+        self.k_proj = nn.Linear(dim, n_tokens * n_heads)
+        self.v_proj = nn.Linear(dim, dim)
+
+        self.out_proj = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        H = self.n_heads
+        D = self.n_tokens
+
+        x_in = self.ln1(x)
+
+        # Q, K: [B, N, H, D], V: [B, N, H, head_dim]
+        q = self.q_proj(x_in).view(B, N, H, D)
+        k = self.k_proj(x_in).view(B, N, H, D)
+        v = self.v_proj(x_in).view(B, N, H, self.head_dim)
+
+        # phi(Q): Softmax along tokens D
+        q = torch.softmax(q, dim=-1)
+
+        # psi(K)^T:  Softmax along N
+        k_t = k.permute(0, 2, 3, 1)  # [B, H, D, N]
+        k_t = torch.softmax(k_t, dim=-1)
+
+        # Linear Attention
+        # V  [B, H, N, head_dim]
+        v = v.permute(0, 2, 1, 3)
+
+        # (D, N) @ (N, head_dim) -> (D, head_dim)
+        global_context = torch.matmul(k_t, v)
+
+        # Deslicing
+        q = q.permute(0, 2, 1, 3)
+        out = torch.matmul(q, global_context)  # [B, H, N, head_dim]
+
+        out = out.permute(0, 2, 1, 3).contiguous().view(B, N, C)
+
+        out = self.out_proj(self.ln2(out)) + x
+
+        return out
 
 
 class IAETBlock(nn.Module):

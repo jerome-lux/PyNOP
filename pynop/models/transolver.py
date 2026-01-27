@@ -3,7 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Union, Sequence, Callable
-from pynop.core.blocks import MLPBlock, TransolverBlock
+from pynop.core.blocks import MLPBlock, TransolverBlock, LinearNOBlock
+from pynop.core.ops import time_encoding
 
 
 class Transolver(nn.Module):
@@ -17,9 +18,11 @@ class Transolver(nn.Module):
         dropout=0,
         n_head=8,
         activation=nn.GELU,
+        mode="linear",
         mlp_ratio=1,
         dim=2,
         cond_dim=None,
+        encoding_freq=12,
     ):
         super(Transolver, self).__init__()
         assert n_hidden % n_head == 0, "Hidden dim must be divisible by the number o fheads"
@@ -29,22 +32,47 @@ class Transolver(nn.Module):
         self.dim = dim
         self.out_ch = out_ch
         self.dim_head = n_hidden // n_head
+        self.encoding_freq = encoding_freq
         if cond_dim is not None:
             self.embedding = nn.Linear(cond_dim, n_hidden)
-        self.blocks = nn.ModuleList(
-            [
-                TransolverBlock(
-                    dim=n_hidden,
-                    heads=n_head,
-                    dim_head=self.dim_head,
-                    dropout=dropout,
-                    slice_num=slice_num,
-                    activation=activation,
-                    mlp_ratio=mlp_ratio,
-                )
-                for _ in range(n_layers)
-            ]
+
+        self.time_mlp = MLPBlock(
+            in_ch=2 * encoding_freq,
+            out_ch=n_hidden,
+            hidden_dim=n_hidden,
+            num_layers=1,
+            activation=activation,
         )
+
+        if mode == "linear":
+            self.blocks = nn.ModuleList(
+                [
+                    LinearNOBlock(
+                        dim=n_hidden,
+                        n_heads=n_head,
+                        n_tokens=slice_num,
+                        dropout=dropout,
+                        activation=activation,
+                        mlp_ratio=mlp_ratio,
+                    )
+                    for _ in range(n_layers)
+                ]
+            )
+        else:
+            self.blocks = nn.ModuleList(
+                [
+                    TransolverBlock(
+                        dim=n_hidden,
+                        heads=n_head,
+                        dim_head=self.dim_head,
+                        dropout=dropout,
+                        slice_num=slice_num,
+                        activation=activation,
+                        mlp_ratio=mlp_ratio,
+                    )
+                    for _ in range(n_layers)
+                ]
+            )
         self.projection = MLPBlock(
             n_hidden, out_ch=out_ch, hidden_dim=n_hidden * mlp_ratio, num_layers=1, activation=activation
         )
@@ -76,10 +104,6 @@ class Transolver(nn.Module):
         coords = coords.unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, W, 2] - VRAM: 0
         coords = coords.reshape(B, H * W, 2)
 
-        if time is not None:
-            t = time.view(B, 1, 1).expand(-1, H * W, -1)
-            coords = torch.cat([coords, t], dim=-1)
-
         x = x.permute(0, 2, 3, 1).reshape(B, H * W, C).contiguous()
         x = torch.concat([x, coords], dim=-1)
 
@@ -91,6 +115,12 @@ class Transolver(nn.Module):
             if len(cond.shape) == 2:
                 cond = cond[:, None, :]
             x = x + cond
+
+        # time modulation
+        if time is not None:
+            t = time_encoding(time, self.encoding_freq)  # -> B, 2 * F
+            t = self.time_mlp(t)
+            x = x * t.unsqueeze(1)
 
         for _, block in enumerate(self.blocks):
             x = block(x)
