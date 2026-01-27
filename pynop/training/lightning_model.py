@@ -343,7 +343,7 @@ class LNOModel(pl.LightningModule):
         else:
             AR_steps = 0
 
-        threshold = (T_unroll - 1) - AR_steps
+        threshold = AR_steps
 
         loss = 0.0
         RMSE = 0.0
