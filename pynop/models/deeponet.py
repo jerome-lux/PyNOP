@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pynop.core.ops import CartesianEmbedding, SinusoidalEmbedding
+from pynop.core.ops import CartesianEmbedding
 from typing import Callable, Union
 
 

@@ -5,6 +5,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.fft
 import torch.nn.init as init
+import numpy as np
 
 from .norm import LayerNorm2d
 from .utils import get_same_padding_2d
@@ -413,19 +414,19 @@ class TuckerSpectralConv2d(nn.Module):
                 f"for input spatial size ({H}, {W}). modes_y must be <= W//2 + 1."
             )
 
-        # 1. FFT -> domaine spectral
+        # 1. FFT
         x_ft = torch.fft.rfft2(x, dim=(-2, -1), norm="ortho")  # (B, C_in, H, W//2 + 1), cfloat
 
-        # 2. Sélection des modes bas
+        # 2. select modes
         x_ft_low_modes = x_ft[:, :, : self.modes_x, : self.modes_y]  # (B, C_in, mx, my), cfloat
 
-        # 3. Reconstruire les poids spectraux W_hat
+        # 3. Compute What
         G1 = torch.einsum("ij,jkl->ikl", self.U, self.G)  # (C_in, r2, r3), cfloat
         G2 = torch.einsum("ok,ikl->iol", self.V, G1)  # (C_in, C_out, r3), cfloat
         # S(mx, my, r3) et G2(i, o, r3)
         W_hat = torch.einsum("iol,xyl->ioxy", G2, self.S)  # (C_in, C_out, modes_x, modes_y), cfloat
 
-        # 4. Appliquer la convolution spectrale (multiplication de tenseurs complexes)
+        # 4. Spectral conv
         # y_ft_low_modes[b, o, mx, my] = sum_i (x_ft_low_modes[b, i, mx, my] * W_hat[i, o, mx, my])
         y_ft_low_modes = torch.einsum("bixy,ioxy->boxy", x_ft_low_modes, W_hat)  # (B, C_out, mx, my), cfloat
 
@@ -433,7 +434,7 @@ class TuckerSpectralConv2d(nn.Module):
         out_ft = torch.zeros(batchsize, self.out_channels, H, W // 2 + 1, dtype=torch.cfloat, device=device)
         out_ft[:, :, : self.modes_x, : self.modes_y] = y_ft_low_modes
 
-        # 6. Retour au domaine spatial
+        # 6. IFFT
         y = torch.fft.irfft2(
             out_ft, s=(int(H * self.scaling), int(W * self.scaling)), dim=(-2, -1), norm="ortho"
         )  # (B, C_out, H, W), float
@@ -582,86 +583,42 @@ class CartesianEmbedding(nn.Module):
         return output
 
 
-class SinusoidalEmbedding(nn.Module):
+
+def time_encoding(t, num_freq=4):
+    # t should be [B, 1] and must be normalized
+
+    phases = t * torch.pow(2.0, torch.arange(num_freq, device=t.device).float()) * math.pi
+    return torch.cat([torch.sin(phases), torch.cos(phases)], dim=-1)
+
+
+def sinusoidal_encoding_2d(coords, num_freqs=6):
     """
-    Generates and concatenates sinusoidal positional embeddings (x, y) as additional channels.
-    Uses sine and cosine function pairs at multiple frequencies.
-    Coordinates are first normalized to the range [0, 1].
-    frequencies are multiple of 2 * math.pi * (2 ** d) where d=0 to num_frequency-1
-    The embeddings are periodic in the image (useful for PDEs with periodic BCs!)
-    **Note**: This is NOT the same as the positionnal embeddings found in vision transformer, where the
-    frequencies are given by 1 / (10000 ** ((2 * i // 2) / num_freq)), where i goes from 0 to num_freq-1
+    Args:
+        coords: Tenseur [B, N, 2] - Coordonnées normalisées en [-1, 1]
+        num_freq: number of frequencies (max = Niquist frequency)
+
+    Returns:
+        enc_coords: Tenseur [B, N, 2 * num_frequencies * 2]
     """
+    H, W, C = coords.shape
+    device = coords.device
 
-    def __init__(self, num_frequencies: int = 10):
-        """
-        Args:
-            num_frequencies (int): The number of sinusoidal frequency pairs (sin/cos)
-                                   per spatial dimension (x and y).
-                                   Total added channels = num_frequencies * 2 (sin/cos) * 2 (x/y).
-        """
-        super().__init__()
-        self.num_frequencies = num_frequencies
-        # Define frequencies. Commonly powers of 2 multiplied by 2*pi.
-        # E.g., frequencies = [2*pi*2^0, 2*pi*2^1, ..., 2*pi*2^(num_frequencies-1)]
-        self.frequencies = 2 * math.pi * (2 ** torch.arange(num_frequencies))
-        # Frequencies are not learnable parameters
+    max_res = max(H, W)
+    num_frequencies = min(int(np.ceil(np.log2(max_res * 0.5))), num_freqs)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Generates sinusoidal positional embeddings and concatenates them to the input.
+    freq_bands = torch.pow(2.0, torch.arange(num_frequencies, device=device).float())
+    freq_bands = freq_bands * math.pi
 
-        Args:
-            x (torch.Tensor): Input tensor with shape (B, C, H, W).
+    #  [N, 2, 1] * [F] -> [N, 2, F]
+    angles = coords.reshape(-1, 2).contiguous().unsqueeze(-1) * freq_bands
 
-        Returns:
-            torch.Tensor: Input tensor concatenated with sinusoidal positional embeddings.
-                          Shape (B, C + num_frequencies * 4, H, W).
-        """
-        batch_size, _, height, width = x.shape
-        device = x.device
+    # 4. Calcul Sin et Cos
+    sin_feat = torch.sin(angles)
+    cos_feat = torch.cos(angles)
 
-        # Move frequencies to the correct device
-        frequencies = self.frequencies.to(device)  # Shape (num_frequencies,)
-
-        # Generate x and y coordinates normalized to [0, 1]
-        # Used to calculate the arguments for the sinusoidal functions
-        x_coords_normalized = torch.linspace(0, 1, steps=width, device=device)  # Shape (W,)
-        y_coords_normalized = torch.linspace(0, 1, steps=height, device=device)  # Shape (H,)
-
-        # Create a full grid of normalized coordinates
-        # grid_y (H, W), grid_x (H, W)
-        grid_y, grid_x = torch.meshgrid(y_coords_normalized, x_coords_normalized, indexing="ij")
-
-        # Stack coordinates to get shape (H, W, 2)
-        grid_coords = torch.stack([grid_x, grid_y], dim=-1)  # Shape (H, W, 2)
-
-        # Apply frequencies. Broadcast frequencies (1, 1, 1, num_frequencies)
-        # over coordinates (H, W, 2, 1) -> (H, W, 2, num_frequencies)
-        grid_frequencies = frequencies.view(1, 1, 1, self.num_frequencies)
-        grid_coords_freq = grid_coords.unsqueeze(-1) * grid_frequencies  # Shape (H, W, 2, num_frequencies)
-
-        # Apply sin and cos. Along the last dimension, we have [x_freq1, y_freq1, x_freq2, y_freq2, ...]
-        # We want [sin(x_freq1), cos(x_freq1), sin(y_freq1), cos(y_freq1), ...]
-        # We can concatenate sin and cos applied separately.
-        sin_vals = torch.sin(grid_coords_freq)  # (H, W, 2, num_frequencies)
-        cos_vals = torch.cos(grid_coords_freq)  # (H, W, 2, num_frequencies)
-
-        # Concatenate sin and cos for each coordinate and each frequency
-        # Resulting shape (H, W, 2, num_frequencies * 2)
-        grid_embeddings = torch.cat([sin_vals, cos_vals], dim=-1)
-
-        grid_embeddings = grid_embeddings.permute(2, 3, 0, 1).reshape(
-            1, -1, height, width
-        )  # Shape (1, num_frequencies * 4, H, W)
-
-        grid_embeddings = grid_embeddings.expand(batch_size, -1, -1, -1)  # Shape (B, num_frequencies * 4, H, W)
-
-        # Concatenate with the input tensor
-        # The output will have shape (B, C_in + num_frequencies * 4, H, W)
-        output = torch.cat([x, grid_embeddings], dim=1)
-
-        return output
+    # [B, N, 2 * num_frequencies * 2]
+    enc_coords = torch.cat([sin_feat, cos_feat], dim=-1)
+    return enc_coords.view(H * W, -1)
 
 
 def sin_positional_encoding_2d(d_model, H, W, basis=10000.0, device="cpu"):
