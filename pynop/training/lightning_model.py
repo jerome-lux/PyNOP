@@ -59,7 +59,7 @@ class TrainingSchedule:
             json.dump(self.to_json_dict(), f, indent=4)
 
 
-class NOModel(pl.LightningModule):
+class OneStepNOModel(pl.LightningModule):
 
     def __init__(
         self,
@@ -186,6 +186,7 @@ class NOModel(pl.LightningModule):
         self.log("avg_loss", self.train_loss_avg.compute(), prog_bar=True)
         self.log("RMSE", RMSE, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log("AR_steps", int(AR_steps), on_step=True, prog_bar=True, on_epoch=True, logger=True)
+        self.log("lr", self.optimizer.param_groups[0]["lr"], prog_bar=True)
 
         return loss
 
@@ -228,7 +229,7 @@ class NOModel(pl.LightningModule):
         return loss
 
 
-class NOModel_AR(pl.LightningModule):
+class MultiStepNOModel(pl.LightningModule):
 
     def __init__(
         self,
@@ -284,30 +285,103 @@ class NOModel_AR(pl.LightningModule):
     def on_train_epoch_start(self):
         self.train_loss_avg.reset()
 
-    def training_step(self, batch, batch_idx):
+    # def training_step(self, batch, batch_idx):
 
+    #     inputs, time_idx = batch
+    #     B, T_unroll, C, H, W = inputs.shape
+    #     n = self.train_config.n_slices
+    #     t_norm = self.train_config.time_normalization
+
+    #     loss = 0.0
+    #     RMSE = 0.0
+
+    #     preds = None
+    #     num_predictions = 0
+
+    #     for t in range(n - 1, T_unroll - 1):
+
+    #         if t == n - 1:
+    #             current_input = inputs[:, :n, ...]
+    #         else:
+    #             current_input = torch.cat([current_input[:, 1:, ...], preds.unsqueeze(1)], dim=1)
+
+    #         # 2. Forward pass.
+    #         current_time = (time_idx + t) / t_norm
+
+    #         preds = self.model(current_input.view(B, -1, H, W), time=current_time, residual=self.train_config.residual)
+
+    #         targets_t = inputs[:, t + 1, ...]
+    #         loss += self.loss_fn(preds, targets_t)
+
+    #         with torch.no_grad():
+    #             RMSE += torch.sqrt(torch.mean((preds - targets_t) ** 2))
+
+    #         num_predictions += 1
+
+    #         if (num_predictions) % self.detach_every_k == 0:
+    #             preds = preds.detach()
+
+    #     if num_predictions > 0:
+    #         loss = loss / num_predictions
+    #         with torch.no_grad():
+    #             RMSE = RMSE / num_predictions
+
+    #     self.train_loss_avg.update(loss)
+
+    #     self.log("loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+    #     self.log("avg_loss", self.train_loss_avg.compute(), prog_bar=True)
+    #     self.log("RMSE", RMSE, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+    #     self.log("lr", self.optimizer.param_groups[0]["lr"], prog_bar=True)
+
+    #     return loss
+
+    def training_step(self, batch, batch_idx):
         inputs, time_idx = batch
         B, T_unroll, C, H, W = inputs.shape
         n = self.train_config.n_slices
         t_norm = self.train_config.time_normalization
 
+        # --- Logique Curriculum Learning ---
+        epoch = self.current_epoch
+        max_AR_steps = int(min(T_unroll - n, self.train_config.max_autoregressive_steps))
+        min_AR_steps = max(self.train_config.min_autoregressive_steps, 1)
+
+        if self.train_config.start_autoregressive is not None and self.train_config.final_autoregressive is not None:
+            nint = max_AR_steps - min_AR_steps + 1
+            delta = (self.train_config.final_autoregressive - self.train_config.start_autoregressive) // nint
+            if epoch < self.train_config.start_autoregressive:
+                AR_steps = 0
+            elif delta > 0:
+                AR_steps = int(min(max(min_AR_steps + (epoch // delta), 0), max_AR_steps))
+            else:
+                AR_steps = max_AR_steps
+        else:
+            AR_steps = 0
+        # ----------------------------------
+
         loss = 0.0
         RMSE = 0.0
-
         preds = None
         num_predictions = 0
 
+        # On commence à t = n-1 pour prédire le slice n
         for t in range(n - 1, T_unroll - 1):
 
-            if t == n - 1:
-                current_input = inputs[:, :n, ...]
-            else:
+            if num_predictions < AR_steps and preds is not None:
                 current_input = torch.cat([current_input[:, 1:, ...], preds.unsqueeze(1)], dim=1)
+            else:
+                # Mode TEACHER FORCING : On utilise les données réelles (avec bruit éventuel)
+                real_window = inputs[:, t - (n - 1) : t + 1, ...]
+                if self.train_config.noise_level > 0:
+                    current_input = add_noise(real_window, self.train_config.noise_level, positive=False)
+                else:
+                    current_input = real_window
 
-            # 2. Forward pass.
-            current_time = (time_idx + t) / t_norm
+            # Forward pass
+            current_time = (time_idx + (t + 1)) / t_norm
 
-            preds = self.model(current_input.view(B, -1, H, W), time=current_time, residual=self.train_config.residual)
+            model_input = current_input.reshape(B, -1, H, W)
+            preds = self.model(model_input, time=current_time, residual=self.train_config.residual)
 
             targets_t = inputs[:, t + 1, ...]
             loss += self.loss_fn(preds, targets_t)
@@ -317,20 +391,21 @@ class NOModel_AR(pl.LightningModule):
 
             num_predictions += 1
 
-            if (num_predictions) % self.detach_every_k == 0:
+            # 4. Troncature des gradients (BPTT)
+            if num_predictions % self.detach_every_k == 0:
                 preds = preds.detach()
 
+        # Normalisation finale
         if num_predictions > 0:
             loss = loss / num_predictions
             with torch.no_grad():
                 RMSE = RMSE / num_predictions
 
-        self.train_loss_avg.update(loss)
-
-        self.log("loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("avg_loss", self.train_loss_avg.compute(), prog_bar=True)
-        self.log("RMSE", RMSE, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-
+        # Logging
+        self.log("AR_steps", int(AR_steps), prog_bar=True)
+        self.log("loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("RMSE", RMSE, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("lr", self.optimizer.param_groups[0]["lr"], prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -360,8 +435,7 @@ class NOModel_AR(pl.LightningModule):
             targets_t = inputs[:, t + 1, ...]
             loss += self.loss_fn(preds, targets_t)
 
-            with torch.no_grad():
-                RMSE += torch.sqrt(torch.mean((preds - targets_t) ** 2))
+            RMSE += torch.sqrt(torch.mean((preds - targets_t) ** 2))
 
             num_predictions += 1
 
@@ -370,8 +444,7 @@ class NOModel_AR(pl.LightningModule):
 
         if num_predictions > 0:
             loss = loss / num_predictions
-            with torch.no_grad():
-                RMSE = RMSE / num_predictions
+            RMSE = RMSE / num_predictions
 
         self.log("val_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log("val_RMSE", RMSE, on_step=True, on_epoch=True, prog_bar=True, logger=True)
