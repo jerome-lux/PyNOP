@@ -1,36 +1,22 @@
 import math
+from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Union, Sequence, Callable
 import collections.abc as abc
 from pynop.core.blocks import MLPBlock, TransformerBlock
-from pynop.core.ops import CartesianEmbedding, sin_positional_encoding_2d
-from pynop.core.loss import ortho_loss
+from pynop.core.ops import CartesianEmbedding, sinusoidal_encoding_2d
 from pynop.core.norm import AdaptiveLayerNorm
 from pynop.core.activations import gumbel_softmax
 
 
-class ITLNO(nn.Module):
+class ModITLNO(nn.Module):
     """Integral Transform-based Latent Nonlinear Operator (ITLNO) using self-attention in transfomed domain.
 
     This module performs a forward integral transform using learned bases,
     applies self-attention in the transformed domain, and then reconstructs the output
     in the original spatial domain. It uses real basis functions only.
-
-    Attributes:
-        fixed_pos_encoding (bool): Whether to use fixed positional encoding via Cartesian embedding.
-        m1 (int): Number of modes in the first spatial dimension.
-        m2 (int): Number of modes in the second spatial dimension.
-        compute_orth_loss (bool): Whether to compute orthogonality loss during forward pass.
-        ortho_loss_sampling (int): Number of samples for orthogonality loss computation.
-        grid_encoding (CartesianEmbedding): Cartesian grid embedding layer (if fixed_pos_encoding=True).
-        pos_embedding_weights (nn.Parameter): Learnable positional embeddings for transformed domain.
-        lifting (nn.Conv2d): 1x1 convolution to lift input to hidden channel dimension.
-        basis_generator (MLPBlock): MLP network that generates integral transform basis vectors.
-        alpha (nn.Parameter): Learnable scaling parameter for the reconstructed output.
-        ops (nn.ModuleList): List of TransformerBlock modules for self-attention operations.
-        projection (nn.Conv2d): 1x1 convolution to project from hidden channels to output channels.
 
     Args:
         in_channels (int): Number of input channels.
@@ -44,9 +30,7 @@ class ITLNO(nn.Module):
         mlp_layers (int): Number of layers in the basis generator MLP. Default: 2.
         mlp_dim (int): Hidden dimension for the basis generator MLP. Default: 128.
         activation (Callable): Activation function to use. Default: nn.GELU.
-        fixed_pos_encoding (bool): Whether to use fixed Cartesian positional encoding. Default: True.
-        compute_ortho_loss (bool): Whether to compute orthogonality loss for the basis. Default: True.
-        orth_loss_sampling (int): Number of samples for orthogonality loss. Default: 2048."""
+    """
 
     def __init__(
         self,
@@ -60,11 +44,10 @@ class ITLNO(nn.Module):
         mlp_layers: int = 2,
         mlp_dim: int = 128,
         activation: Callable = nn.GELU,
-        mlp_activation=nn.GELU,
+        mlp_act=nn.GELU,
         mlp_factor=4,
         dropout=0,
-        compute_ortho_loss: bool = True,
-        orth_loss_sampling: int = 2048,
+        sinus_pe_freq=None,
         dim=2,
     ):
 
@@ -72,22 +55,44 @@ class ITLNO(nn.Module):
 
         self.m1 = modes if isinstance(modes, int) else modes[0]
         self.m2 = modes if isinstance(modes, int) else modes[1]
-        self.compute_ortho_loss = compute_ortho_loss
-        self.ortho_loss_sampling = orth_loss_sampling
         self.dim = dim
         self.linear_kernel = linear_kernel
+        self.sinus_pe_freq = sinus_pe_freq
 
         self.lifting = nn.Linear(in_channels, hidden_channels, bias=True)
-        self.norm = AdaptiveLayerNorm(hidden_channels)
+        self.timsetep_embedding = nn.Linear(1, hidden_channels, bias=True)
 
-        in_ch = dim if linear_kernel else dim + hidden_channels
-        self.basis_generator = MLPBlock(
+        self.norm = AdaptiveLayerNorm(hidden_channels, hidden_channels)
+
+        if sinus_pe_freq is not None:
+            trunk_in_ch = 4 * sinus_pe_freq
+        else:
+            trunk_in_ch = 2
+
+        self.trunk = MLPBlock(
             out_ch=self.m1 * self.m2,
-            in_ch=in_ch,
+            in_ch=trunk_in_ch,
             hidden_dim=mlp_dim,
             num_layers=mlp_layers,
-            activation=mlp_activation,
+            activation=mlp_act,
         )
+
+        self.branch = MLPBlock(
+            out_ch=2 * self.m1 * self.m2,
+            in_ch=hidden_channels,
+            hidden_dim=mlp_dim,
+            num_layers=mlp_layers,
+            activation=mlp_act,
+        )
+
+        self.pe = MLPBlock(
+            out_ch=self.m1 * self.m2,
+            in_ch=2,
+            hidden_dim=mlp_dim,
+            num_layers=mlp_layers,
+            activation=mlp_act,
+        )
+
         self.alpha = nn.Parameter(torch.ones(1, hidden_channels, 1, 1))
 
         # List of attention modules
@@ -96,8 +101,7 @@ class ITLNO(nn.Module):
         for i in range(num_blocks):
             self.ops.append(
                 TransformerBlock(
-                    in_ch=hidden_channels,
-                    out_ch=hidden_channels,
+                    dim=hidden_channels,
                     n_heads=num_heads,
                     activation=activation,
                     mlp_dim=mlp_factor * hidden_channels,
@@ -107,7 +111,15 @@ class ITLNO(nn.Module):
 
         self.projection = nn.Conv2d(hidden_channels, out_channels, 1, bias=True)
 
-    def forward(self, x: torch.Tensor, time: Union[None, torch.Tensor], residual: bool = False):
+        self.trunk.apply(self._init_weights)
+
+    def _init_weights(self, module, std=0.0002):
+        if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
+            nn.init.trunc_normal_(module.weight, std=std)
+            if isinstance(module, torch.nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+
+    def forward(self, x: torch.Tensor, time: torch.Tensor, residual: bool = False):
 
         if residual:
             shortcut = x
@@ -115,46 +127,228 @@ class ITLNO(nn.Module):
         B, C, H, W = x.shape
 
         x = self.lifting(x.permute(0, 2, 3, 1))
-
-        if self.norm is not None:
-            if isinstance(self.norm, AdaptiveLayerNorm):
-                x = self.norm(x, time)
-            else:
-                x = self.norm(x)
-
+        # normalisation & time modulation
         h_coords = torch.linspace(-1, 1, H, device=x.device)
         w_coords = torch.linspace(-1, 1, W, device=x.device)
         grid_h, grid_w = torch.meshgrid(h_coords, w_coords, indexing="ij")
 
         coords = torch.stack([grid_h, grid_w], dim=-1)  # [H, W, 2]
-        coords = coords.unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, W, 2]
-        coords = coords.reshape(B, H, W, 2).contiguous()
+        if self.sinus_pe_freq:
+            coords = sinusoidal_encoding_2d(coords, self.sinus_pe_freq).view(H, W, -1)  # [H, W, 4 * F]
+        coords = coords.unsqueeze(0).expand(B, -1, -1, -1)
 
-        if time is not None:
-            t = time.view(B, 1, 1, 1).expand(-1, H, W, -1)
-            coords = torch.cat([coords, t], dim=-1)
+        time = self.timsetep_embedding(time).unsqueeze(1).unsqueeze(1)
+        x = x + time
 
-        # 3. Generate kernels
-        if self.linear_kernel:
-            x_in = coords
-        else:
-            x_in = torch.concat([coords, x], dim=-1)  # (B, H, W, 2 + Cin)
+        x = self.norm(x, time)
 
-        # Normalization of each basis vector
-        basis = self.basis_generator(x_in)  # -> (B*H*W, m1*m2)
-        basis = basis.view(B, H, W, self.m1, self.m2)
-        norm_factor = torch.sqrt(torch.sum(torch.abs(basis) ** 2, dim=(1, 2), keepdim=True))
-        basis = basis / (norm_factor + 1e-6)
+        trunk = self.trunk(coords)  # [B, H, W, m1*m2]
+        branch = self.branch(x)  # [B, H, W, m1*m2]
 
-        if self.compute_ortho_loss:
-            self.ortho_loss = ortho_loss(basis, n_samples=self.ortho_loss_sampling, mode="MSE")
+        # the kernel is modulated by the signal
+        gamma, beta = branch.chunk(2, dim=-1)
+        basis = trunk * (1 + F.softsign(gamma)) + beta
+
+        basis = basis.view(B, H, W, self.m1, self.m2) / (H * W)
+        # norm_factor = torch.sqrt(torch.mean(torch.abs(basis) ** 2, dim=(1, 2), keepdim=True))
+        # basis = basis / (norm_factor + 1e-6)
 
         # Forward integral transform
-        xhat = torch.einsum("bchw,bhwmn->bmnc", x, basis) / (H * W)
-        # Add Positional encoding
-        PE = sin_positional_encoding_2d(C, self.m1, self.m2, device=xhat.device).repeat(B, 1, 1)  # B, m1 * m2, C
-        xhat = xhat.reshape(B, -1, C).contiguous()  # -> m1*m2 tokens
+        xhat = torch.einsum("bhwc,bhwmn->bmnc", x, basis)
+        # Add Positional encoding in latent representation before the self-attention modules
+        m1_coords = torch.linspace(-1, 1, steps=self.m1, device=xhat.device)
+        m2_coords = torch.linspace(-1, 1, steps=self.m2, device=xhat.device)
+        grid_m1, grid_m2 = torch.meshgrid(m1_coords, m2_coords, indexing="ij")
+        m_coords = torch.stack([grid_m1, grid_m2], dim=-1)
+        PE = m_coords.view(self.m1, self.m2, -1).unsqueeze(0).expand(B, -1, -1, -1)
+        PE = self.pe(PE)
         xhat = xhat + PE
+        xhat = xhat.reshape(B, -1, self.m1 * self.m2).contiguous()  # -> m1*m2 tokens
+
+        # Multi-head attention with time conditioning in transformed domain
+        for op in self.ops:
+            xhat = op(xhat, time)
+
+        # Go back to spatial domain
+        out_ch = xhat.shape[-1]
+        xhat = xhat.reshape(B, self.m1, self.m2, out_ch)
+        x_rec = torch.einsum("bmnc,bhwmn->bchw", xhat, basis)
+        x_rec = x_rec * self.alpha
+
+        # Mixing channels
+        output = self.projection(x_rec)
+
+        if residual:
+            return output + shortcut
+        else:
+            return output
+
+
+class ITLNO(nn.Module):
+    """Integral Transform-based Latent Nonlinear Operator (ITLNO) using self-attention in transfomed domain.
+
+    This module performs a forward integral transform using learned bases,
+    applies self-attention in the transformed domain, and then reconstructs the output
+    in the original spatial domain. It uses real basis functions only.
+
+    Args:
+        in_channels (int): Number of input channels.
+        out_channels (int): Number of output channels.
+        modes (Union[int, Sequence[int]]): Number of modes for the integral transform. If int, uses same
+            value for both dimensions. If sequence, uses modes[0] for m1 and modes[1] for m2.
+        hidden_channels (Sequence[int]): Sequence of hidden channel dimensions for each transformer block.
+        num_heads (int): Number of attention heads in transformer blocks. Default: 2.
+        linear_kernel (bool): Whether to use only coordinates as basis generator input (True) or
+            include input channels (False). Default: True.
+        mlp_layers (int): Number of layers in the basis generator MLP. Default: 2.
+        mlp_dim (int): Hidden dimension for the basis generator MLP. Default: 128.
+        activation (Callable): Activation function to use. Default: nn.GELU.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        modes: Union[int, Sequence[int]],
+        num_blocks: int = 4,
+        hidden_channels: int = 256,
+        num_heads: int = 4,
+        linear_kernel: bool = True,
+        mlp_layers: int = 2,
+        mlp_dim: int = 128,
+        activation: Callable = nn.GELU,
+        mlp_act=nn.GELU,
+        mlp_factor=4,
+        dropout=0,
+        sinus_pe_freq=None,
+        dim=2,
+        orthogonal_init=True,
+    ):
+
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.m1 = modes if isinstance(modes, int) else modes[0]
+        self.m2 = modes if isinstance(modes, int) else modes[1]
+        self.dim = dim
+        self.linear_kernel = linear_kernel
+        self.sinus_pe_freq = sinus_pe_freq
+
+        self.lifting = nn.Linear(in_channels, hidden_channels, bias=True)
+        self.timsetep_embedding = MLPBlock(
+            out_ch=hidden_channels,
+            in_ch=1,
+            hidden_dim=mlp_dim,
+            num_layers=mlp_layers,
+            activation=mlp_act,
+        )
+
+        self.norm = AdaptiveLayerNorm(hidden_channels, hidden_channels)
+
+        if sinus_pe_freq is not None:
+            in_ch = 4 * sinus_pe_freq
+        else:
+            in_ch = 2
+
+        if not linear_kernel:
+            in_ch = in_ch + hidden_channels
+
+        self.generator = MLPBlock(
+            out_ch=self.m1 * self.m2,
+            in_ch=in_ch,
+            hidden_dim=mlp_dim,
+            num_layers=mlp_layers,
+            activation=mlp_act,
+        )
+        if orthogonal_init:
+            self.ortho_init_weights(self.generator)
+
+        self.pe = MLPBlock(
+            out_ch=hidden_channels,
+            in_ch=2,
+            hidden_dim=mlp_dim,
+            num_layers=mlp_layers,
+            activation=mlp_act,
+        )
+
+        self.alpha = nn.Parameter(torch.ones(1, hidden_channels, 1, 1))
+
+        # List of attention modules
+        self.ops = nn.ModuleList()
+
+        for i in range(num_blocks):
+            self.ops.append(
+                TransformerBlock(
+                    dim=hidden_channels,
+                    n_heads=num_heads,
+                    activation=activation,
+                    mlp_dim=mlp_factor * hidden_channels,
+                    dropout=dropout,
+                )
+            )
+
+        self.projection = nn.Conv2d(hidden_channels, out_channels, 1, bias=True)
+
+    def ortho_init_weights(self, module):
+        if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
+            torch.nn.init.orthogonal_(module.weight)
+            if isinstance(module, torch.nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+
+    def _init_weights(self, module, std=0.0002):
+        if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
+            nn.init.trunc_normal_(module.weight, std=std)
+            if isinstance(module, torch.nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+
+    def forward(self, x: torch.Tensor, time: torch.Tensor, residual: bool = False):
+
+        if residual:
+            if self.in_channels > self.out_channels:
+                shortcut = x[:, -self.out_channels :, ...]
+            elif self.in_channels == self.out_channels:
+                shortcut = x
+            else:
+                residual = False
+
+        B, C, H, W = x.shape
+
+        x = self.lifting(x.permute(0, 2, 3, 1))
+        # normalisation & time modulation
+        h_coords = torch.linspace(-1, 1, H, device=x.device)
+        w_coords = torch.linspace(-1, 1, W, device=x.device)
+        grid_h, grid_w = torch.meshgrid(h_coords, w_coords, indexing="ij")
+
+        coords = torch.stack([grid_h, grid_w], dim=-1)  # [H, W, 2]
+        if self.sinus_pe_freq:
+            coords = sinusoidal_encoding_2d(coords, self.sinus_pe_freq).view(H, W, -1)  # [H, W, 4 * F]
+        coords = coords.unsqueeze(0).expand(B, -1, -1, -1)
+
+        time = self.timsetep_embedding(time).unsqueeze(1).unsqueeze(1)
+        x = self.norm(x + time, time)
+        time = time.view(B, 1, -1)
+
+        basis_input = torch.cat([x, coords], dim=-1)
+
+        basis = self.generator(basis_input)
+
+        basis = basis.view(B, H, W, self.m1, self.m2) / (H * W)
+        # norm_factor = torch.sqrt(torch.mean(torch.abs(basis) ** 2, dim=(1, 2), keepdim=True))
+        # basis = basis / (norm_factor + 1e-6)
+
+        # Forward integral transform
+        xhat = torch.einsum("bhwc,bhwmn->bmnc", x, basis)
+        # Add Positional encoding in latent representation before the self-attention modules
+        m1_coords = torch.linspace(-1, 1, steps=self.m1, device=xhat.device)
+        m2_coords = torch.linspace(-1, 1, steps=self.m2, device=xhat.device)
+        grid_m1, grid_m2 = torch.meshgrid(m1_coords, m2_coords, indexing="ij")
+        m_coords = torch.stack([grid_m1, grid_m2], dim=-1)
+        PE = m_coords.view(self.m1, self.m2, -1).unsqueeze(0).expand(B, -1, -1, -1)
+        PE = self.pe(PE)
+        # print(PE.shape, xhat.shape)
+        xhat = xhat + PE
+        xhat = xhat.reshape(B, self.m1 * self.m2, -1).contiguous()  # -> m1*m2 tokens
 
         # Multi-head attention with time conditioning in transformed domain
         for op in self.ops:
@@ -222,17 +416,34 @@ class TLNO(nn.Module):
         dropout: float = 0,
         transformer_mlp_factor: int = 4,
         activation: Callable = nn.GELU,
-        nonlinear=False,
         dim: int = 2,
+        sinus_pe_freq=None,
+        std_init=0.005,
     ):
 
         super().__init__()
 
         self.dim = dim
-        self.nonlinear = nonlinear
-        trunk_ch = dim + in_channels if self.nonlinear else dim
+        self.sinus_pe_freq = sinus_pe_freq
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.norm = AdaptiveLayerNorm(d_model, d_model)
+        self.trunk_norm = nn.LayerNorm(d_model)
+        self.timsetep_embedding = MLPBlock(
+            out_ch=d_model,
+            in_ch=1,
+            hidden_dim=mlp_hidden_dim,
+            num_layers=mlp_layers,
+            activation=activation,
+        )
+
+        if sinus_pe_freq is not None:
+            trunk_in_ch = 4 * sinus_pe_freq
+        else:
+            trunk_in_ch = 2
+
         self.trunk_projector = MLPBlock(
-            in_ch=trunk_ch,
+            in_ch=trunk_in_ch,
             out_ch=d_model,
             hidden_dim=mlp_hidden_dim,
             num_layers=mlp_layers,
@@ -272,8 +483,7 @@ class TLNO(nn.Module):
         for i in range(num_blocks):
             self.ops.append(
                 TransformerBlock(
-                    in_ch=d_model,
-                    out_ch=d_model,
+                    dim=d_model,
                     n_heads=num_heads,
                     activation=activation,
                     mlp_dim=transformer_mlp_factor * d_model,
@@ -290,50 +500,59 @@ class TLNO(nn.Module):
             norm=None,
             dropout=dropout,
         )
+        # LNO needs very small weight in the Linear layers to avoid explosion!
+        if std_init is not None:
+            self.apply(partial(self._init_weights, std=std_init))
 
-    def _init_weights(self, module):
+    def _init_weights(self, module, std=0.0002):
         if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=0.0002)
+            module.weight.data.normal_(mean=0.0, std=std)
             if isinstance(module, torch.nn.Linear) and module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, torch.nn.LayerNorm):
             module.weight.data.fill_(1.0)
             module.bias.data.zero_()
 
-    def forward(self, x: torch.Tensor, time: Union[None, torch.Tensor] = None, residual: bool = False):
+    def forward(self, x: torch.Tensor, time: torch.Tensor, residual: bool = False):
 
         if residual:
-            shortcut = x  # The network learns the residual r(t+dt): f(t+dt)= r(t+dt) + f(t)
+            if self.in_channels > self.out_channels:
+                shortcut = x[:, -self.out_channels :, ...]
+            elif self.in_channels == self.out_channels:
+                shortcut = x
+            else:
+                residual = False
 
         B, C, H, W = x.shape
+
+        x = x.permute(0, 2, 3, 1).reshape(B, H * W, C).contiguous()
+
         h_coords = torch.linspace(-1, 1, H, device=x.device)
         w_coords = torch.linspace(-1, 1, W, device=x.device)
         grid_h, grid_w = torch.meshgrid(h_coords, w_coords, indexing="ij")
 
         coords = torch.stack([grid_h, grid_w], dim=-1)  # [H, W, 2]
-        coords = coords.unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, W, 2] - VRAM: 0
-        trunk_input = coords.reshape(B, H * W, 2)
+        if self.sinus_pe_freq:
+            coords = sinusoidal_encoding_2d(coords, self.sinus_pe_freq)  # [H, W, 4 * F]
+        coords = coords.view(H * W, -1)
+        coords = coords.unsqueeze(0).expand(B, -1, -1)
 
-        if time is not None:
-            t = time.view(B, 1, 1).expand(-1, H * W, -1)
-            trunk_input = torch.cat([trunk_input, t], dim=-1)
+        time = self.timsetep_embedding(time)[:, None, :]
 
-        x = x.permute(0, 2, 3, 1).reshape(B, H * W, C).contiguous()
-
-        # We add the function to the trunk output -> non linear kernel
-        if self.nonlinear:
-            trunk_input = torch.concat([x, trunk_input], dim=-1)
-
-        trunk_output = self.trunk_projector(trunk_input)  # -> [B, H*W, d_model]
-        branch_output = self.branch_projector(x)  # [B, H*W, d_model]
+        trunk_output = self.trunk_norm(self.trunk_projector(coords))  # -> [B, H*W, d_model]
+        branch_output = self.branch_projector(x)
+        branch_output = branch_output + time  # [B, H*W, d_model]
+        branch_output = self.norm(branch_output, time)
 
         temperature = self.proj_temperature(trunk_output) + self.bias
         temperature = torch.clamp(temperature, min=0.01)
         score = self.attention_projector(trunk_output) / math.sqrt(trunk_output.size(-1))  # [B, H*W, modes]
+        score = score / temperature
 
-        score_encode = gumbel_softmax(score, temperature, dim=-1)
-        score_decode = gumbel_softmax(score, temperature, dim=1)
-
+        # score_encode = gumbel_softmax(score, temperature, dim=-1)
+        # score_decode = gumbel_softmax(score, temperature, dim=1)
+        score_encode = torch.softmax(score, dim=-1)
+        score_decode = torch.softmax(score, dim=1)
         z = torch.einsum("bnm,bnc->bmc", score_encode, branch_output)
 
         for block in self.ops:

@@ -113,7 +113,10 @@ class FNO(nn.Module):
 
         self.projection = nn.Conv2d(hidden_channels[-1], out_channels, 1, bias=True)
 
-    def forward(self, x, return_coords=False):
+    def forward(self, x, residual=False, return_coords=False, **kwargs):
+
+        if residual:
+            shortcut = x
 
         if return_coords and not self.fixed_pos_encoding:
             raise ValueError(
@@ -138,6 +141,9 @@ class FNO(nn.Module):
             x = op(x)
 
         x = self.projection(x)
+
+        if residual:
+            x = x + shortcut
 
         if self.fixed_pos_encoding and return_coords:
             return x, coords

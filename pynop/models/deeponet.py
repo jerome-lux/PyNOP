@@ -52,9 +52,9 @@ class DeepONet(nn.Module):
             for i, n in enumerate(branchnet[1:]):
                 self.branchlist.append(nn.Linear(branchnet[i], n, bias=use_bias))
                 if normalization is not None:
-                    self.branchlist.append(self.normalization(n))
+                    self.branchlist.append(normalization(n))
                 if activation is not None:
-                    self.branchlist.append(self.activation())
+                    self.branchlist.append(activation())
             # Last layer without activation
             self.branchlist.append(nn.Linear(branchnet[i + 1], branchnet[i + 2]))
         else:
@@ -67,9 +67,9 @@ class DeepONet(nn.Module):
             for i, n in enumerate(trunknet[1:]):
                 self.trunknet.append(nn.Linear(trunknet[i], n, bias=use_bias))
                 if normalization is not None:
-                    self.trunknet.append(self.normalization(n))
+                    self.trunknet.append(normalization(n))
                 if activation is not None:
-                    self.trunknet.append(self.activation())
+                    self.trunknet.append(activation())
             # Last layer without activation
             self.trunknet.append(nn.Linear(trunknet[i + 1], trunknet[i + 2]))
 
@@ -84,8 +84,8 @@ class DeepONet(nn.Module):
         if self.encoder is not None:
             u = self.encoder(u)
 
-        u = self.branch(u)
-        y = self.trunk(y)
+        u = self.branchnet(u)
+        y = self.trunknet(y)
         # The output of the branchnet can have a different shape to that of the trunknet,
         # but it **must** have the same number of channels
         x = torch.einsum("ji, ki...-> kj...", y, u) * self.scale

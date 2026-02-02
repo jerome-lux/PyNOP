@@ -969,7 +969,7 @@ class CoDABlock2D(nn.Module):
         q = q.reshape(batch_size, self.n_heads, t, -1)
         v = v.reshape(batch_size, self.n_heads, t, -1)
 
-        print(q.shape, k.shape, v.shape)
+        # print(q.shape, k.shape, v.shape)
 
         # attention mechanism
         dprod = torch.matmul(q, k.transpose(-1, -2)) / (np.sqrt(k.shape[-1]) * self.temperature)
@@ -1170,7 +1170,7 @@ class SepLITBlock(nn.Module):
         m1,
         m2,
         mlp_hidden_dim=64,
-        mlp_num_layers=2,
+        mlp_num_layers=1,
         activation=nn.GELU,
         norm=AdaptiveLayerNorm,
     ):
@@ -1556,7 +1556,6 @@ class ParametricITBlock(nn.Module):
         out_channels: int,
         complex: bool = False,
         activation: Callable = nn.GELU,
-        norm: Callable = AdaptiveLayerNorm,
         dim: int = 2,
     ):
 
@@ -1604,25 +1603,15 @@ class ParametricITBlock(nn.Module):
                 self.learned_weights_1.normal_(0, std)
                 self.learned_weights_2.normal_(0, std)
 
-        self.mixer = nn.Linear(out_channels, out_channels)
-
-        # Activation & normalization
-        self.activation = activation()
-        if norm is not None:
-            self.norm = norm(out_channels)
-        else:
-            self.norm = None
-
-        # Shortcut Branch Layer
-        # 1x1 Conv to potentially change input channels to output channels
-        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        self.mixer = MLPBlock(out_channels, out_channels, hidden_dim=out_channels, num_layers=1, activation=activation)
+        self.norm = AdaptiveLayerNorm(out_channels, out_channels)
 
     def forward(self, x: Tensor, fwd_basis: Tensor, time: Union[None, Tensor] = None):
         """
         Performs the forward pass of the module for variable resolution input.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (B, C, H, W).
+            x (torch.Tensor): Input tensor of shape (B, H, W, C).
                                 H and W may vary.
             fwd_basis: basis for forward IT tranform
             cond: contionning variable (e.g. time) passed to the norm layer
@@ -1630,7 +1619,7 @@ class ParametricITBlock(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (B, C, H_out, W_out), real part.
         """
-        B, C, H, W = x.shape
+        B, H, W, C = x.shape
 
         # Convert input to complex numbers if it is real
         if fwd_basis.is_complex():
@@ -1638,35 +1627,29 @@ class ParametricITBlock(nn.Module):
         else:
             xin = x
 
-        xhat = torch.einsum("bchw,bhwmn->bcmn", xin, fwd_basis)  # "Spectral" representation
+        xhat = torch.einsum("bhwc,bhwmn->bmnc", xin, fwd_basis)  # "Spectral" representation
 
         # Multiply by learned weigths in transformed space
         # xhat = torch.einsum("bixy,oixy->boxy", xhat, self.learned_weights)
-        xhat = torch.einsum("bimn, imn -> bimn", xhat, self.learned_weights_1)
-        xhat = torch.einsum("bixy,oi->boxy", xhat, self.learned_weights_2)
+        xhat = torch.einsum("bmni, imn -> bmni", xhat, self.learned_weights_1)
+        xhat = torch.einsum("bmni,oi->bmno", xhat, self.learned_weights_2)
 
         if fwd_basis.is_complex():
-            x_rec = torch.einsum("bcmn,bhwmn->bhwc", xhat, fwd_basis.conj()).real
+            x_rec = torch.einsum("bmnc,bhwmn->bhwc", xhat, fwd_basis.conj()).real
         else:
-            x_rec = torch.einsum("bcmn,bhwmn->bhwc", xhat, fwd_basis)
+            x_rec = torch.einsum("bmnc,bhwmn->bhwc", xhat, fwd_basis)
 
-        x_rec = x_rec * self.alpha
-
+        x_rec = x_rec * self.alpha + x  # 1st shortcut
+        shortcut = x_rec
         # Mixing channels
-        output = self.mixer(x_rec)
-        if self.norm is not None:
-            if isinstance(self.norm, AdaptiveLayerNorm):
-                output = self.norm(output, time)
-            else:
-                output = self.norm(output)
-        output = self.activation(output).permute(0, 3, 1, 2)
-        output = output + self.shortcut(x)
-        output = self.activation(output)
+        x_rec = self.norm(x_rec, time)
+        x_rec = self.mixer(x_rec)
+        x_rec = x_rec + shortcut  # 2nd shortcut"
 
-        return output
+        return x_rec
 
 
-class ITBlock(nn.Module):
+class _deprec_ITBlock(nn.Module):
     """
     ITBlock Module for Non-Linear or linear Integral Transform.
 
@@ -1703,7 +1686,6 @@ class ITBlock(nn.Module):
     def __init__(
         self,
         in_channels,
-        out_channels,
         m1,
         m2,
         nonlinear=True,
@@ -1712,23 +1694,15 @@ class ITBlock(nn.Module):
         activation=nn.GELU,
         mlp_act=nn.GELU,
         norm=AdaptiveLayerNorm,
-        compute_ortho_loss=False,
-        sampling=2048,
-        ortho_loss_mode="MSE",
         dim=2,
     ):
 
         super().__init__()
 
         self.in_channels = in_channels
-        self.out_channels = out_channels
         self.m1 = m1  # Number of modes kept in height (u)
         self.m2 = m2  # Number of modes kept in width (v)
         self.nonlinear = nonlinear
-        self.compute_ortho_loss = compute_ortho_loss
-        self.ortho_loss = 0.0
-        self.sampling = sampling
-        self.ortho_loss_mode = ortho_loss_mode
         self.dim = dim
 
         in_ch = dim + in_channels if nonlinear else dim
@@ -1747,30 +1721,26 @@ class ITBlock(nn.Module):
         # channel wise multiplicaito
         self.learned_weights_1 = nn.Parameter(torch.zeros(self.in_channels, self.m1, self.m2, dtype=torch.cfloat))
         # mixing
-        self.learned_weights_2 = nn.Parameter(torch.zeros(self.in_channels, self.out_channels, dtype=torch.cfloat))
+        self.learned_weights_2 = nn.Parameter(torch.zeros(self.in_channels, self.in_channels, dtype=torch.cfloat))
 
-        std = (1.0 / (in_channels + out_channels)) ** 0.5
+        std = (1.0 / (in_channels + in_channels)) ** 0.5
         with torch.no_grad():
             self.learned_weights_1.real.normal_(0, std)
             self.learned_weights_1.imag.normal_(0, std)
             self.learned_weights_2.real.normal_(0, std)
             self.learned_weights_2.imag.normal_(0, std)
 
-        self.alpha = nn.Parameter(torch.ones(1, 1, 1, out_channels))
+        self.alpha = nn.Parameter(torch.ones(1, 1, 1, in_channels))
 
-        self.mixer = nn.Linear(out_channels, out_channels)
+        self.mixer = nn.Linear(in_channels, in_channels)
 
         # Activation & normalization
         self.activation = activation()
 
         if norm is not None:
-            self.norm = norm(out_channels)
+            self.norm = norm(in_channels)
         else:
             self.norm = None
-
-        # Shortcut Branch Layer
-        # 1x1 Conv to potentially change input channels to output channels
-        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
     def forward(self, x: Tensor, time: Union[None, Tensor] = None):
         """
@@ -1786,7 +1756,7 @@ class ITBlock(nn.Module):
         """
         B, C, H, W = x.shape
 
-        shortcut = self.shortcut(x)
+        shortcut = x
         H_basis, W_basis = H, W
 
         h_coords = torch.linspace(-1, 1, H_basis, device=x.device)
@@ -1813,9 +1783,6 @@ class ITBlock(nn.Module):
 
         # Normalization of each basis vector
         # encoder_basis = F.normalize(encoder_basis, p=2, dim=(1, 2))
-
-        if self.compute_ortho_loss:
-            self.ortho_loss = ortho_loss(encoder_basis, n_samples=self.sampling, mode=self.ortho_loss_mode)
 
         # Convert input to complex numbers if it is real
         xc = torch.complex(x, torch.zeros_like(x)) if not x.is_complex() else x
@@ -1847,7 +1814,7 @@ class ITBlock(nn.Module):
         return output
 
 
-class RITBlock(nn.Module):
+class _deprec_RITBlock(nn.Module):
     """
     Real ITBlock Module for Non-Linear or linear Integral Transform.
 
@@ -1885,7 +1852,6 @@ class RITBlock(nn.Module):
     def __init__(
         self,
         in_channels,
-        out_channels,
         m1,
         m2,
         nonlinear=True,
@@ -1894,23 +1860,15 @@ class RITBlock(nn.Module):
         activation=nn.GELU,
         mlp_act=nn.GELU,
         norm=AdaptiveLayerNorm,
-        compute_ortho_loss=False,
-        sampling=2048,
         dim=2,
-        ortho_loss_mode="MSE",
     ):
 
         super().__init__()
 
         self.in_channels = in_channels
-        self.out_channels = out_channels
         self.m1 = m1  # Number of modes kept in height (u)
         self.m2 = m2  # Number of modes kept in width (v)
         self.nonlinear = nonlinear
-        self.compute_ortho_loss = compute_ortho_loss
-        self.ortho_loss = 0.0
-        self.sampling = sampling
-        self.ortho_loss_mode = ortho_loss_mode
         self.dim = dim
 
         in_ch = dim + in_channels if nonlinear else dim
@@ -1926,27 +1884,23 @@ class RITBlock(nn.Module):
         # self.learned_weights = nn.Parameter(torch.zeros(self.in_channels, out_channels, self.m1, self.m2))
         self.learned_weights_1 = nn.Parameter(torch.zeros(self.in_channels, self.m1, self.m2))
         # mixing
-        self.learned_weights_2 = nn.Parameter(torch.zeros(self.in_channels, self.out_channels))
+        self.learned_weights_2 = nn.Parameter(torch.zeros(self.in_channels, self.in_channels))
 
-        std = (2.0 / (in_channels + out_channels)) ** 0.5
+        std = (1.0 / in_channels) ** 0.5
         with torch.no_grad():
             self.learned_weights_1.normal_(0, std)
             self.learned_weights_2.normal_(0, std)
 
-        self.alpha = nn.Parameter(torch.ones(1, 1, 1, out_channels))
+        self.alpha = nn.Parameter(torch.ones(1, 1, 1, in_channels))
 
-        self.mixer = nn.Linear(out_channels, out_channels)
+        self.mixer = nn.Linear(in_channels, in_channels)
 
         # Activation & normalization
         self.activation = activation()
         if norm is not None:
-            self.norm = norm(out_channels)
+            self.norm = norm(in_channels)
         else:
             self.norm = None
-
-        # Shortcut Branch Layer
-        # 1x1 Conv to potentially change input channels to output channels
-        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
     def forward(self, x: Tensor, time: Union[None, Tensor] = None):
         """
@@ -1962,7 +1916,7 @@ class RITBlock(nn.Module):
         B, C, H, W = x.shape
         H_basis, W_basis = H, W
 
-        shortcut = self.shortcut(x)
+        shortcut = x
 
         h_coords = torch.linspace(-1, 1, H_basis, device=x.device)
         w_coords = torch.linspace(-1, 1, W_basis, device=x.device)
@@ -1988,9 +1942,6 @@ class RITBlock(nn.Module):
         # Normalization of each basis vector
         # encoder_basis = F.normalize(encoder_basis, p=2, dim=(1, 2))
 
-        if self.compute_ortho_loss:
-            self.ortho_loss = ortho_loss(encoder_basis, n_samples=self.sampling, mode=self.ortho_loss_mode)
-
         xhat = torch.einsum("bhwc,bhwmn->bcmn", x, encoder_basis)  # "Spectral" representation
 
         # Multiply by learned weigths in transformed space
@@ -2015,48 +1966,34 @@ class RITBlock(nn.Module):
 
         return output
 
-
-class AttentionITBlock(nn.Module):
+class LITBlock(nn.Module):
     """
-    Attention-based Integral Transform Block for Non-Linear Integral Transform.
+    Learnable Intregral transform block for Non-Linear or linear Integral Transform.
 
-    This module implements a non-linear integral transform with attention mechanism that:
-        1. Transforms the input to a 'spectral' representation using provided basis vectors
-        2. Applies multi-head attention in the transformed space
-        3. Applies inverse transform back to spatial domain using conjugate basis
-        4. Applies channel mixing, normalization, and activation
-        5. Adds shortcut connection with optional resampling
+    This module implements a non-linear integral transform that:
+        1. Generates learned basis functions K(u, v, x, y, f(x, y)) or K(u, v, x, y) based on input coordinates and values
+        2. Transforms the input to a 'spectral' representation via einsum operation
+        3. Multiply by learned weights in the transformed space
+        4. Applies inverse transform back to spatial domain using conjugate basis functions
+        5. Applies channel mixing, normalization, and activation
+        6. Adds shortcut connection with optional resampling
 
-    Parameters:
+        Parameters:
         in_channels (int): Number of input channels.
         out_channels (int): Number of output channels.
-        m1 (int): Number of modes in the height dimension (u).
-        m2 (int): Number of modes in the width dimension (v).
-        num_heads (int, optional): Number of attention heads. Default is 2.
-        nonlinear (bool, optional): If True, conditions kernels on input values.
-            Default is True.
-        activation (callable, optional): Activation function to use.
-            Default is nn.GELU.
-        norm (callable, optional): Normalization layer to use.
-            Default is LayerNorm2d.
-        resampling (str, optional): If "down" or "up", resample by factor of 2.
-            Default is None.
-        compute_ortho_loss (bool, optional): If True, compute orthogonality loss
-            for basis functions. Default is True.
-        sampling (int, optional): Number of spatial points to sample for
-            orthogonality loss. Default is 2048.
-        ortho_loss_mode (str, optional): Mode for orthogonality loss computation.
-            Default is "QR".
-        complex (bool, optional): If True, use complex attention. Default is True.
-        dim (int, optional): Spatial dimensionality. Default is 2.
+        m1 (int): Number of modes to keep in the height dimension (u).
+        m2 (int): Number of modes to keep in the width dimension (v).
+        mlp_hidden_dim (int, optional): Hidden dimension of the MLPs learning the bases. Default is 64.
+        mlp_num_layers (int, optional): Number of hidden layers in the MLPs learning the bases. Default is 2.
+        activation (callable, optional): Activation function to use. Default is nn.GELU.
+        dim (int, optional): Spatial dimensionality (default is 2 for 2d problems).
 
     Forward Args:
-        x (torch.Tensor): Input tensor of shape (B, C, H, W), where H and W
-            may vary.
-        basis (torch.Tensor): Basis functions tensor for the transformation.
+        x (torch.Tensor): Input tensor of shape (B, C, H, W), where H and W may vary.
 
     Forward Returns:
-        torch.Tensor: Output tensor of shape (B, out_channels, H, W) (real part).
+        torch.Tensor: Output tensor of shape (B, out_channels, H, W) (real part)
+
     """
 
     def __init__(
@@ -2064,16 +2001,13 @@ class AttentionITBlock(nn.Module):
         in_channels,
         m1,
         m2,
-        num_heads=2,
-        nonlinear=True,
+        mlp_hidden_dim=64,
+        mlp_num_layers=1,
         activation=nn.GELU,
-        norm=AdaptiveLayerNorm,
-        resampling=None,
-        compute_ortho_loss=True,
-        sampling=2048,
-        ortho_loss_mode="MSE",
-        complex=True,
-        dim=2,
+        mlp_act=nn.GELU,
+        sinus_pe_freq=None,
+        nonlinear=True,
+        orthogonal_init=True,
     ):
 
         super().__init__()
@@ -2081,111 +2015,132 @@ class AttentionITBlock(nn.Module):
         self.in_channels = in_channels
         self.m1 = m1  # Number of modes kept in height (u)
         self.m2 = m2  # Number of modes kept in width (v)
+        self.sinus_pe_freq = sinus_pe_freq
         self.nonlinear = nonlinear
-        self.resampling = resampling
-        self.compute_ortho_loss = compute_ortho_loss
-        self.ortho_loss = 0.0
-        self.sampling = sampling
-        self.ortho_loss_mode = ortho_loss_mode
 
-        self.alpha = nn.Parameter(
-            torch.ones(
-                1,
-                in_channels,
-                1,
-                1,
-            )
+        # If sinusoidal positional encoding the final dimension is 4 * frequencies
+
+        in_ch = in_channels + 2 if nonlinear else 2
+
+        if sinus_pe_freq is not None:
+            in_ch = in_ch + 4 * sinus_pe_freq
+        else:
+            in_ch = in_ch + 2
+
+        self.generator = MLPBlock(
+            out_ch=self.m1 * self.m2,
+            in_ch=in_ch,
+            hidden_dim=mlp_hidden_dim,
+            num_layers=mlp_num_layers,
+            activation=mlp_act,
         )
+        if orthogonal_init:
 
-        # Self-Attention block in the transformed space
-        if complex:
-            self.attention = ComplexAttention(
-                in_ch=in_channels,
-                out_ch=in_channels,
-                num_heads=num_heads,
-            )
-        else:
-            self.attention = Attention(
-                in_ch=in_channels,
-                out_ch=in_channels,
-                num_heads=num_heads,
-            )
+            self.ortho_init_weights(self.generator)
 
-        self.mixer = nn.Linear(in_channels, in_channels)
-        # Activation & normalization
-        self.activation = activation()
-        if norm is not None:
-            self.norm = norm(in_channels)
-        else:
-            self.norm = None
+        # Learned parameters for multiplication in the transformed space (per channel).
+        # self.learned_weights = nn.Parameter(torch.zeros(self.in_channels, out_channels, self.m1, self.m2))
 
-        # Shortcut Branch Layer
-        self.shortcut = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.learned_weights_1 = nn.Parameter(torch.zeros(self.in_channels, self.m1, self.m2))
+        # mixing
+        self.learned_weights_2 = nn.Parameter(torch.zeros(self.in_channels, self.in_channels))
 
-    def forward(self, x, basis, cond=None):
+        std = (1.0 / (in_channels)) ** 0.5
+        with torch.no_grad():
+            self.learned_weights_1.normal_(0, std)
+            self.learned_weights_2.normal_(0, std)
+
+        self.alpha = nn.Parameter(torch.zeros(1, 1, 1, in_channels))
+
+        self.mixer = MLPBlock(in_channels, in_channels, num_layers=1, activation=activation)
+
+        self.in_norm = AdaptiveLayerNorm(in_channels, in_channels)
+        self.out_norm = nn.LayerNorm(in_channels)
+
+    def ortho_init_weights(self, module):
+        if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
+            torch.nn.init.orthogonal_(module.weight)
+            if isinstance(module, torch.nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+
+    def _init_weights(self, module, std=0.02):
+        if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
+            nn.init.trunc_normal_(module.weight, std=std)
+            if isinstance(module, torch.nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+
+    def forward(self, x: Tensor, time: Union[None, Tensor] = None):
         """
         Performs the forward pass of the module for variable resolution input.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (B, C, H, W).
-                                H and W may vary.
+            x (torch.Tensor): Input tensor of shape (B, H, W, C).
 
         Returns:
-            torch.Tensor: Output tensor of shape (B, C, H_out, W_out), real part.
+            torch.Tensor: Output tensor of shape (B, H, W, C)
         """
-        B, C, H, W = x.shape
 
-        if self.compute_ortho_loss:
-            self.ortho_loss = ortho_loss(basis, n_samples=self.sampling, mode=self.ortho_loss_mode)
+        shortcut = x
 
-        # Convert input to complex numbers if it is real
-        if basis.is_complex():
-            xin = torch.complex(x, torch.zeros_like(x)) if not x.is_complex() else x
+        # Generate kernels
+        B, H, W, C = x.shape
+
+        h_coords = torch.linspace(-1, 1, H, device=x.device)
+        w_coords = torch.linspace(-1, 1, W, device=x.device)
+        grid_h, grid_w = torch.meshgrid(h_coords, w_coords, indexing="ij")
+
+        coords = torch.stack([grid_h, grid_w], dim=-1)  # [H, W, 2]
+        if self.sinus_pe_freq:
+            coords = sinusoidal_encoding_2d(coords, self.sinus_pe_freq).view(H, W, -1)  # [H, W, 4 * F]
+        coords = coords.unsqueeze(0).expand(B, -1, -1, -1)
+
+        x = self.in_norm(x, time)
+
+        if self.nonlinear:
+            basis_input = torch.cat([x, coords], dim=-1)
         else:
-            xin = x
+            basis_input = coords
 
-        xhat = torch.einsum("bchw,bhwmn->bmnc", xin, basis)  # "Spectral" representation
+        # print(gamma.shape, beta.shape, x.shape, trunk.shape)
+        basis = self.generator(basis_input)
 
-        # Attention in transformed space (uses complex attention)
-        xhat = xhat.contiguous().view(B, -1, C)  # (B, m1 * m2, C_in)
-        xhat = self.attention(xhat, xhat, xhat)
-        xhat = xhat.reshape(B, self.m1, self.m2, -1)
+        basis = basis.view(B, H, W, self.m1, self.m2) / (H * W)
+        # norm_factor = torch.sqrt(torch.mean(torch.abs(basis) ** 2, dim=(1, 2), keepdim=True))
+        # basis = basis / (norm_factor + 1e-6)
 
-        # Inverse transform
-        if basis.is_complex():
-            x_rec = torch.einsum("bcmn,bhwmn->bhwc", xhat, basis.conj()).real
-        else:
-            x_rec = torch.einsum("bcmn,bhwmn->bhwc", xhat, basis)
+        xhat = torch.einsum("bhwc,bhwmn->bcmn", x, basis)  # "Spectral" representation
 
-        x_rec = x_rec * self.alpha
+        # Multiply by learned weigths in transformed space
+        # xhat = torch.einsum("bixy,oixy->boxy", xhat, self.learned_weights)
+        xhat = torch.einsum("bimn, imn -> bimn", xhat, self.learned_weights_1)
+        xhat = torch.einsum("bimn,oi->bomn", xhat, self.learned_weights_2)
 
-        # Mixing channels
-        output = self.mixer(x_rec)
-        output = self.norm(output, cond) if self.norm is not None else output
-        output = self.activation(output)
-        output = output.permute(0, 3, 1, 2)
-        output = output + self.shortcut(x)
-        output = self.activation(output)
+        x_rec = torch.einsum("bcmn,bhwmn->bhwc", xhat, basis)
+        x_rec = x_rec * self.alpha + shortcut  # 1st shortcut
+        shortcut = x_rec
+        x_rec = self.out_norm(x_rec)
+        x_rec = self.mixer(x_rec)
+        x_rec = x_rec + shortcut  # 2nd shortcut
 
-        return output
+        return x_rec
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, n_heads, activation=nn.GELU, mlp_dim=256, dropout=0.1, complex=True):
+    def __init__(self, dim, n_heads, activation=nn.GELU, mlp_dim=256, dropout=0.1):
         super().__init__()
 
-        self.attention = Attention(in_ch, out_ch, n_heads)
+        self.attention = Attention(dim, dim, n_heads)
 
         self.mlp = nn.Sequential(
-            nn.Linear(out_ch, mlp_dim),
+            nn.Linear(dim, mlp_dim),
             activation(),
             nn.Dropout(dropout),
-            nn.Linear(mlp_dim, out_ch),
+            nn.Linear(mlp_dim, dim),
             nn.Dropout(dropout),
         )
 
-        self.norm1 = AdaptiveLayerNorm(in_ch)
-        self.norm2 = AdaptiveLayerNorm(out_ch)
+        self.norm1 = AdaptiveLayerNorm(dim, dim)
+        self.norm2 = nn.LayerNorm(dim)
 
     def forward(self, x, cond=None):
         # x: [B, N, C]
@@ -2195,7 +2150,7 @@ class TransformerBlock(nn.Module):
         x = self.attention(Q=x, V=x, K=x)
         x = x + res
         res = x
-        x = self.norm2(x, cond)
+        x = self.norm2(x)
         x = self.mlp(x)
         x = x + res
 
@@ -2229,14 +2184,14 @@ class TransolverBlock(nn.Module):
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
-        self.proj = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+        self.proj = MLPBlock(inner_dim, dim, hidden_dim=mlp_ratio * dim, activation=activation)
 
     def forward(self, x):
         # input B N C
         B, N, C = x.shape
 
         x_mid = self.ln1(x)
-        # --- Physic Attention bnlock
+        # --- Physic Attention block
         x_mid = (
             self.in_project_x(x).reshape(B, N, self.heads, self.dim_head).permute(0, 2, 1, 3).contiguous()
         )  # B H N C
@@ -2319,9 +2274,9 @@ class LinearNOBlock(nn.Module):
         q = q.permute(0, 2, 1, 3)
         out = torch.matmul(q, global_context)  # [B, H, N, head_dim]
 
-        out = out.permute(0, 2, 1, 3).contiguous().view(B, N, C)
+        out = out.permute(0, 2, 1, 3).contiguous().view(B, N, C) + x
 
-        out = self.out_proj(self.ln2(out)) + x
+        out = self.out_proj(self.ln2(out)) + out
 
         return out
 

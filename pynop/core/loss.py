@@ -149,6 +149,24 @@ def diffusion_loss(c_pred, ct, dt, diffusivity, x_coords, y_coords, time_derivat
     return torch.mean(residual**2)
 
 
+class DepthwiseMSELoss(nn.Module):
+    """
+    Compute the normalized MSE Loss per channel
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred, target):
+
+        spatial_dims = tuple(range(2, pred.ndim))
+
+        # per channel - MSE
+        mse_per_channel = torch.mean((pred - target) ** 2, dim=spatial_dims)
+
+        return torch.mean(mse_per_channel)
+
+
 class nMSELoss(nn.Module):
     """
     Compute the normalized MSE Loss per channel

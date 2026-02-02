@@ -22,38 +22,40 @@ class LayerNorm2d(nn.LayerNorm):
 
 
 class AdaptiveLayerNorm(nn.Module):
-    def __init__(self, normalized_shape, cond_dim=1):
+    def __init__(self, channels, cond_dim=1):
         super().__init__()
-        self.normalized_shape = (normalized_shape,) if isinstance(normalized_shape, int) else tuple(normalized_shape)
+        self.channels = channels
         self.eps = 1e-5
 
-        self.weight = nn.Parameter(torch.ones(self.normalized_shape))
-        self.bias = nn.Parameter(torch.zeros(self.normalized_shape))
+        self.weight = nn.Parameter(torch.ones(channels))
+        self.bias = nn.Parameter(torch.zeros(channels))
 
-        num_features = 1
-        for s in self.normalized_shape:
-            num_features *= s
+        self.cond_mlp = nn.Sequential(nn.Linear(cond_dim, channels * 2))
 
-        self.cond_mlp = nn.Sequential(nn.Linear(cond_dim, num_features * 2))
         nn.init.zeros_(self.cond_mlp[0].weight)
         nn.init.zeros_(self.cond_mlp[0].bias)
 
-    def forward(self, x, cond=None):
+    def forward(self, x, cond):
+        """
+        x: [B, ..., C] (peut �tre [B, N, C] ou [B, H, W, C])
+        cond: [B, cond_dim] (temps ou signal global)
+        """
 
-        x_norm = F.layer_norm(x, self.normalized_shape, eps=self.eps)
-
+        x_norm = F.layer_norm(x, (self.channels,), weight=None, bias=None, eps=self.eps)
         if cond is None:
+
             return self.weight * x_norm + self.bias
-        else:
 
-            ada_params = self.cond_mlp(cond)
-            gamma, beta = torch.chunk(ada_params, 2, dim=-1)
+        # [B, C*2] -> [B, 2, C]
+        ada_params = self.cond_mlp(cond).view(-1, 2, self.channels)
+        gamma = ada_params[:, 0, :]  # [B, C]
+        beta = ada_params[:, 1, :]  # [B, C]
 
-            for _ in range(x.dim() - gamma.dim()):
-                gamma = gamma.unsqueeze(1)
-                beta = beta.unsqueeze(1)
+        for _ in range(x.dim() - 2):
+            gamma = gamma.unsqueeze(1)
+            beta = beta.unsqueeze(1)
 
-            return (1 + gamma) * x_norm + beta
+        return (self.weight + gamma) * x_norm + (self.bias + beta)
 
 
 class ComplexLayerNorm(nn.Module):

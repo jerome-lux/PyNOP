@@ -583,12 +583,52 @@ class CartesianEmbedding(nn.Module):
         return output
 
 
+def timestep_embedding(timesteps, dim, max_period=10000):
+    """
+    Create sinusoidal timestep embeddings.
+    :param timesteps: a 1-D Tensor of N indices, one per batch element.
+                      These may be fractional.
+    :param dim: the dimension of the output.
+    :param max_period: controls the minimum frequency of the embeddings.
+    :return: an [N x dim] Tensor of positional embeddings.
+    """
 
-def time_encoding(t, num_freq=4):
-    # t should be [B, 1] and must be normalized
+    half = dim // 2
+    freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
+        device=timesteps.device
+    )
+    args = timesteps[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :, :1])], dim=-1)
+    return embedding
 
-    phases = t * torch.pow(2.0, torch.arange(num_freq, device=t.device).float()) * math.pi
-    return torch.cat([torch.sin(phases), torch.cos(phases)], dim=-1)
+
+class TimestepEmbedding(nn.Module):
+    def __init__(self, dim, max_period=10000):
+
+        super().__init__()
+        self.dim = dim
+        self.max_period = max_period
+
+        half = dim // 2
+        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half)
+        self.register_buffer("freqs", freqs)
+
+    def forward(self, timesteps):
+        """
+        :param timesteps: Tensor 1-D de taille [N]
+        :return: Tensor de taille [N, dim]
+        """
+        # timesteps[:, None] transforme [N] en [N, 1]
+        args = timesteps[:, None].float() * self.freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+
+        if self.dim % 2:
+            zero_pad = torch.zeros(timesteps.shape[0], 1, device=timesteps.device)
+            embedding = torch.cat([embedding, zero_pad], dim=-1)
+
+        return embedding
 
 
 def sinusoidal_encoding_2d(coords, num_freqs=6):
@@ -603,10 +643,10 @@ def sinusoidal_encoding_2d(coords, num_freqs=6):
     H, W, C = coords.shape
     device = coords.device
 
-    max_res = max(H, W)
-    num_frequencies = min(int(np.ceil(np.log2(max_res * 0.5))), num_freqs)
+    # max_res = max(H, W)
+    # num_freqs = min(int(np.ceil(np.log2(max_res * 0.5))), num_freqs)
 
-    freq_bands = torch.pow(2.0, torch.arange(num_frequencies, device=device).float())
+    freq_bands = torch.pow(2.0, torch.arange(num_freqs, device=device).float())
     freq_bands = freq_bands * math.pi
 
     #  [N, 2, 1] * [F] -> [N, 2, F]
@@ -616,7 +656,7 @@ def sinusoidal_encoding_2d(coords, num_freqs=6):
     sin_feat = torch.sin(angles)
     cos_feat = torch.cos(angles)
 
-    # [B, N, 2 * num_frequencies * 2]
+    # [B, N, 2 * num_freqs * 2]
     enc_coords = torch.cat([sin_feat, cos_feat], dim=-1)
     return enc_coords.view(H * W, -1)
 

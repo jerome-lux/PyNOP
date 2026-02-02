@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Union, Sequence, Callable
 from pynop.core.blocks import MLPBlock, TransolverBlock, LinearNOBlock
-from pynop.core.ops import time_encoding
 
 
 class Transolver(nn.Module):
@@ -22,7 +21,6 @@ class Transolver(nn.Module):
         mlp_ratio=1,
         dim=2,
         cond_dim=None,
-        encoding_freq=12,
     ):
         super(Transolver, self).__init__()
         assert n_hidden % n_head == 0, "Hidden dim must be divisible by the number o fheads"
@@ -30,14 +28,15 @@ class Transolver(nn.Module):
         self.placeholder = nn.Parameter((1 / (n_hidden)) * torch.rand(n_hidden, dtype=torch.float))
         self.n_hidden = n_hidden
         self.dim = dim
+        self.in_ch = in_ch
         self.out_ch = out_ch
         self.dim_head = n_hidden // n_head
-        self.encoding_freq = encoding_freq
+
         if cond_dim is not None:
             self.embedding = nn.Linear(cond_dim, n_hidden)
 
         self.time_mlp = MLPBlock(
-            in_ch=2 * encoding_freq,
+            in_ch=1,
             out_ch=n_hidden,
             hidden_dim=n_hidden,
             num_layers=1,
@@ -90,7 +89,15 @@ class Transolver(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def forward(self, x, time=None, cond=None, **kwargs):
+    def forward(self, x, time=None, cond=None, residual=False, **kwargs):
+
+        if residual:
+            if self.in_ch > self.out_ch:
+                shortcut = x[:, -self.out_ch :, ...]
+            elif self.in_ch == self.out_ch:
+                shortcut = x
+            else:
+                residual = False
 
         # cond MUST be [B, H*W, cond_dim] (field) or [B, cond_dim] (scalar)
 
@@ -118,14 +125,16 @@ class Transolver(nn.Module):
 
         # time modulation
         if time is not None:
-            t = time_encoding(time, self.encoding_freq)  # -> B, 2 * F
-            t = self.time_mlp(t)
-            x = x * t.unsqueeze(1)
+            t = self.time_mlp(time).unsqueeze(1)
+            x = x + t
 
         for _, block in enumerate(self.blocks):
             x = block(x)
 
         x = self.projection(x)
         x = x.reshape(B, H, W, self.out_ch).permute(0, 3, 1, 2).contiguous()
+
+        if residual:
+            x = x + shortcut
 
         return x
