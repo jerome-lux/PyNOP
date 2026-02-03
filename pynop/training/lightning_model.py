@@ -8,6 +8,7 @@ import os
 import json
 from typing import Any
 from torchmetrics import MeanMetric
+from pytorch_lightning.callbacks import ModelCheckpoint
 from dataclasses import dataclass, asdict
 from ..core import add_noise
 
@@ -57,6 +58,17 @@ class TrainingSchedule:
     def save(self, path: str):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.to_json_dict(), f, indent=4)
+
+
+# custom callback to begin the monitoring only after a certain number of epochs
+class CurriculumCheckpoint(ModelCheckpoint):
+    def __init__(self, start_epoch, **kwargs):
+        super().__init__(**kwargs)
+        self.start_epoch = start_epoch
+
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.current_epoch >= self.start_epoch:
+            super().on_validation_end(trainer, pl_module)
 
 
 class OneStepNOModel(pl.LightningModule):
@@ -125,20 +137,22 @@ class OneStepNOModel(pl.LightningModule):
 
         epoch = self.current_epoch
         max_AR_steps = int(min(T_unroll - 1, self.train_config.max_autoregressive_steps))
-        min_AR_steps = max(self.train_config.min_autoregressive_steps, 1)
+        min_AR_steps = max(self.train_config.min_autoregressive_steps, 0)
 
         if self.train_config.start_autoregressive is not None and self.train_config.final_autoregressive is not None:
             nint = max_AR_steps - min_AR_steps + 1
             delta = (self.train_config.final_autoregressive - self.train_config.start_autoregressive) // nint
             if epoch < self.train_config.start_autoregressive:
-                AR_steps = 0
+                AR_steps = min_AR_steps
             if delta > 0:
-                AR_steps = int(min(max(min_AR_steps + (epoch // delta), 0), max_AR_steps))
+                AR_steps = int(
+                    min(max(min_AR_steps + (epoch - self.train_config.start_autoregressive) // delta, 0), max_AR_steps)
+                )
             else:
                 AR_steps = max_AR_steps
 
         else:
-            AR_steps = 0
+            AR_steps = min_AR_steps
 
         threshold = AR_steps
 
@@ -341,34 +355,39 @@ class MultiStepNOModel(pl.LightningModule):
         n = self.train_config.n_slices
         t_norm = self.train_config.time_normalization
 
-        # --- Logique Curriculum Learning ---
         epoch = self.current_epoch
         max_AR_steps = int(min(T_unroll - n, self.train_config.max_autoregressive_steps))
-        min_AR_steps = max(self.train_config.min_autoregressive_steps, 1)
+        min_AR_steps = max(self.train_config.min_autoregressive_steps, 0)
+        min_AR_steps = int(min(min_AR_steps, T_unroll - n))
 
         if self.train_config.start_autoregressive is not None and self.train_config.final_autoregressive is not None:
             nint = max_AR_steps - min_AR_steps + 1
             delta = (self.train_config.final_autoregressive - self.train_config.start_autoregressive) // nint
             if epoch < self.train_config.start_autoregressive:
-                AR_steps = 0
+                AR_steps = min_AR_steps
             elif delta > 0:
-                AR_steps = int(min(max(min_AR_steps + (epoch // delta), 0), max_AR_steps))
+
+                AR_steps = int(
+                    min(max(min_AR_steps + (epoch - self.train_config.start_autoregressive) // delta, 0), max_AR_steps)
+                )
             else:
                 AR_steps = max_AR_steps
         else:
-            AR_steps = 0
+            AR_steps = min_AR_steps
         # ----------------------------------
 
         loss = 0.0
         RMSE = 0.0
         preds = None
         num_predictions = 0
+        AR_preds = 0
 
         # On commence à t = n-1 pour prédire le slice n
         for t in range(n - 1, T_unroll - 1):
 
             if num_predictions < AR_steps and preds is not None:
                 current_input = torch.cat([current_input[:, 1:, ...], preds.unsqueeze(1)], dim=1)
+                AR_preds += 1
             else:
                 # Mode TEACHER FORCING : On utilise les données réelles (avec bruit éventuel)
                 real_window = inputs[:, t - (n - 1) : t + 1, ...]
@@ -392,7 +411,7 @@ class MultiStepNOModel(pl.LightningModule):
             num_predictions += 1
 
             # 4. Troncature des gradients (BPTT)
-            if num_predictions % self.detach_every_k == 0:
+            if AR_preds % self.detach_every_k == 0:
                 preds = preds.detach()
 
         # Normalisation finale
@@ -401,9 +420,11 @@ class MultiStepNOModel(pl.LightningModule):
             with torch.no_grad():
                 RMSE = RMSE / num_predictions
 
+        self.train_loss_avg.update(loss)
         # Logging
         self.log("AR_steps", int(AR_steps), prog_bar=True)
         self.log("loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("avg_loss", self.train_loss_avg.compute(), prog_bar=True)
         self.log("RMSE", RMSE, on_step=True, on_epoch=True, prog_bar=True)
         self.log("lr", self.optimizer.param_groups[0]["lr"], prog_bar=True)
         return loss
