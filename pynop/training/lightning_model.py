@@ -42,17 +42,21 @@ class TrainingSchedule:
 
     def to_json_dict(self):
         def serialize_value(v):
+            # 1. Si c'est une fonction ou une classe (ex: torch.nn.MSELoss)
+            if callable(v) or isinstance(v, type):
+                if hasattr(v, "__name__"):
+                    return v.__name__
+                return v.__class__.__name__
 
-            if hasattr(v, "__class__") and hasattr(v.__class__, "__name__"):
-                if type(v).__module__ != "builtins":
-                    return v.__class__.__name__
+            # 2. Si c'est un objet complexe non-natif (mais pas une fonction)
+            if hasattr(v, "__class__") and type(v).__module__ != "builtins":
+                return v.__class__.__name__
 
-            if hasattr(v, "__name__"):
-                return v.__name__
+            # 3. Retourner la valeur telle quelle pour les types natifs (int, float, bool, str, None)
+            # JSON gère ces types parfaitement.
+            return v
 
-            json.dumps(v)
-
-        # On parcourt récursivement le dictionnaire de la dataclass
+        # Utilisation de asdict(self) pour récupérer les données de la dataclass
         return {k: serialize_value(v) for k, v in asdict(self).items()}
 
     def save(self, path: str):
