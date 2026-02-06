@@ -79,6 +79,7 @@ class LITNet(nn.Module):
         if residual:
             if self.in_channels > self.out_channels:
                 shortcut = x[:, -self.out_channels :, ...]
+
             elif self.in_channels == self.out_channels:
                 shortcut = x
             else:
@@ -86,13 +87,11 @@ class LITNet(nn.Module):
 
         B, C, H, W = x.shape
 
-        if residual:
-            shortcut = x
-
         if self.fixed_pos_encoding:
             x = self.grid_encoding(x)
 
         x = self.lifting(x.permute(0, 2, 3, 1))
+
         if time is not None:
             time = self.timstep_embedding(time).unsqueeze(1).unsqueeze(1)
             x = x + time
@@ -127,7 +126,7 @@ class SharedModLITNet(nn.Module):
     ):
 
         super().__init__()
-        
+
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.fixed_pos_encoding = fixed_pos_encoding
