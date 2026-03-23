@@ -6,7 +6,7 @@ from torch import nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 from .metrics import AverageMeter
-from .loss import G_GANLoss, D_GANLoss, ZeroCenteredGradientPenalty, diffusion_loss
+from ..core.loss import G_GANLoss, D_GANLoss, ZeroCenteredGradientPenalty, diffusion_loss
 
 from torch.utils.tensorboard import SummaryWriter
 

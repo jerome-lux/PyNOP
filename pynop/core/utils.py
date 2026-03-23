@@ -3,7 +3,80 @@ from collections.abc import Iterable
 from typing import Optional, Any, Sequence
 import math
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+
+def print_stats(x, dim=-1, text=""):
+    with torch.no_grad():
+        var = x.var(dim=dim).mean()
+        mean = x.mean(dim=dim).mean()
+        print(f"{text} mu={mean.item():.2e}, var={var.item():.2e}")
+class ChebyshevBasis(nn.Module):
+    def __init__(self, m1, m2):
+        super().__init__()
+        self.m1 = m1  # Degree max in x
+        self.m2 = m2  # Degree max in y
+
+    def forward(self, coords):
+        """
+        coords: [B, H, W, 2] in range [-1, 1]
+        returns: [B, H, W, m1 * m2]
+        """
+        B, H, W, _ = coords.shape
+        x = coords[..., 0]  # [B, H, W]
+        y = coords[..., 1]  # [B, H, W]
+
+        def get_polys(val, degree):
+            polys = [torch.ones_like(val), val]
+            for n in range(2, degree):
+                polys.append(2 * val * polys[-1] - polys[-2])
+            return torch.stack(polys, dim=-1)  # [B, H, W, degree]
+
+        poly_x = get_polys(x, self.m1)
+        poly_y = get_polys(y, self.m2)
+
+        # Outer product of all x and y degrees to get 2D basis
+        # [B, H, W, m1, 1] * [B, H, W, 1, m2] -> [B, H, W, m1, m2]
+        basis = poly_x.unsqueeze(-1) * poly_y.unsqueeze(-2)
+        return basis.reshape(B, H, W, self.m1 * self.m2)
+
+
+def Newton_Schulz(basis, iterations=5):
+    """
+    Orthogonalize learned bases using Newton-Schulz iteration.
+
+    Args:
+        basis: Tensor of shape [B, H, W, M1, M2]
+        iterations: Number of orthogonalization steps
+
+    Returns:
+        Orthogonalized basis of the same shape [B, H, W, M1, M2]
+    """
+    B, H, W, M1, M2 = basis.shape
+    M = M1 * M2
+    N = H * W
+
+    # 1. Reshape to [B, N, M] -> M columns (modes) of size N (space)
+    # We want columns to be orthonormal: B^T * B = I
+    V = basis.view(B, N, M)
+
+    # 2. Initial scaling to ensure spectral norm < sqrt(3) for convergence
+    # Using a safe spectral norm estimate
+    V_norm = torch.linalg.norm(V, ord=2, dim=(1, 2), keepdim=True)
+    V = V / (V_norm + 1e-6)
+
+    # 3. Newton-Schulz Iteration
+    # Formula: V_{n+1} = V_n * (1.5 * I - 0.5 * V_n^T * V_n)
+    I = torch.eye(M, device=basis.device).expand(B, M, M)
+
+    for _ in range(iterations):
+        # G = V^T * V (Gram matrix [B, M, M])
+        G = torch.bmm(V.transpose(1, 2), V)
+        # Update V
+        V = torch.bmm(V, 1.5 * I - 0.5 * G)
+
+    # 4. Reshape back to original dimensions
+    return V.view(B, H, W, M1, M2)
 
 
 def gs_orthogonalization(X, n_iter=5, eps=1e-6):

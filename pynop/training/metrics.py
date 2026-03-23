@@ -1,3 +1,6 @@
+import torch
+
+
 class AverageMeter:
     def __init__(self):
         self.reset()

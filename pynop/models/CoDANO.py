@@ -5,7 +5,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from pynop.core.blocks import CoDABlock2D
-from pynop.core.ops import CartesianEmbedding
+from pynop.core.encoding import CartesianEmbedding
 
 
 class CoDANO(nn.Module):

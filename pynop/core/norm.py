@@ -21,6 +21,38 @@ class LayerNorm2d(nn.LayerNorm):
         return x
 
 
+class AdaRMSNorm(nn.Module):
+    def __init__(self, feature_dim, condition_dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        # Standard learnable gain for the fallback case
+        self.weight = nn.Parameter(torch.ones(feature_dim))
+
+        # Adaptive gain projection
+        self.to_gamma = nn.Linear(condition_dim, feature_dim)
+
+        # Zero-init ensures we start with identity mapping
+        nn.init.zeros_(self.to_gamma.weight)
+        nn.init.zeros_(self.to_gamma.bias)
+
+    def forward(self, x, condition=None):
+        # Calculate RMS
+        # x: (batch, seq_len, feature_dim)
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        x_normed = x * rms
+
+        if condition is not None:
+            # Generate adaptive gain: (batch, feature_dim)
+            gamma = self.to_gamma(condition)
+            for i in range(x.ndim - 2):
+                gamma = gamma.unsqueeze(1)
+            # Add 1 to ensure stability and broadcast to (batch, 1, feature_dim)
+            return x_normed * (1 + gamma)
+        else:
+            # Fallback to standard RMSNorm with learned weight
+            return x_normed * self.weight
+
+
 class AdaptiveLayerNorm(nn.Module):
     def __init__(self, channels, cond_dim=1):
         super().__init__()

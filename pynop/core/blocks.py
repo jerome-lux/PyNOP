@@ -10,9 +10,9 @@ from torchvision.ops import SqueezeExcitation
 
 from .utils import make_tuple
 from .ops import *
-from .norm import AdaptiveLayerNorm, LayerNorm2d, AdaptiveLayerNorm
-from .loss import ortho_loss
+from .norm import AdaptiveLayerNorm, LayerNorm2d, AdaptiveLayerNorm, AdaRMSNorm
 from .activations import Sine, gumbel_softmax
+from .encoding import RoPE
 from einops import rearrange
 
 # TODO: implement FNO block with  differential kernels (i.e. conv when the kernel is rescaled by 1/h and the mean is substracted)
@@ -1101,7 +1101,6 @@ class MLPBlock(nn.Module):
         Initializes the MLP.
         Args:
             n_dim (int): Dimension of the input coordinates (default: 2).
-            Note: the kernel can be made non linear by using an input with the evaluation of the funciton at the coordinates.
             num_modes (int): Number of modes to learn.
             hidden_dim (int): Hidden dimension of the MLP.
             num_layers (int): Number of hidden layers in the MLP.
@@ -1649,323 +1648,6 @@ class ParametricITBlock(nn.Module):
         return x_rec
 
 
-class _deprec_ITBlock(nn.Module):
-    """
-    ITBlock Module for Non-Linear or linear Integral Transform.
-
-    This module implements a non-linear integral transform that:
-        1. Generates learned basis functions K(u, v, x, y, f(x, y)) or K(u, v, x, y) based on input coordinates and values
-        2. Transforms the input to a 'spectral' representation via einsum operation
-        3. Multiply by learned weights in the transformed space
-        4. Applies inverse transform back to spatial domain using conjugate basis functions
-        5. Applies channel mixing, normalization, and activation
-        6. Adds shortcut connection with optional resampling
-
-        Parameters:
-        in_channels (int): Number of input channels.
-        out_channels (int): Number of output channels.
-        m1 (int): Number of modes to keep in the height dimension (u).
-        m2 (int): Number of modes to keep in the width dimension (v).
-        nonlinear (bool, optional): If True, conditions kernels on input values. Default is True.
-        mlp_hidden_dim (int, optional): Hidden dimension of the MLPs learning the bases. Default is 64.
-        mlp_num_layers (int, optional): Number of hidden layers in the MLPs learning the bases. Default is 2.
-        activation (callable, optional): Activation function to use. Default is nn.GELU.
-        norm (callable, optional): Normalization layer to use. Default is AdaptiveLayerNorm.
-        compute_ortho_loss (bool, optional): If True, compute orthogonality loss for basis functions. Default is True.
-        sampling (int, optional): Number of spatial points to sample for orthogonality loss. Default is 2048.
-        dim (int, optional): Spatial dimensionality (default is 2 for 2d problems).
-
-    Forward Args:
-        x (torch.Tensor): Input tensor of shape (B, C, H, W), where H and W may vary.
-
-    Forward Returns:
-        torch.Tensor: Output tensor of shape (B, out_channels, H, W) (real part)
-
-    """
-
-    def __init__(
-        self,
-        in_channels,
-        m1,
-        m2,
-        nonlinear=True,
-        mlp_hidden_dim=64,
-        mlp_num_layers=2,
-        activation=nn.GELU,
-        mlp_act=nn.GELU,
-        norm=AdaptiveLayerNorm,
-        dim=2,
-    ):
-
-        super().__init__()
-
-        self.in_channels = in_channels
-        self.m1 = m1  # Number of modes kept in height (u)
-        self.m2 = m2  # Number of modes kept in width (v)
-        self.nonlinear = nonlinear
-        self.dim = dim
-
-        in_ch = dim + in_channels if nonlinear else dim
-        self.basis_generator = ComplexMLPBlock(
-            out_ch=self.m1 * self.m2,
-            in_ch=in_ch,
-            hidden_dim=mlp_hidden_dim,
-            num_layers=mlp_num_layers,
-            activation=mlp_act,
-        )
-
-        # Learned parameters for multiplication in the transformed space (per channel).
-        # self.learned_weights = nn.Parameter(
-        #     torch.zeros(self.in_channels, out_channels, self.m1, self.m2, dtype=torch.cfloat)
-        # )
-        # channel wise multiplicaito
-        self.learned_weights_1 = nn.Parameter(torch.zeros(self.in_channels, self.m1, self.m2, dtype=torch.cfloat))
-        # mixing
-        self.learned_weights_2 = nn.Parameter(torch.zeros(self.in_channels, self.in_channels, dtype=torch.cfloat))
-
-        std = (1.0 / (in_channels + in_channels)) ** 0.5
-        with torch.no_grad():
-            self.learned_weights_1.real.normal_(0, std)
-            self.learned_weights_1.imag.normal_(0, std)
-            self.learned_weights_2.real.normal_(0, std)
-            self.learned_weights_2.imag.normal_(0, std)
-
-        self.alpha = nn.Parameter(torch.ones(1, 1, 1, in_channels))
-
-        self.mixer = nn.Linear(in_channels, in_channels)
-
-        # Activation & normalization
-        self.activation = activation()
-
-        if norm is not None:
-            self.norm = norm(in_channels)
-        else:
-            self.norm = None
-
-    def forward(self, x: Tensor, time: Union[None, Tensor] = None):
-        """
-        Performs the forward pass of the module for variable resolution input.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, C, H, W).
-                                H and W may vary.
-            cond: conditionning tensor (e.g. time) must be [B, 1]
-
-        Returns:
-            torch.Tensor: Output tensor of shape (B, C, H_out, W_out), real part.
-        """
-        B, C, H, W = x.shape
-
-        shortcut = x
-        H_basis, W_basis = H, W
-
-        h_coords = torch.linspace(-1, 1, H_basis, device=x.device)
-        w_coords = torch.linspace(-1, 1, W_basis, device=x.device)
-        grid_h, grid_w = torch.meshgrid(h_coords, w_coords, indexing="ij")
-
-        coords = torch.stack([grid_h, grid_w], dim=-1)  # [H, W, 2]
-        coords = coords.unsqueeze(0).expand(B, -1, -1, -1).contiguous()  # [B, H, W, 2] - VRAM: 0
-
-        if time is not None:
-            t = time.view(B, 1, 1, 1).expand(-1, H_basis, W_basis, -1)  # VRAM: 0
-            coords = torch.cat([coords, t], dim=-1)
-
-        x = x.permute(0, 2, 3, 1)
-
-        # 3. Generate kernels
-        if self.nonlinear:
-            x_in = torch.concat([coords, x], dim=-1)  # (B, H, W, 2 + Cin)
-        else:
-            x_in = coords
-
-        encoder_basis = self.basis_generator(x_in)  # -> (B*H*W, m1*m2)
-        encoder_basis = encoder_basis.view(B, H_basis, W_basis, self.m1, self.m2)
-
-        # Normalization of each basis vector
-        # encoder_basis = F.normalize(encoder_basis, p=2, dim=(1, 2))
-
-        # Convert input to complex numbers if it is real
-        xc = torch.complex(x, torch.zeros_like(x)) if not x.is_complex() else x
-
-        xhat = torch.einsum("bhwc,bhwmn->bcmn", xc, encoder_basis)  # "Spectral" representation
-
-        # Multiply by learned weigths in transformed space
-        # xhat = torch.einsum("bixy,oixy->boxy", xhat, self.learned_weights)
-        # element-wise multiplication followed by linear combination of the channels
-        xhat = torch.einsum("bimn, imn -> bimn", xhat, self.learned_weights_1)
-        xhat = torch.einsum("bimn,oi->bomn", xhat, self.learned_weights_2)
-
-        x_rec = torch.einsum("bcmn,bhwmn->bhwc", xhat, encoder_basis.conj())
-
-        # Normalization
-        x_rec = x_rec.real * self.alpha
-        # Mixing channels
-        output = self.mixer(x_rec)
-        if self.norm is not None:
-            if isinstance(self.norm, AdaptiveLayerNorm):
-                output = self.norm(output, time)
-            else:
-                output = self.norm(output)
-        output = self.activation(output)
-        output = output.permute(0, 3, 1, 2)
-        output = output + shortcut
-        output = self.activation(output)
-
-        return output
-
-
-class _deprec_RITBlock(nn.Module):
-    """
-    Real ITBlock Module for Non-Linear or linear Integral Transform.
-
-    This module implements a non-linear integral transform that:
-        1. Generates learned basis functions K(u, v, x, y, f(x, y)) or K(u, v, x, y) based on input coordinates and values
-        2. Transforms the input to a 'spectral' representation via einsum operation
-        3. Multiply by learned weights in the transformed space
-        4. Applies inverse transform back to spatial domain using conjugate basis functions
-        5. Applies channel mixing, normalization, and activation
-        6. Adds shortcut connection with optional resampling
-
-        Parameters:
-        in_channels (int): Number of input channels.
-        out_channels (int): Number of output channels.
-        m1 (int): Number of modes to keep in the height dimension (u).
-        m2 (int): Number of modes to keep in the width dimension (v).
-        nonlinear (bool, optional): If True, conditions kernels on input values. Default is True.
-        mlp_hidden_dim (int, optional): Hidden dimension of the MLPs learning the bases. Default is 64.
-        mlp_num_layers (int, optional): Number of hidden layers in the MLPs learning the bases. Default is 2.
-        activation (callable, optional): Activation function to use. Default is nn.GELU.
-        norm (callable, optional): Normalization layer to use. Default is AdaptiveLayerNorm.
-        resampling (str, optional): If "down" or "up", resample the output by a factor of 2. Default is None.
-        compute_ortho_loss (bool, optional): If True, compute orthogonality loss for basis functions. Default is True.
-        sampling (int, optional): Number of spatial points to sample for orthogonality loss. Default is 2048.
-        dim (int, optional): Spatial dimensionality (default is 2 for 2d problems).
-
-    Forward Args:
-        x (torch.Tensor): Input tensor of shape (B, C, H, W), where H and W may vary.
-
-    Forward Returns:
-        torch.Tensor: Output tensor of shape (B, out_channels, H, W) (real part)
-
-    """
-
-    def __init__(
-        self,
-        in_channels,
-        m1,
-        m2,
-        nonlinear=True,
-        mlp_hidden_dim=64,
-        mlp_num_layers=2,
-        activation=nn.GELU,
-        mlp_act=nn.GELU,
-        norm=AdaptiveLayerNorm,
-        dim=2,
-    ):
-
-        super().__init__()
-
-        self.in_channels = in_channels
-        self.m1 = m1  # Number of modes kept in height (u)
-        self.m2 = m2  # Number of modes kept in width (v)
-        self.nonlinear = nonlinear
-        self.dim = dim
-
-        in_ch = dim + in_channels if nonlinear else dim
-        self.basis_generator = MLPBlock(
-            out_ch=self.m1 * self.m2,
-            in_ch=in_ch,
-            hidden_dim=mlp_hidden_dim,
-            num_layers=mlp_num_layers,
-            activation=mlp_act,
-        )
-
-        # Learned parameters for multiplication in the transformed space (per channel).
-        # self.learned_weights = nn.Parameter(torch.zeros(self.in_channels, out_channels, self.m1, self.m2))
-        self.learned_weights_1 = nn.Parameter(torch.zeros(self.in_channels, self.m1, self.m2))
-        # mixing
-        self.learned_weights_2 = nn.Parameter(torch.zeros(self.in_channels, self.in_channels))
-
-        std = (1.0 / in_channels) ** 0.5
-        with torch.no_grad():
-            self.learned_weights_1.normal_(0, std)
-            self.learned_weights_2.normal_(0, std)
-
-        self.alpha = nn.Parameter(torch.ones(1, 1, 1, in_channels))
-
-        self.mixer = nn.Linear(in_channels, in_channels)
-
-        # Activation & normalization
-        self.activation = activation()
-        if norm is not None:
-            self.norm = norm(in_channels)
-        else:
-            self.norm = None
-
-    def forward(self, x: Tensor, time: Union[None, Tensor] = None):
-        """
-        Performs the forward pass of the module for variable resolution input.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, C, H, W).
-                                H and W may vary.
-
-        Returns:
-            torch.Tensor: Output tensor of shape (B, C, H_out, W_out), real part.
-        """
-        B, C, H, W = x.shape
-        H_basis, W_basis = H, W
-
-        shortcut = x
-
-        h_coords = torch.linspace(-1, 1, H_basis, device=x.device)
-        w_coords = torch.linspace(-1, 1, W_basis, device=x.device)
-        grid_h, grid_w = torch.meshgrid(h_coords, w_coords, indexing="ij")
-
-        coords = torch.stack([grid_h, grid_w], dim=-1)  # [H, W, 2]
-        coords = coords.unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, W, 2] - VRAM: 0
-
-        if time is not None:
-            t = time.view(B, 1, 1, 1).expand(-1, H_basis, W_basis, -1).contiguous()  # VRAM: 0
-            coords = torch.cat([coords, t], dim=-1)
-
-        x = x.permute(0, 2, 3, 1)
-
-        # 3. Generate kernels
-        if self.nonlinear:
-            x_in = torch.concat([coords, x], dim=-1)  # (B, H, W, dim + Cin)
-        else:
-            x_in = coords
-        encoder_basis = self.basis_generator(x_in)  # -> (B*H*W, m1*m2)
-        encoder_basis = encoder_basis.view(B, H_basis, W_basis, self.m1, self.m2)
-
-        # Normalization of each basis vector
-        # encoder_basis = F.normalize(encoder_basis, p=2, dim=(1, 2))
-
-        xhat = torch.einsum("bhwc,bhwmn->bcmn", x, encoder_basis)  # "Spectral" representation
-
-        # Multiply by learned weigths in transformed space
-        # xhat = torch.einsum("bixy,oixy->boxy", xhat, self.learned_weights)
-        xhat = torch.einsum("bimn, imn -> bimn", xhat, self.learned_weights_1)
-        xhat = torch.einsum("bimn,oi->bomn", xhat, self.learned_weights_2)
-
-        x_rec = torch.einsum("bcmn,bhwmn->bhwc", xhat, encoder_basis)
-        x_rec = x_rec * self.alpha
-
-        # Mixing channels
-        output = self.mixer(x_rec)
-        if self.norm is not None:
-            if isinstance(self.norm, AdaptiveLayerNorm):
-                output = self.norm(output, time)
-            else:
-                output = self.norm(output)
-        output = self.activation(output)
-        output = output.permute(0, 3, 1, 2)
-        output = output + shortcut
-        output = self.activation(output)
-
-        return output
-
 class LITBlock(nn.Module):
     """
     Learnable Intregral transform block for Non-Linear or linear Integral Transform.
@@ -2024,8 +1706,6 @@ class LITBlock(nn.Module):
 
         if sinus_pe_freq is not None:
             in_ch = in_ch + 4 * sinus_pe_freq
-        else:
-            in_ch = in_ch + 2
 
         self.generator = MLPBlock(
             out_ch=self.m1 * self.m2,
@@ -2125,8 +1805,60 @@ class LITBlock(nn.Module):
         return x_rec
 
 
+class GalerkinTransformerBlock(nn.Module):
+    def __init__(self, dim, heads=8, mlp_dim=2048, dropout=0.1, delta=0.01):
+        super().__init__()
+        self.attn = GalerkinAttention(dim, heads, delta)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+
+        # Feed-Forward Network (FFN) standard
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class LinearTransformerBlock(nn.Module):
+
+    def __init__(self, dim, n_heads=4, activation=nn.GELU, mlp_dim=512, dropout=0.0, rmsnorm=True, type="softmax"):
+        super().__init__()
+
+        if rmsnorm:
+            self.norm1 = nn.RMSNorm(dim)
+            self.norm2 = nn.RMSNorm(dim)
+        else:
+            self.norm1 = nn.LayerNorm(dim)
+            self.norm2 = nn.LayerNorm(dim)
+
+        if type == "softmax":
+            self.attn = SoftmaxKernelAttention(dim, n_heads)
+        elif type == "galerkin":
+            self.attn = GalerkinAttention(dim, n_heads)
+        else:
+            self.attn = LinearAttention(dim, n_heads)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim), activation(), nn.Dropout(dropout), nn.Linear(mlp_dim, dim), nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        # Pre-norm architecture
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, n_heads, activation=nn.GELU, mlp_dim=256, dropout=0.1):
+    def __init__(self, dim, n_heads, activation=nn.GELU, mlp_dim=256, dropout=0.1, rmsnorm=True):
         super().__init__()
 
         self.attention = Attention(dim, dim, n_heads)
@@ -2138,9 +1870,12 @@ class TransformerBlock(nn.Module):
             nn.Linear(mlp_dim, dim),
             nn.Dropout(dropout),
         )
-
-        self.norm1 = AdaptiveLayerNorm(dim, dim)
-        self.norm2 = nn.LayerNorm(dim)
+        if rmsnorm:
+            self.norm1 = AdaRMSNorm(dim, dim)
+            self.norm2 = nn.RMSNorm(dim)
+        else:
+            self.norm1 = AdaptiveLayerNorm(dim, dim)
+            self.norm2 = nn.LayerNorm(dim)
 
     def forward(self, x, cond=None):
         # x: [B, N, C]
@@ -2153,6 +1888,93 @@ class TransformerBlock(nn.Module):
         x = self.norm2(x)
         x = self.mlp(x)
         x = x + res
+
+        return x
+
+
+class LatentTemporalTransformer(nn.Module):
+    def __init__(self, dim, n_heads, num_layers=2, mlp_factor=2, max_history=5, rmsnorm=True):
+        super().__init__()
+        self.max_history = max_history
+        self.rope = RoPE(dim // n_heads)  # RoPE on head_dim
+        if rmsnorm:
+            self.norm = nn.RMSNorm(dim)
+        else:
+            self.norm = nn.LayerNorm(dim)
+        self.layers = nn.ModuleList([RoPETransformerBlock(dim, n_heads, dim * mlp_factor) for _ in range(num_layers)])
+
+    def forward(self, z_current, z_history=None, coords_t=None):
+        """
+        z_current: [B, M, C]
+        z_history: [B, T_past, M, C]
+        coords_t:  [B, T_total, 1] -> Real time values
+        """
+        B, M, C = z_current.shape
+
+        # 1. Sequence construction [B, T, M, C]
+        if z_history is not None:
+            z_full = torch.cat([z_history, z_current.unsqueeze(1)], dim=1)
+            z_full = z_full[:, -self.max_history :]
+        else:
+            z_full = z_current.unsqueeze(1)
+
+        T = z_full.shape[1]
+
+        # 2. Prepare Time for Flattened Sequence
+        # coords_t must be [B, T, 1]. We expand it to [B, T, M, 1]
+        if coords_t is None:
+            # Fallback to frame indices if no real time provided
+            full_time = torch.arange(T, device=z_current.device).view(1, T, 1).expand(B, T, 1)
+        else:
+            if coords_t.shape[1] < T:
+                last_t = coords_t[:, -1, :]
+                offsets = torch.arange(-(T - 1), 1, device=z_current.device).view(1, T, 1)
+                full_time = last_t.unsqueeze(1) + offsets
+            else:
+                full_time = coords_t[:, -T:, :]
+
+        # Expand time to match flattened modes: [B, T*M, 1]
+        full_time = full_time.unsqueeze(2).expand(-1, -1, M, -1)  # [B, T, M, 1]
+        full_time = full_time.contiguous().view(B, T * M, 1)
+
+        # full_time = coords_t[:, :T, :].unsqueeze(2).expand(B, T, M, 1).reshape(B, T * M, 1)
+        x_seq = z_full.contiguous().view(B, T * M, C)
+        x_seq = self.norm(x_seq)
+
+        # 3. Block Causal Mask [T*M, T*M]
+        # Diagonal=1 to block future frames
+        t_mask = torch.triu(torch.ones(T, T, device=x_seq.device), diagonal=1).bool()
+        mask = t_mask.repeat_interleave(M, dim=0).repeat_interleave(M, dim=1)
+
+        # 4. Iterative pass through custom blocks
+        for layer in self.layers:
+            x_seq = layer(x_seq, coords=full_time, mask=mask, rope=self.rope)
+
+        # 5. Extract last timestep [B, M, C]
+        z_refined = x_seq.view(B, T, M, C)[:, -1]
+
+        return z_refined, z_full
+
+
+class RoPETransformerBlock(nn.Module):
+    def __init__(self, dim, n_heads, mlp_dim, dropout=0.1, rmsnorm=True):
+        super().__init__()
+
+        if rmsnorm:
+            self.norm1 = AdaRMSNorm(dim, dim)
+            self.norm2 = nn.RMSNorm(dim)
+        else:
+            self.norm1 = AdaptiveLayerNorm(dim, dim)
+            self.norm2 = nn.LayerNorm(dim)
+
+        self.attn = Attention(dim, dim, n_heads)
+        self.mlp = nn.Sequential(nn.Linear(dim, mlp_dim), nn.GELU(), nn.Linear(mlp_dim, dim), nn.Dropout(dropout))
+
+    def forward(self, x, coords, mask=None, rope=None):
+        # x: [B, T*M, C], time: [B, T*M, 1]
+        x_norm = self.norm1(x)
+        x = x + self.attn(x_norm, x_norm, x_norm, mask=mask, rope=rope, coords=coords)
+        x = x + self.mlp(self.norm2(x))
 
         return x
 

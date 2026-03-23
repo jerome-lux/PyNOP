@@ -37,6 +37,33 @@ class ModReLU(nn.Module):
         scale = F.relu(mag + self.bias) / (mag + self.eps)
         return z * scale
 
+class TaylorSoftmax(nn.Module):
+    def __init__(self, dim=-1, order=2):
+        super().__init__()
+        self.dim = dim
+        self.order = order
+
+    def forward(self, x):
+        # x: [Batch, N, D]
+        # Taylor approximation of exp(x) = 1 + x + x^2/2! + ...
+
+        # 1. Ensure x is centered or positive if needed,
+        # but Taylor Softmax is often used directly on logits.
+        # We add 1 for the first term (1 + x + x^2/2)
+
+        if self.order == 2:
+            poly = 1.0 + x + (x**2) / 2.0
+        elif self.order == 3:
+            poly = 1.0 + x + (x**2) / 2.0 + (x**3) / 6.0
+        else:
+            raise NotImplementedError("Order not implemented")
+
+        # 2. Prevent negative values due to poly approximation
+        # Even with order 2, it's safer to use ReLU or clamp
+        poly = torch.clamp(poly, min=1e-6)
+
+        # 3. Normalize
+        return poly / poly.sum(dim=self.dim, keepdim=True)
 
 class Sine(nn.Module):
     """Sinusoidal activation with scaling"""

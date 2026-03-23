@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pynop.core.ops import CartesianEmbedding
+from pynop.core.encoding import CartesianEmbedding
 from typing import Callable, Union
 
 
@@ -32,7 +32,7 @@ class DeepONet(nn.Module):
         Notes:
         The dimension of the input of the trunk net is the dimensionality N of the coordinates: [Bt, N]./ Bt is the number of query points.
         The input shape of the branch net depends on the chosen model:
-        - MLP case: A tensor of shape [Bb, Neval, C] where Bb is the number of evaluated functions and Neval is the number of evaluations of the function(s).
+        - MLP or Attention case: A tensor of shape [Bb, Neval, C] where Bb is the number of evaluated functions and Neval is the number of evaluations of the function(s).
         C can be > 1 if the function is a vector function.
         - CNN or FNO: a structured 2D or 3D grid [Bb, C, H, W] for example).
         Note that the batch dimension of the two networks may not be the same: we evaluate Bb functions at Bt coordinates.

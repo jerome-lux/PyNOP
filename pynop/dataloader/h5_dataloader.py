@@ -51,6 +51,8 @@ class PDEBenchDataSet(Dataset):
         n_samples=None,
         min_id=0,
         max_id=None,
+        shift=0.0,
+        scale=1.0,
         seed=42,
     ):
 
@@ -65,6 +67,9 @@ class PDEBenchDataSet(Dataset):
         self.h5file = None
         self.data_dict = {}
         self.windows = []
+        self.max_t_idx = 0
+        self.shift = shift
+        self.scale = scale
 
         with h5py.File(h5_path, "r") as f:
             all_sample_ids = sorted(list(f.keys()))
@@ -88,6 +93,7 @@ class PDEBenchDataSet(Dataset):
 
             for sid in tqdm(self.sample_ids, desc=f"Scanning {split_type or 'all'}"):
                 T_total = f[sid]["data"].shape[0]
+                self.max_t_idx = max(self.max_t_idx, T_total)
 
                 current_max_id = max_id if max_id is not None else T_total
                 current_max_id = min(current_max_id, T_total)
@@ -132,7 +138,108 @@ class PDEBenchDataSet(Dataset):
             # (T, X, Y, C) -> (T, C, X, Y)
             fields = torch.from_numpy(np.moveaxis(fields, -1, 1)).float()
 
-        return fields, torch.Tensor([t0])
+        return (fields + self.shift) * self.scale, torch.Tensor([t0])
+
+
+def inspect_PDEBenchDataset(h5_path, DT=1.0):
+    """
+    Scans a PDEBench HDF5 file to extract physical, structural,
+    and temporal derivative (velocity) statistics.
+    """
+    stats = {
+        "n_simulations": 0,
+        "spatial_shape": None,
+        "temporal_steps": None,
+        "n_channels": None,
+        "global_min": None,
+        "global_max": None,
+        "mean_per_channel": None,
+        "std_per_channel": None,
+        "mean_deriv": None,
+        "std_deriv": None,
+    }
+
+    with h5py.File(h5_path, "r") as f:
+        sample_ids = list(f.keys())
+        stats["n_simulations"] = len(sample_ids)
+
+        if stats["n_simulations"] == 0:
+            return "Error: Empty HDF5 file."
+
+        # Get structural info [T, X, Y, (Z), C]
+        first_data = f[sample_ids[0]]["data"]
+        shape = first_data.shape
+        stats["temporal_steps"] = shape[0]
+        stats["spatial_shape"] = shape[1:-1]
+        stats["n_channels"] = shape[-1]
+
+        n_channels = stats["n_channels"]
+
+        # Accumulators for global stats
+        sum_val = np.zeros(n_channels)
+        sum_sq = np.zeros(n_channels)
+        total_elements = 0
+
+        # Accumulators for derivative stats (v = du/dt)
+        sum_v = np.zeros(n_channels)
+        sum_v_sq = np.zeros(n_channels)
+        total_v_elements = 0
+
+        all_mins = []
+        all_maxs = []
+
+        for sid in tqdm(sample_ids, desc="Inspecting dataset & derivatives"):
+            data = f[sid]["data"][:]  # Shape: [T, X, Y, C]
+
+            # --- Global Value Stats ---
+            reduce_axes = tuple(range(data.ndim - 1))  # Reduce T, X, Y
+            all_mins.append(np.min(data, axis=reduce_axes))
+            all_maxs.append(np.max(data, axis=reduce_axes))
+
+            sum_val += np.sum(data, axis=reduce_axes)
+            sum_sq += np.sum(np.square(data), axis=reduce_axes)
+            total_elements += np.prod(data.shape[:-1])
+
+            # --- Derivative Stats (du/dt) ---
+            # diff shape: [T-1, X, Y, C]
+            diff = (data[1:] - data[:-1]) / DT
+            reduce_axes_v = tuple(range(diff.ndim - 1))
+
+            sum_v += np.sum(diff, axis=reduce_axes_v)
+            sum_v_sq += np.sum(np.square(diff), axis=reduce_axes_v)
+            total_v_elements += np.prod(diff.shape[:-1])
+
+        # Finalize Value Stats
+        stats["global_min"] = np.min(all_mins, axis=0)
+        stats["global_max"] = np.max(all_maxs, axis=0)
+        stats["mean_per_channel"] = sum_val / total_elements
+        var = (sum_sq / total_elements) - np.square(stats["mean_per_channel"])
+        stats["std_per_channel"] = np.sqrt(np.maximum(var, 0))
+
+        # Finalize Derivative Stats
+        stats["mean_deriv"] = sum_v / total_v_elements
+        var_v = (sum_v_sq / total_v_elements) - np.square(stats["mean_deriv"])
+        stats["std_deriv"] = np.sqrt(np.maximum(var_v, 0))
+
+    # Print report
+    print("\n" + "=" * 50)
+    print("              PDEBENCH INSPECTION REPORT")
+    print("=" * 50)
+    print(f"Simulations : {stats['n_simulations']}")
+    print(f"Time steps  : {stats['temporal_steps']}")
+    print(f"Resolution  : {stats['spatial_shape']}")
+    print(f"Channels    : {stats['n_channels']}")
+    print("-" * 50)
+
+    for c in range(stats["n_channels"]):
+        print(f"CHANNEL {c}:")
+        print(f"  [Values] Min: {stats['global_min'][c]:.4f} | Max: {stats['global_max'][c]:.4f}")
+        print(f"  [Values] Mean: {stats['mean_per_channel'][c]:.4f} | Std: {stats['std_per_channel'][c]:.4f}")
+        print(f"  [Deriv ] Mean: {stats['mean_deriv'][c]:.6f} | Std: {stats['std_deriv'][c]:.6f}")
+        print("-" * 50)
+    print("=" * 50)
+
+    return stats
 
 
 class TheWellDataSet(Dataset):

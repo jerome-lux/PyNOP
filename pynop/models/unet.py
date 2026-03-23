@@ -29,9 +29,7 @@ class unet(nn.Module):
     ):
         """
         UNET architecture.
-        The UNET architecture is a convolutional neural network that consists of an encoder and a decoder.
-        The encoder is a series of convolutional layers that downsample the input image,
-        while the decoder is a series of convolutional layers that upsample the feature maps.
+
         The encoder and decoder are connected by skip connections, which concatenate the feature maps
         from the encoder to the decoder.
         Args:

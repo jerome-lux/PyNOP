@@ -4,7 +4,7 @@ import collections.abc as abc
 import torch
 import torch.nn as nn
 from pynop.core.blocks import FNOBlock, FNOBlockv2, UFNOBlock, ConvFNOBlock
-from pynop.core.ops import CartesianEmbedding
+from pynop.core.encoding import CartesianEmbedding
 from pynop.core.ops import ConvLayer
 from pynop.core.norm import LayerNorm2d
 from pynop.core.utils import make_tuple
@@ -61,6 +61,8 @@ class FNO(nn.Module):
         block_kwargs: dict = {},
     ):
         super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.fixed_pos_encoding = fixed_pos_encoding
         self.trainable_pos_encoding = trainable_pos_encoding
 
@@ -116,7 +118,12 @@ class FNO(nn.Module):
     def forward(self, x, residual=False, return_coords=False, **kwargs):
 
         if residual:
-            shortcut = x
+            if self.in_channels > self.out_channels:
+                shortcut = x[:, -self.out_channels :, ...]
+            elif self.in_channels == self.out_channels:
+                shortcut = x
+            else:
+                residual = False
 
         if return_coords and not self.fixed_pos_encoding:
             raise ValueError(

@@ -531,196 +531,189 @@ class SpectralConv2d(nn.Module):
         return y
 
 
-class CartesianEmbedding(nn.Module):
-    """
-    Generates and concatenates normalized Cartesian coordinates (x, y) as additional channels.
-    Coordinates are normalized to the range [-1, 1] using torch.meshgrid.
-    """
 
-    def __init__(self, minval=-1, maxval=1):
+class GalerkinAttention(nn.Module):
+    def __init__(self, dim, heads=8, delta=1e-2):
         super().__init__()
-        # No learnable parameters needed for this embedding layer
-        self.minval = minval
-        self.maxval = maxval
+        self.heads = heads
+        self.head_dim = dim // heads
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Q vient des tokens latents (M), K et V viennent de la grille (N)
+        self.to_q = nn.Linear(dim, dim, bias=False)
+        self.to_k = nn.Linear(dim, dim, bias=False)
+        self.to_v = nn.Linear(dim, dim, bias=False)
+
+        self.k_norm = nn.LayerNorm(self.head_dim)
+        self.v_norm = nn.LayerNorm(self.head_dim)
+
+        self.apply(lambda m: self.init_weights(m, delta))
+
+    def init_weights(self, module, delta=0.01):
         """
-        Generates normalized (x, y) coordinates using meshgrid and concatenates them to the input.
-
-        Args:
-            x (torch.Tensor): Input tensor with shape (B, C, H, W).
-
-        Returns:
-            torch.Tensor: Input tensor concatenated with normalized x and y coordinates.
-                          Shape (B, C + 2, H, W).
+        Diagonally dominant rescaled initialization: W = W_xavier + delta * I
+        As described in Section 5.1 of the paper.
         """
-        batch_size, _, height, width = x.shape
-        device = x.device
+        if isinstance(module, nn.Linear):
+            # Xavier uniform initialization
+            nn.init.xavier_uniform_(module.weight)
+            # Weight scaling/Identity trick
+            with torch.no_grad():
+                d_out, d_in = module.weight.size()
+                identity = torch.eye(d_out, d_in).to(module.weight.device)
+                module.weight.add_(identity, alpha=delta)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
 
-        # Generate 1D coordinate vectors normalized to [-1, 1]
-        x_lin = torch.linspace(self.minval, self.maxval, steps=width, device=device)  # Shape (W,)
-        y_lin = torch.linspace(self.minval, self.maxval, steps=height, device=device)  # Shape (H,)
+    def forward(self, x, context=None):
+        """
+        x: [batch, M, dim] (Tokens latents / Queries)
+        context: [batch, N, dim] (Points de la grille / Contecontextt)
+        """
+        if context is None:  # Self-attention
+            context = x
+        b, m, d = x.shape
+        n = context.size(1)  # Nombre de points grille
+        h = self.heads
 
-        # Use meshgrid to create 2D grids of coordinates
-        # grid_y will have shape (H, W), grid_x will have shape (H, W)
-        # Use indexing='ij' to match the (H, W) spatial dimensions ordering
-        grid_y, grid_x = torch.meshgrid(y_lin, x_lin, indexing="ij")
+        # Q: [b, h, M, d_h]
+        q = self.to_q(x).view(b, m, h, self.head_dim).transpose(1, 2)
+        # K, V: [b, h, N, d_h]
+        k = self.to_k(context).view(b, n, h, self.head_dim).transpose(1, 2)
+        v = self.to_v(context).view(b, n, h, self.head_dim).transpose(1, 2)
 
-        coords = torch.stack([grid_x, grid_y], dim=-1)  # Shape (H, W, 2)
+        k = self.k_norm(k)
+        v = self.v_norm(v)
 
-        # Permute dimensions to get shape (2, H, W) and add batch dimension (1, 2, H, W)
-        # Permute moves the coordinate dimension (originally last) to the first position
-        # unsqueeze(0) adds the batch dimension at the start
-        coords = coords.permute(2, 0, 1).unsqueeze(0)  # Shape (1, 2, H, W)
+        # Calcul de l'opérateur sur la grille N
+        # (K^T * V) / n  -> Taille [d_h, d_h]
+        context = torch.matmul(k.transpose(-1, -2), v) / n
 
-        # Expand for the batch size to match the input tensor batch size
-        coords = coords.expand(batch_size, -1, -1, -1)  # Shape (B, 2, H, W)
+        # Projection sur les queries M
+        # Q * Context -> Taille [b, h, M, d_h]
+        out = torch.matmul(q, context)
 
-        # Concatenate with the input tensor along the channel dimension
-        # Output shape (B, C_in + 2, H, W)
-        output = torch.cat([x, coords], dim=1)
-
-        return output
+        return out.transpose(1, 2).reshape(b, m, d)
 
 
-def timestep_embedding(timesteps, dim, max_period=10000):
+class SoftmaxKernelAttention(nn.Module):
     """
-    Create sinusoidal timestep embeddings.
-    :param timesteps: a 1-D Tensor of N indices, one per batch element.
-                      These may be fractional.
-    :param dim: the dimension of the output.
-    :param max_period: controls the minimum frequency of the embeddings.
-    :return: an [N x dim] Tensor of positional embeddings.
+    Linear attention via independent softmax on Q and K.
+    Approximates full softmax attention in O(N·D) instead of O(N²).
+
+    Ref: Tsai et al. 2019 "Transformer Dissection"
+         Katharopoulos et al. 2020 "Transformers are RNNs"
     """
 
-    half = dim // 2
-    freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
-        device=timesteps.device
-    )
-    args = timesteps[:, None].float() * freqs[None]
-    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    if dim % 2:
-        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :, :1])], dim=-1)
-    return embedding
-
-
-class TimestepEmbedding(nn.Module):
-    def __init__(self, dim, max_period=10000):
-
+    def __init__(self, dim, num_heads=8):
         super().__init__()
-        self.dim = dim
-        self.max_period = max_period
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
 
-        half = dim // 2
-        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half)
-        self.register_buffer("freqs", freqs)
+    def forward(self, x, context=None):
+        if context is None:
+            context = x
+        B, Sq, C = x.shape
+        Sk = context.shape[1]
 
-    def forward(self, timesteps):
-        """
-        :param timesteps: Tensor 1-D de taille [N]
-        :return: Tensor de taille [N, dim]
-        """
-        # timesteps[:, None] transforme [N] en [N, 1]
-        args = timesteps[:, None].float() * self.freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        q = self.q_proj(x).view(B, Sq, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(context).view(B, Sk, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(context).view(B, Sk, self.num_heads, self.head_dim).transpose(1, 2)
 
-        if self.dim % 2:
-            zero_pad = torch.zeros(timesteps.shape[0], 1, device=timesteps.device)
-            embedding = torch.cat([embedding, zero_pad], dim=-1)
+        # Softmax indépendant sur la dimension features (dim=-1)
+        # → chaque token a une distribution sur les head_dim features
+        # C'est la décomposition : exp(q·k^T) ≈ softmax(q) · softmax(k)^T * head_dim
+        q = torch.softmax(q, dim=-1)  # [B, H, Sq, D]
+        k = torch.softmax(k, dim=-1)  # [B, H, Sk, D]
 
-        return embedding
+        # Agrégation linéaire O(N·D²)
+        kv = torch.matmul(k.transpose(-2, -1), v)  # [B, H, D, D]
+        num = torch.matmul(q, kv)  # [B, H, Sq, D]
 
+        # Normalisation
+        k_sum = k.sum(dim=2)  # [B, H, D]
+        den = (q * k_sum.unsqueeze(2)).sum(dim=-1, keepdim=True)  # [B, H, Sq, 1]
 
-def sinusoidal_encoding_2d(coords, num_freqs=6):
-    """
-    Args:
-        coords: Tenseur [B, N, 2] - Coordonnées normalisées en [-1, 1]
-        num_freq: number of frequencies (max = Niquist frequency)
-
-    Returns:
-        enc_coords: Tenseur [B, N, 2 * num_frequencies * 2]
-    """
-    H, W, C = coords.shape
-    device = coords.device
-
-    # max_res = max(H, W)
-    # num_freqs = min(int(np.ceil(np.log2(max_res * 0.5))), num_freqs)
-
-    freq_bands = torch.pow(2.0, torch.arange(num_freqs, device=device).float())
-    freq_bands = freq_bands * math.pi
-
-    #  [N, 2, 1] * [F] -> [N, 2, F]
-    angles = coords.reshape(-1, 2).contiguous().unsqueeze(-1) * freq_bands
-
-    # 4. Calcul Sin et Cos
-    sin_feat = torch.sin(angles)
-    cos_feat = torch.cos(angles)
-
-    # [B, N, 2 * num_freqs * 2]
-    enc_coords = torch.cat([sin_feat, cos_feat], dim=-1)
-    return enc_coords.view(H * W, -1)
+        out = num / (den + 1e-6)
+        out = out.transpose(1, 2).reshape(B, Sq, C)
+        return self.out_proj(out)
 
 
-def sin_positional_encoding_2d(d_model, H, W, basis=10000.0, device="cpu"):
-    if d_model % 4 != 0:
-        raise ValueError("d_model doit être divisible par 4")
-    d_half = d_model // 2
+class LinearAttention(nn.Module):
+    def __init__(self, dim, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
 
-    y_coords = torch.arange(H, device=device).float().unsqueeze(1)
-    x_coords = torch.arange(W, device=device).float().unsqueeze(1)
-    div_term = torch.exp(torch.arange(0, d_half, 2, device=device).float() * -(math.log(basis) / d_half))
+        # Projections for Q, K, V
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
 
-    pe_y = torch.zeros(d_half, H, W, device=device)
-    pe_y[0::2, :, :] = torch.sin(y_coords * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
-    pe_y[1::2, :, :] = torch.cos(y_coords * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
+    def forward(self, x, context):
+        # x: [batch, seq_q, dim], context: [batch, seq_k, dim]
+        B, N, C = x.shape
 
-    pe_x = torch.zeros(d_half, H, W, device=device)
-    pe_x[0::2, :, :] = torch.sin(x_coords * div_term).transpose(0, 1).unsqueeze(1).repeat(1, H, 1)
-    pe_x[1::2, :, :] = torch.cos(x_coords * div_term).transpose(0, 1).unsqueeze(1).repeat(1, H, 1)
+        if torch.isnan(x).any():
+            print("NaN detected in x!")
 
-    pe = torch.cat([pe_y, pe_x], dim=0)  # [d_model, H, W]
-    pe = pe.view(d_model, -1).transpose(0, 1)  # [H*W, d_model]
-    return pe.unsqueeze(0)  # [1, H*W, d_model]
+        q = self.q_proj(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(context).view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(context).view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+
+        q = F.elu(q / (q.norm(dim=-1, keepdim=True) + 1e-6)) + 1.0  # [B, H, Sq, D]
+        k = F.elu(k / (k.norm(dim=-1, keepdim=True) + 1e-6)) + 1.0
+
+        # Apply activation for linear attention (e.g., ELU + 1)
+        kv = torch.matmul(k.transpose(-2, -1), v)  # [B, H, D, D]
+        num = torch.matmul(q, kv)  # [B, H, Sq, D]
+
+        # Normalisation : Z = q · (Σ_i k_i)
+        k_sum = k.sum(dim=2)  # [B, H, D]
+        den = (q * k_sum.unsqueeze(2)).sum(dim=-1, keepdim=True)  # [B, H, Sq, 1]
+        out = num / (den + 1e-6)
+
+        out = out.transpose(1, 2).reshape(B, N, C)
+        return self.out_proj(out)
 
 
 class Attention(nn.Module):
-    """Attention Module (can be self or cross attention) depedning on inputs Q, K, V of the forward method"""
-
     def __init__(self, in_ch, out_ch, num_heads):
-        super(Attention, self).__init__()
+        super().__init__()
         assert out_ch % num_heads == 0
-        self.d_model = out_ch
         self.num_heads = num_heads
         self.head_dim = out_ch // num_heads
 
-        self.wq = nn.Linear(in_ch, out_ch, bias=True)
-        self.wk = nn.Linear(in_ch, out_ch, bias=True)
-        self.wv = nn.Linear(in_ch, out_ch, bias=True)
+        self.wq = nn.Linear(in_ch, out_ch)
+        self.wk = nn.Linear(in_ch, out_ch)
+        self.wv = nn.Linear(in_ch, out_ch)
+        self.out_proj = nn.Linear(out_ch, out_ch)
 
     def split_heads(self, x):
-        batch_size, seq_len, d_model = x.shape
-        x = x.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        return x.transpose(1, 2)
+        B, N, C = x.shape
+        return x.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
-    def combine_heads(self, x):
-        x = x.transpose(1, 2).contiguous()
-        batch_size, seq_len, num_heads, head_dim = x.shape
-        return x.reshape(batch_size, seq_len, num_heads * head_dim)
+    def forward(self, Q, K, V, mask=None, rope=None, coords=None):
+        q = self.split_heads(self.wq(Q))  # [B, n_h, L, head_dim]
+        k = self.split_heads(self.wk(K))
+        v = self.split_heads(self.wv(V))
 
-    def forward(self, Q, V, K):
-        Q = self.split_heads(self.wq(Q))
-        K = self.split_heads(self.wk(K))
-        V = self.split_heads(self.wv(V))
+        if rope is not None and coords is not None:
+            q = rope(q, coords)  # [B, n_h, L, head_dim]
+            k = rope(k, coords)
 
-        attention_scores = torch.matmul(Q, K.transpose(-2, -1))
-        attention_scores = attention_scores / (self.head_dim**0.5)
+        attn = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
 
-        attention_weights = F.softmax(attention_scores, dim=-1)
+        if mask is not None:
+            attn = attn.masked_fill(mask, -1e9)
 
-        weighted_output = torch.matmul(attention_weights, V)
-        output = self.combine_heads(weighted_output)
-
-        return output
+        attn = F.softmax(attn, dim=-1)
+        out = (attn @ v).transpose(1, 2).contiguous().view(Q.shape[0], Q.shape[1], -1)
+        return self.out_proj(out)
 
 
 class ComplexAttention(nn.Module):

@@ -149,9 +149,9 @@ def diffusion_loss(c_pred, ct, dt, diffusivity, x_coords, y_coords, time_derivat
     return torch.mean(residual**2)
 
 
-class DepthwiseMSELoss(nn.Module):
+class DWMSELoss(nn.Module):
     """
-    Compute the normalized MSE Loss per channel
+    Compute the MSE Loss per channel
     """
 
     def __init__(self):
@@ -167,30 +167,59 @@ class DepthwiseMSELoss(nn.Module):
         return torch.mean(mse_per_channel)
 
 
-class nMSELoss(nn.Module):
+class NormalizedTimeDerivativeMSE(nn.Module):
     """
-    Compute the normalized MSE Loss per channel
+    Compute the MSE Loss per channel and normalize by the average squared difference between input and target
     """
 
     def __init__(self, eps=1e-8):
         super().__init__()
         self.eps = eps
 
-    def forward(self, pred, target):
+    def forward(self, pred, target, input, dt):
+        # input MUSt be B, C, H, W, ...
+        # pred is the time derivative prediction
 
         spatial_dims = tuple(range(2, pred.ndim))
+        gt_derivative = (target - input) / dt
 
         # per channel - MSE
-        mse_per_channel = torch.mean((pred - target) ** 2, dim=spatial_dims)
-        norm = torch.mean(target**2, dim=spatial_dims)
+        mse_per_channel = torch.mean((pred - gt_derivative) ** 2, dim=spatial_dims)
+        norm = torch.mean(gt_derivative**2, dim=spatial_dims)
         rel_mse = mse_per_channel / (norm + self.eps)
 
         return torch.mean(rel_mse)
 
 
-class nL2Loss(torch.nn.Module):
+class nDWMSELoss(nn.Module):
     """
-    Compute the normalized L2 Loss per channel
+    Compute the normalized MSE Loss per channel
+    """
+
+    def __init__(self, shift=0.0, scale=1.0, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+        self.shift = shift
+        self.scale = scale
+
+    def forward(self, pred, target):
+
+        # pred = torch.sign(pred) * torch.log(1 + torch.abs(pred) / self.eps)
+        # target = torch.sign(target) * torch.log(1 + torch.abs(target) / self.eps)
+
+        spatial_dims = tuple(range(2, pred.ndim))
+
+        # per channel - MSE
+        mse_per_channel = torch.mean((pred - target) ** 2, dim=spatial_dims)
+        norm = torch.mean(((target + self.shift) * self.scale) ** 2, dim=spatial_dims)
+        rel_mse = mse_per_channel / (norm + self.eps)
+
+        return torch.mean(rel_mse)
+
+
+class WeightedMSE(nn.Module):
+    """
+    Penalize errors more heavily on channels with lower L2 norms.
     """
 
     def __init__(self, eps=1e-8):
@@ -198,57 +227,146 @@ class nL2Loss(torch.nn.Module):
         self.eps = eps
 
     def forward(self, pred, target):
+        # Identify spatial dimensions (B, C, H, W -> dims 2, 3)
+        spatial_dims = tuple(range(2, pred.ndim))
 
-        pred_flat = pred.reshape(pred.shape[0], pred.shape[1], -1)
-        target_flat = target.reshape(target.shape[0], target.shape[1], -1)
+        # MSE per channel: (B, C)
+        mse_per_channel = torch.mean((pred - target) ** 2, dim=spatial_dims)
 
-        diff_norms = torch.norm(pred_flat - target_flat, p=2, dim=2)  # [B, C]
-        norm = torch.norm(target_flat, p=2, dim=2)  # [B, C]
+        # L2 Norm per channel: (B, C)
+        channel_norm = torch.sqrt(torch.mean(target**2, dim=spatial_dims) + self.eps)
 
-        # Per channel relative error
-        rel_errors = diff_norms / (norm + self.eps)  # [B, C]
+        # Scale based on the maximum energy in the batch/channels
+        # Channels with max energy get weight 1.0
+        # Channels with lower energy get weight > 1.0
+        max_norm, _ = torch.max(channel_norm, dim=1, keepdim=True)
+        weights = max_norm / (channel_norm + self.eps)
 
-        loss_per_sample = torch.mean(rel_errors, dim=1)  # [B]
-        return torch.mean(loss_per_sample)
+        # Apply weights to focus on low-energy channels
+        weighted_mse = mse_per_channel * weights
+
+        return torch.mean(weighted_mse)
 
 
-def ortho_loss(basis, n_samples=2048, normalize=True, mode="MSE"):
-    """
-    compute
-    - A loss based on the QR decomposition if mode=="QR"
-    - a sampled loss to force orthogonality of the kernels
-    if mode ="fro" compute the Frobenius norm gram - identity (seems to be numerically bad)
-    basis: (B, H, W, m1, m2) - note that basis should be already normalized
-    n_samples: number of samples
-    """
-    B, H, W, m1, m2 = basis.shape
-    M = m1 * m2
-    basis_flat = basis.contiguous().view(B, H * W, M)
-    n_samples = max(min(n_samples, H * W), 1)
+class MaskedSpectralLoss(nn.Module):
+    def __init__(self, k_min=0.0, k_max=0.1, norm="ortho"):
+        """
+        Spectral loss focused on a radial frequency band.
+        - k_min=0.0, k_max=0.1: Low frequencies
+        - k_min=0.3, k_max=0.7: High frequencies
+        """
+        super().__init__()
+        self.k_min = k_min
+        self.k_max = k_max
+        self.norm = norm
+        self.register_buffer("_k_mag", None)
 
-    # Spatial sampling
-    indices = torch.randint(0, H * W, (n_samples,), device=basis.device)
-    sampled_basis = basis_flat[:, indices, :]  # (B, n_samples, M)
+    def _get_k_mag(self, h, w, device):
+        # Cache the radial grid to avoid recomputing every step
+        fy = torch.fft.fftfreq(h, device=device).abs().reshape(-1, 1)
+        fx = torch.fft.rfftfreq(w, device=device).reshape(1, -1)
+        return torch.sqrt(fx**2 + fy**2)
 
-    # Gram matrix over space
-    # (B, M, n_samples) @ (B, n_samples, M) -> (B, M, M)
-    if basis.is_complex():
-        gram = torch.matmul(sampled_basis.transpose(-2, -1).conj(), sampled_basis)
-    else:
-        gram = torch.matmul(sampled_basis.transpose(-2, -1), sampled_basis)
+    def forward(self, pred, target):
+        p_fft = torch.fft.rfftn(pred, dim=(-2, -1), norm=self.norm)
+        t_fft = torch.fft.rfftn(target, dim=(-2, -1), norm=self.norm)
 
-    if normalize:
-        gram = gram * ((H * W) / n_samples)
-    else:
-        gram = gram / n_samples
+        h, w = pred.shape[-2:]
+        if self._k_mag is None or self._k_mag.shape != p_fft.shape[-2:]:
+            self._k_mag = self._get_k_mag(h, w, pred.device)
 
-    identity = torch.eye(M, device=basis.device).unsqueeze(0).to(basis.dtype)
-    if mode == "fro":
-        ortho_loss = torch.linalg.matrix_norm(gram - identity, ord="fro") / M
-        ortho_loss = ortho_loss.mean()
-    else:
-        ortho_loss = torch.mean(torch.abs(gram - identity) ** 2)
+        # Create the radial mask
+        mask = (self._k_mag >= self.k_min) & (self._k_mag <= self.k_max)
 
-    off_diag = gram - torch.diag_embed(torch.diagonal(gram, dim1=-2, dim2=-1))
+        # Apply mask and compute MSE on complex coefficients
+        diff = torch.abs(p_fft - t_fft)  # / (torch.abs(t_fft) + 1e-6)
+        masked_diff = (diff**2) * mask.float()
 
-    return off_diag.abs().mean()
+        # We divide by the number of active points in the mask
+        # to have a consistent mean regardless of mask size.
+        loss = masked_diff.sum() / (mask.sum() + 1e-8)
+
+        return loss
+
+
+class SpectralLoss(nn.Module):
+    def __init__(self, beta=1.0, alpha=2.0):
+        super().__init__()
+        self.beta = beta  # if beta > 1, it penalizes high frequencies
+        self.alpha = alpha  # 1-> MAE, 2-> MSE
+
+    def forward(self, pred, target):
+        # input shape: B, C, H, W
+
+        # Fast Fourier Transform (Real 2D)
+        # Shape: [batch, channel, height, width_freq]
+        pred_fft = torch.fft.rfftn(pred, dim=(-2, -1), norm="ortho")
+        target_fft = torch.fft.rfftn(target, dim=(-2, -1), norm="ortho")
+
+        # Compute frequency coordinates
+        h, w = pred.shape[-2], pred.shape[-1]
+        freq_y = torch.fft.fftfreq(h, device=pred.device).abs().reshape(-1, 1)
+        freq_x = torch.fft.rfftfreq(w, device=pred.device).reshape(1, -1)
+
+        # Magnitude of frequency vector (distance from origin)
+        k_mag = torch.sqrt(freq_x**2 + freq_y**2)
+        weight = 1.0 + (k_mag * 2) ** self.beta
+
+        # Weighted error in frequency domain
+        diff_fft = torch.abs(pred_fft - target_fft)  # / (torch.abs(target_fft) + self.eps)
+
+        spec_loss = torch.mean(weight * (diff_fft**self.alpha))
+
+        return spec_loss
+
+
+class StructureLoss(nn.Module):
+    def __init__(self, k=3, loss_type="mse", alpha=1.0, eps=1e-8):
+        super().__init__()
+        self.k = k
+        self.eps = eps
+        self.alpha = alpha
+        self.avg_pool = nn.AvgPool2d(kernel_size=k, stride=k)
+        self.loss_fn = F.mse_loss if loss_type == "mse" else F.l1_loss
+
+    def forward(self, pred, target):
+
+        error = self.loss_fn(pred, target, reduction="none")
+
+        patch_error = self.avg_pool(error)
+        mean_target = self.avg_pool(target)
+        mean_sq_target = self.avg_pool(target**2)
+        patch_std = torch.sqrt(F.relu(mean_sq_target - mean_target**2) + self.eps)
+
+        loss = patch_error * (patch_std + self.alpha)
+        return loss.mean()
+
+
+class SobolevLoss(nn.Module):
+
+    def __init__(self, l1=0.1, l2=0.1):
+        super().__init__()
+        self.l1 = l1  # weight for the gradient loss
+        self.l2 = l2  # weight for the laplacian loss
+
+    def forward(self, pred, target):
+
+        # Gradient computation (finite differences)
+        # pred shape: [batch, channels, height, width]
+        grad_pred_x = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+        grad_pred_y = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+
+        grad_target_x = target[:, :, 1:, :] - target[:, :, :-1, :]
+        grad_target_y = target[:, :, :, 1:] - target[:, :, :, :-1]
+
+        # Gradient penalty
+        grad_loss = F.l1_loss(grad_pred_x, grad_target_x) + F.l1_loss(grad_pred_y, grad_target_y)
+
+        # laplacian computation
+        lap_kernel = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=pred.dtype, device=pred.device)
+        lap_kernel = lap_kernel.view(1, 1, 3, 3).repeat(pred.shape[1], 1, 1, 1)
+        pred_lap = F.conv2d(pred, lap_kernel, padding=1, groups=pred.shape[1])
+        target_lap = F.conv2d(target, lap_kernel, padding=1, groups=target.shape[1])
+        lap_loss = F.l1_loss(pred_lap, target_lap)
+
+        return self.l1 * grad_loss + self.l2 * lap_loss
