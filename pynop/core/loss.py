@@ -168,9 +168,6 @@ class DWMSELoss(nn.Module):
 
 
 class NormalizedTimeDerivativeMSE(nn.Module):
-    """
-    Compute the MSE Loss per channel and normalize by the average squared difference between input and target
-    """
 
     def __init__(self, eps=1e-8):
         super().__init__()
@@ -344,29 +341,90 @@ class StructureLoss(nn.Module):
 
 class SobolevLoss(nn.Module):
 
-    def __init__(self, l1=0.1, l2=0.1):
+    def __init__(self, l1: float = 1, l2: float = 1, eps: float = 1e-6):
         super().__init__()
-        self.l1 = l1  # weight for the gradient loss
-        self.l2 = l2  # weight for the laplacian loss
+        self.l1 = l1
+        self.l2 = l2
+        self.eps = eps
 
-    def forward(self, pred, target):
-
-        # Gradient computation (finite differences)
-        # pred shape: [batch, channels, height, width]
+    def forward(self, pred, target, norm=False):
+        # Gradient
         grad_pred_x = pred[:, :, 1:, :] - pred[:, :, :-1, :]
         grad_pred_y = pred[:, :, :, 1:] - pred[:, :, :, :-1]
-
         grad_target_x = target[:, :, 1:, :] - target[:, :, :-1, :]
         grad_target_y = target[:, :, :, 1:] - target[:, :, :, :-1]
 
-        # Gradient penalty
-        grad_loss = F.l1_loss(grad_pred_x, grad_target_x) + F.l1_loss(grad_pred_y, grad_target_y)
+        # Normalisation
+        norm_grad = torch.mean(grad_target_x[:, :, :, :-1] ** 2 + grad_target_y[:, :, :-1, :] ** 2) + self.eps
+        grad_loss = F.mse_loss(grad_pred_x, grad_target_x) + F.mse_loss(grad_pred_y, grad_target_y)
+        if norm:
+            grad_loss = grad_loss / norm_grad
 
-        # laplacian computation
+        # Laplacian
         lap_kernel = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=pred.dtype, device=pred.device)
         lap_kernel = lap_kernel.view(1, 1, 3, 3).repeat(pred.shape[1], 1, 1, 1)
-        pred_lap = F.conv2d(pred, lap_kernel, padding=1, groups=pred.shape[1])
-        target_lap = F.conv2d(target, lap_kernel, padding=1, groups=target.shape[1])
-        lap_loss = F.l1_loss(pred_lap, target_lap)
+
+        # On utilise circular pour des domaines périodiques ou replicate sinon
+        pred_lap = F.conv2d(F.pad(pred, (1, 1, 1, 1), mode="replicate"), lap_kernel, groups=pred.shape[1])
+        target_lap = F.conv2d(F.pad(target, (1, 1, 1, 1), mode="replicate"), lap_kernel, groups=target.shape[1])
+
+        norm_lap = torch.mean(target_lap**2) + self.eps
+        lap_loss = F.mse_loss(pred_lap, target_lap)
+        if norm:
+            lap_loss = lap_loss / norm_lap
 
         return self.l1 * grad_loss + self.l2 * lap_loss
+
+
+class RBF(nn.Module):
+    def __init__(self, n_kernels=5, mul_factor=2.0, bandwidth=None):
+        super().__init__()
+        self.register_buffer("bandwidth_multipliers", mul_factor ** (torch.arange(n_kernels) - n_kernels // 2))
+        self.bandwidth = bandwidth
+
+    def forward(self, X, Y):
+        """
+        X: [B, D]
+        Y: [B, D]
+        """
+        X_flat = X.view(-1, X.shape[-1])  # [B*?, D]
+        Y_flat = Y.view(-1, Y.shape[-1])  # [B*?, D]
+
+        L2_distances = torch.cdist(X_flat, Y_flat) ** 2  # [N, M]
+
+        if self.bandwidth is None:
+            n_samples = X_flat.shape[0]
+            X_dist = torch.cdist(X_flat, X_flat) ** 2
+            bandwidth = X_dist.data.sum() / (n_samples**2 - n_samples)
+        else:
+            bandwidth = self.bandwidth
+
+        # [n_kernels, N, M]
+        kernels = torch.exp(-L2_distances[None, ...] / (bandwidth * self.bandwidth_multipliers.view(-1, 1, 1)))
+
+        return kernels.mean(dim=0)  # [N, M]
+
+
+class MMDLoss(nn.Module):
+    def __init__(self, kernel=RBF()):
+        super().__init__()
+        self.kernel = kernel
+
+    def forward(self, z, prior=None):
+        """
+        z: [batch, modes, hidden_channels] ou [batch, latent_dim]
+        prior: échantillons N(0,1) de même taille que z, ou None pour génération auto
+        """
+        batch_size = z.shape[0]
+        z_flat = z.view(batch_size, -1)  # [batch, latent_dim]
+
+        if prior is None:
+            prior = torch.randn_like(z_flat)
+
+        # Calcul MMD
+        K_zz = self.kernel(z_flat, z_flat)
+        K_zp = self.kernel(z_flat, prior)
+        K_pp = self.kernel(prior, prior)
+
+        mmd = K_zz.mean() - 2 * K_zp.mean() + K_pp.mean()
+        return mmd
