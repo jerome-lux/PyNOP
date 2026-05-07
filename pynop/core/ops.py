@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import torch.fft
 import torch.nn.init as init
 import numpy as np
-
+from torch.nn.utils import spectral_norm
 from .norm import LayerNorm2d
 from .utils import get_same_padding_2d
 
@@ -326,20 +326,6 @@ class DropPath(nn.Module):
         return drop_path(x, self.drop_prob, self.training, self.scale_by_keep)
 
 
-class GRN(nn.Module):
-    """GRN (Global Response Normalization) layer"""
-
-    def __init__(self, dim):
-        super().__init__()
-        self.gamma = nn.Parameter(torch.zeros(1, 1, 1, dim))
-        self.beta = nn.Parameter(torch.zeros(1, 1, 1, dim))
-
-    def forward(self, x):
-        Gx = torch.norm(x, p=2, dim=(1, 2), keepdim=True)
-        Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + 1e-6)
-        return self.gamma * (x * Nx) + self.beta + x
-
-
 class TuckerSpectralConv2d(nn.Module):
     """
     convolution spectrale 2D avec factorisation de Tucker.
@@ -363,12 +349,13 @@ class TuckerSpectralConv2d(nn.Module):
 
     """
 
-    def __init__(self, in_channels, out_channels, modes, ranks, scaling: Union[int, float] = 1):
+    def __init__(self, in_channels, out_channels, modes, ranks, scaling: Union[int, float] = 1, channel_last=False):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.modes_x, self.modes_y = modes
         self.scaling = scaling
+        self.channel_last = channel_last
 
         self.r1, self.r2, self.r3 = ranks
 
@@ -394,6 +381,8 @@ class TuckerSpectralConv2d(nn.Module):
             self.G.imag.copy_(torch.randn_like(self.G.imag) * 0.01)
 
     def forward(self, x):
+        if self.channel_last:
+            x = x.permute(0, 3, 1, 2)
         batchsize, C_in, H, W = x.shape
         device = x.device
 
@@ -439,12 +428,22 @@ class TuckerSpectralConv2d(nn.Module):
             out_ft, s=(int(H * self.scaling), int(W * self.scaling)), dim=(-2, -1), norm="ortho"
         )  # (B, C_out, H, W), float
 
+        if self.channel_last:
+            x = x.permute(0, 2, 3, 1)
+
         return y
 
 
 class SpectralConv2d(nn.Module):
 
-    def __init__(self, in_channels: int, out_channels: int, modes: tuple[int, int], scaling: Union[int, float] = 1):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        modes: tuple[int, int],
+        scaling: Union[int, float] = 1,
+        channel_last=False,
+    ):
         """
         Args:
             in_channels (int): Number of input channels.
@@ -459,6 +458,7 @@ class SpectralConv2d(nn.Module):
         self.out_channels = out_channels
         self.modes_x, self.modes_y = modes
         self.scaling = scaling
+        self.channel_last = channel_last
 
         # Spectral convolution kernel (learned parameter)
         # Its shape is (out_channels, in_channels, modes_x, modes_y)
@@ -478,6 +478,8 @@ class SpectralConv2d(nn.Module):
             nn.init.xavier_uniform_(self.spectral_weights.imag)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.channel_last:
+            x = x.permute(0, 3, 1, 2)
         batchsize, C_in, H, W = x.shape
         device = x.device
 
@@ -498,55 +500,132 @@ class SpectralConv2d(nn.Module):
                 f"for input spatial size ({H}, {W}). modes_y must be <= W//2 + 1."
             )
 
-        # 1. FFT -> spectral domain (x_ft is complex)
-        # (B, C_in, H, W//2 + 1) after rfft2 of a (B, C_in, H, W) input
         x_ft = torch.fft.rfft2(x, dim=(-2, -1), norm="ortho")
-
-        # 2. Select low modes (keep mx, my dimensions)
-        # (B, C_in, modes_x, modes_y)
         x_ft_low_modes = x_ft[:, :, : self.modes_x, : self.modes_y]
-
-        # 3. Apply spectral convolution (complex tensor multiplication)
-        # This is element-wise multiplication per mode (mx, my)
-        # followed by a summation over input channels (C_in) to get output channels (C_out).
-        # y_ft_low_modes_out[b, o, mx, my] = sum_i (x_ft_low_modes[b, i, mx, my] * self.spectral_weights[o, i, mx, my])
-        # einsum('bixy, oixy -> boxy')
-        # b: batch, i: in_channels, o: out_channels, x: modes_x, y: modes_y
         y_ft_low_modes_out = torch.einsum(
             "bixy, oixy -> boxy", x_ft_low_modes, self.spectral_weights
         )  # (B, C_out, modes_x, modes_y)
 
-        # 4. Zero-padding of ignored frequencies
-        # Create a tensor of zeros with the full spectral size after rfft2
+        # Zero-padding of ignored frequencies
         out_ft = torch.zeros(batchsize, self.out_channels, H, W // 2 + 1, dtype=torch.cfloat, device=device)
         # Copy the calculated modes to the low-frequency positions
         out_ft[:, :, : self.modes_x, : self.modes_y] = y_ft_low_modes_out
-
-        # 5. Return to spatial domain
         # irfft2 to get a real output of size (H, W)
         y = torch.fft.irfft2(
             out_ft, s=(int(H * self.scaling), int(W * self.scaling)), dim=(-2, -1), norm="ortho"
         )  # (B, C_out, H, W), float
 
+        if self.channel_last:
+            x = x.permute(0, 2, 3, 1)
+
         return y
 
 
+class SeparableSpectralConv2d(nn.Module):
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        modes: tuple[int, int],
+        scaling: Union[int, float] = 1,
+        channel_last=False,
+    ):
+        """
+        Args:
+            in_channels (int): Number of input channels.
+            out_channels (int): Number of output channels.
+            modes (tuple): Tuple (modes_x, modes_y) for the number of low-frequency modes to retain in x and y.
+                           modes_x corresponds to the height dimension (H) in the spatial domain.
+                           modes_y corresponds to the width dimension (W) in the spatial domain.
+            scaling (int): Scaling factor for the output shape. Default is 1, which means no scaling.
+        """
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes_x, self.modes_y = modes
+        self.scaling = scaling
+        self.channel_last = channel_last
+
+        self.spectral_weights_1 = nn.Parameter(torch.empty(in_channels, self.modes_x, self.modes_y, dtype=torch.cfloat))
+        self.spectral_weights_2 = nn.Parameter(torch.empty(out_channels, in_channels, dtype=torch.cfloat))
+
+        # Initialize complex parameters (Xavier Uniform)
+        self._initialize_parameters_complex_xavier()
+
+    def _initialize_parameters_complex_xavier(self):
+        # Apply Xavier uniform separately to the real and imaginary parts
+        with torch.no_grad():
+            nn.init.xavier_uniform_(self.spectral_weights_1.real)
+            nn.init.xavier_uniform_(self.spectral_weights_1.imag)
+            nn.init.xavier_uniform_(self.spectral_weights_2.real)
+            nn.init.xavier_uniform_(self.spectral_weights_2.imag)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.channel_last:
+            x = x.permute(0, 3, 1, 2)
+        batchsize, C_in, H, W = x.shape
+        device = x.device
+
+        assert C_in == self.in_channels, f"Expected input channels are {self.in_channels}, but received {C_in}"
+
+        # Spectral dimensions after rfft2(H, W) are (H, W//2 + 1)
+        max_spectral_modes_x = H
+        max_spectral_modes_y = W // 2 + 1
+
+        if self.modes_x > max_spectral_modes_x:
+            raise ValueError(
+                f"Number of modes in x ({self.modes_x}) exceeds available spectral dimension in height ({max_spectral_modes_x}) "
+                f"for input spatial size ({H}, {W}). modes_x must be <= H."
+            )
+        if self.modes_y > max_spectral_modes_y:
+            raise ValueError(
+                f"Number of modes in y ({self.modes_y}) exceeds available spectral dimension in width ({max_spectral_modes_y}) "
+                f"for input spatial size ({H}, {W}). modes_y must be <= W//2 + 1."
+            )
+
+        xhat = torch.fft.rfft2(x, dim=(-2, -1), norm="ortho")
+        xhat = xhat[:, :, : self.modes_x, : self.modes_y]
+
+        # depthwise convolution (i.e. depthwise multiplication) followed by linear channel mixing
+        xhat = torch.einsum("bimn, imn -> bimn", xhat, self.spectral_weights_1)
+        xhat = torch.einsum("bimn,oi->bomn", xhat, self.spectral_weights_2)
+
+        out_ft = torch.zeros(batchsize, self.out_channels, H, W // 2 + 1, dtype=torch.cfloat, device=device)
+        # Copy the calculated modes to the low-frequency positions
+        out_ft[:, :, : self.modes_x, : self.modes_y] = xhat
+        y = torch.fft.irfft2(
+            out_ft, s=(int(H * self.scaling), int(W * self.scaling)), dim=(-2, -1), norm="ortho"
+        )  # (B, C_out, H, W), float
+
+        if self.channel_last:
+            x = x.permute(0, 2, 3, 1)
+        return y
+
 
 class GalerkinAttention(nn.Module):
-    def __init__(self, dim, heads=8, delta=1e-2):
+    def __init__(
+        self, dim: int, heads: int = 8, delta: float = 1e-2, std_ini: float = 1e-2, kv_normalization: bool = False
+    ):
         super().__init__()
         self.heads = heads
         self.head_dim = dim // heads
+        self.kv_norm = kv_normalization
 
-        # Q vient des tokens latents (M), K et V viennent de la grille (N)
         self.to_q = nn.Linear(dim, dim, bias=False)
         self.to_k = nn.Linear(dim, dim, bias=False)
         self.to_v = nn.Linear(dim, dim, bias=False)
 
-        self.k_norm = nn.LayerNorm(self.head_dim)
-        self.v_norm = nn.LayerNorm(self.head_dim)
+        if kv_normalization:
+            self.k_norm = nn.LayerNorm(self.head_dim)
+            self.v_norm = nn.LayerNorm(self.head_dim)
 
         self.apply(lambda m: self.init_weights(m, delta))
+
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+
+        with torch.no_grad():
+            nn.init.trunc_normal_(self.out_proj.weight, std=std_ini)
 
     def init_weights(self, module, delta=0.01):
         """
@@ -569,6 +648,7 @@ class GalerkinAttention(nn.Module):
         x: [batch, M, dim] (Tokens latents / Queries)
         context: [batch, N, dim] (Points de la grille / Contecontextt)
         """
+
         if context is None:  # Self-attention
             context = x
         b, m, d = x.shape
@@ -580,9 +660,13 @@ class GalerkinAttention(nn.Module):
         # K, V: [b, h, N, d_h]
         k = self.to_k(context).view(b, n, h, self.head_dim).transpose(1, 2)
         v = self.to_v(context).view(b, n, h, self.head_dim).transpose(1, 2)
+        if self.kv_norm:
+            k = self.k_norm(k)
+            v = self.v_norm(v)
 
-        k = self.k_norm(k)
-        v = self.v_norm(v)
+        # if rope is not None:
+        #     q = rope(q, coords)
+        #     k = rope(k, coords_context)
 
         # Calcul de l'opérateur sur la grille N
         # (K^T * V) / n  -> Taille [d_h, d_h]
@@ -592,7 +676,9 @@ class GalerkinAttention(nn.Module):
         # Q * Context -> Taille [b, h, M, d_h]
         out = torch.matmul(q, context)
 
-        return out.transpose(1, 2).reshape(b, m, d)
+        out = out.transpose(1, 2).reshape(b, m, d)
+
+        return self.out_proj(out)
 
 
 class SoftmaxKernelAttention(nn.Module):
@@ -682,16 +768,25 @@ class LinearAttention(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, in_ch, out_ch, num_heads):
+    def __init__(self, in_ch, out_ch, num_heads, std_ini=1):
         super().__init__()
         assert out_ch % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = out_ch // num_heads
 
-        self.wq = nn.Linear(in_ch, out_ch)
-        self.wk = nn.Linear(in_ch, out_ch)
-        self.wv = nn.Linear(in_ch, out_ch)
-        self.out_proj = nn.Linear(out_ch, out_ch)
+        self.wq = nn.Linear(in_ch, out_ch, bias=False)
+        self.wk = nn.Linear(in_ch, out_ch, bias=False)
+        self.wv = nn.Linear(in_ch, out_ch, bias=False)
+        self.out_proj = nn.Linear(out_ch, out_ch, bias=False)
+
+        # nn.init.kaiming_uniform_(self.wq.weight, nonlinearity="relu")
+        # nn.init.kaiming_uniform_(self.wk.weight, nonlinearity="relu")
+        # nn.init.kaiming_uniform_(self.wv.weight, nonlinearity="relu")
+        with torch.no_grad():
+            nn.init.xavier_uniform_(self.wq.weight, gain=1)
+            nn.init.xavier_uniform_(self.wk.weight, gain=1)
+            nn.init.xavier_uniform_(self.wv.weight, gain=1)
+            nn.init.trunc_normal_(self.out_proj.weight, std=std_ini)
 
     def split_heads(self, x):
         B, N, C = x.shape
@@ -706,7 +801,7 @@ class Attention(nn.Module):
             q = rope(q, coords)  # [B, n_h, L, head_dim]
             k = rope(k, coords)
 
-        attn = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = (q @ k.transpose(-2, -1)) / (self.head_dim**0.5)
 
         if mask is not None:
             attn = attn.masked_fill(mask, -1e9)
@@ -758,156 +853,3 @@ class ComplexAttention(nn.Module):
         output = self.combine_heads(weighted_output)
 
         return output
-
-
-class FiniteDifferenceConvolution(nn.Module):
-    """Finite Difference Convolution Layer introduced in [1]_.
-    "Neural Operators with Localized Integral and Differential Kernels" (ICML 2024)
-        https://arxiv.org/abs/2402.16845
-
-    Computes a finite difference convolution on a regular grid,
-    which converges to a directional derivative as the grid is refined.
-
-    Parameters
-    ----------
-    in_channels : int
-        number of in_channels
-    out_channels : int
-        number of out_channels
-    n_dim : int
-        number of dimensions in the input domain
-    kernel_size : int
-        odd kernel size used for convolutional finite difference stencil
-    groups : int
-        splitting number of channels
-    padding : literal {'periodic', 'replicate', 'reflect', 'zeros'}
-        mode of padding to use on input.
-        See `torch.nn.functional.padding`.
-
-    References
-    ----------
-    .. [1] : Liu-Schiaffini, M., et al. (2024). "Neural Operators with
-        Localized Integral and Differential Kernels".
-        ICML 2024, https://arxiv.org/abs/2402.16845.
-
-    """
-
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        n_dim=2,
-        kernel_size=3,
-        groups=1,
-        stride=1,
-        padding="same",
-    ):
-
-        super().__init__()
-
-        self.conv_function = getattr(F, f"conv{n_dim}d")
-
-        assert kernel_size % 2 == 1, "Kernel size should be odd"
-        self.kernel_size = kernel_size
-        self.in_channels = in_channels
-        self.groups = groups
-        self.n_dim = n_dim
-        self.padding = padding
-        self.stride = stride
-
-        # init kernel weigths
-        self.weights = torch.rand((out_channels, in_channels // groups, kernel_size, kernel_size))
-        k = torch.sqrt(torch.tensor(groups / (in_channels * kernel_size**2)))
-        self.weights = self.weights * 2 * k - k
-
-    def forward(self, x, grid_width: float = 1.0) -> torch.Tensor:
-        """FiniteDifferenceConvolution's forward pass.
-
-        Parameters
-        ----------
-        x : torch.tensor
-            input tensor, shape (batch, in_channels, d_1, d_2, ...d_n)
-        grid_width : float
-            discretization size of input grid
-        """
-
-        self.weights = self.weights.to(x.device)
-        x = (
-            self.conv_function(
-                x,
-                (self.weights - torch.mean(self.weights)),
-                groups=self.groups,
-                stride=self.stride,
-                padding=self.padding,
-            )
-            / grid_width
-        )
-        return x
-
-
-class FiniteDifferenceLayer(nn.Module):
-    """Finite Difference Layer introduced in [1]_.
-    "Neural Operators with Localized Integral and Differential Kernels" (ICML 2024)
-        https://arxiv.org/abs/2402.16845
-
-    Computes a finite difference convolution on a regular grid,
-    which converges to a directional derivative as the grid is refined.
-
-    Parameters
-    ----------
-    in_channels : int
-        number of in_channels
-    out_channels : int
-        number of out_channels
-    n_dim : int
-        number of dimensions in the input domain
-    kernel_size : int
-        odd kernel size used for convolutional finite difference stencil
-    groups : int
-        splitting number of channels
-    padding : literal {'periodic', 'replicate', 'reflect', 'zeros'}
-        mode of padding to use on input.
-        See `torch.nn.functional.padding`.
-
-    References
-    ----------
-    .. [1] : Liu-Schiaffini, M., et al. (2024). "Neural Operators with
-        Localized Integral and Differential Kernels".
-        ICML 2024, https://arxiv.org/abs/2402.16845.
-
-    """
-
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        n_dim=2,
-        kernel_size=3,
-        groups=1,
-        stride=1,
-        padding="same",
-        norm=None,
-        activation=None,
-        grid_width: float = 1.0,
-    ):
-        super().__init__()
-        self.fdc = FiniteDifferenceConvolution(
-            in_channels,
-            out_channels,
-            n_dim=n_dim,
-            kernel_size=kernel_size,
-            groups=groups,
-            stride=stride,
-            padding=padding,
-        )
-        self.normalization = norm(out_channels) if norm is not None else None
-        self.activation = activation() if activation is not None else None
-        self.grid_width = grid_width
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fdc(x, self.grid_width)
-        if self.normalization is not None:
-            x = self.normalization(x)
-        if self.activation is not None:
-            x = self.activation(x)
-        return x
