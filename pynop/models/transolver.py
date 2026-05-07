@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Union, Sequence, Callable
-from pynop.core.blocks import MLPBlock, TransolverBlock, LinearNOBlock, TransformerBlock
+from pynop.core.blocks import MLPBlock, TransolverBlock, LinearNOBlock, TransformerBlock, Transolver3Block
 from pynop.core.norm import AdaptiveLayerNorm, AdaRMSNorm
 from pynop.core.activations import Sine, TaylorSoftmax, gumbel_softmax
 from pynop.core.utils import print_stats
@@ -63,6 +63,17 @@ class Transolver(nn.Module):
                     for _ in range(n_layers)
                 ]
             )
+        elif "t3":
+            self.blocks = nn.ModuleList(
+                [
+                    Transolver3Block(
+                        dim=n_hidden,
+                        num_heads=n_head,
+                        num_slices=slice_num,
+                    )
+                    for _ in range(n_layers)
+                ]
+            )
         else:
             self.blocks = nn.ModuleList(
                 [
@@ -97,13 +108,13 @@ class Transolver(nn.Module):
 
     def forward(self, x, time=None, cond=None, return_derivative=True, **kwargs):
 
-        if return_derivative:
+        if not return_derivative:
             if self.in_ch > self.out_ch:
                 shortcut = x[:, -self.out_ch :, ...]
             elif self.in_ch == self.out_ch:
                 shortcut = x
             else:
-                return_derivative = False
+                return_derivative = True
 
         # cond MUST be [B, H*W, cond_dim] (field) or [B, cond_dim] (scalar)
 
@@ -141,11 +152,9 @@ class Transolver(nn.Module):
         x = x.reshape(B, H, W, self.out_ch).permute(0, 3, 1, 2).contiguous()
 
         if return_derivative:
-            return
+            return x
         else:
             return x * self.dt + shortcut
-
-        return x
 
 
 class LatentTransolver(nn.Module):
