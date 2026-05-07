@@ -1,3 +1,5 @@
+import math
+from posixpath import sep
 from typing import Tuple, Any
 from typing import Callable, Union, Sequence
 import numpy as np
@@ -14,6 +16,7 @@ from .norm import AdaptiveLayerNorm, LayerNorm2d, AdaptiveLayerNorm, AdaRMSNorm
 from .activations import Sine, gumbel_softmax
 from .encoding import RoPE
 from einops import rearrange
+from pynop.core.utils import print_stats
 
 # TODO: implement FNO block with  differential kernels (i.e. conv when the kernel is rescaled by 1/h and the mean is substracted)
 # It would allows to capture the high frequencies while keeping the resolution invariance, far better and more grounded than  the U-FNO! see neuralop for an implementation
@@ -267,6 +270,7 @@ class FNOBlock(nn.Module):
         spectral_layer_type: str = "standard",
         ranks: Union[tuple[int, int, int], np.ndarray, None] = None,
         scaling: Union[int, float] = 1,
+        channel_last=False,
     ):
         """
         Args:
@@ -274,7 +278,8 @@ class FNOBlock(nn.Module):
             hidden_channels:Number of output channels for the SpectralConv
             out_channels (int): Number of output channels for the block.
             modes (tuple): Tuple (modes_x, modes_y) for the spectral convolution.
-            spectral_layer_type (str): Type of spectral layer ('standard' or 'tucker').
+            spectral_layer_type (str): Type of spectral layer ('standard', 'separable' or 'tucker').
+            Separable is the equivalent of Separable Convolution (depthwise + channel mixing)
             ranks (tuple, optional): Ranks (r1, r2, r3) for Tucker factorization, required if spectral_layer_type is 'tucker'.
             A way to set (r1, r2, r3) is to fix a compression factor and to set
             r1 = cin / k
@@ -297,14 +302,23 @@ class FNOBlock(nn.Module):
         self.spectral_layer_type = spectral_layer_type
         self.ranks = ranks
         self.scaling = scaling
+        self.channel_last = channel_last
 
         # Core Spectral Convolution Layer
         if spectral_layer_type == "standard":
-            self.spectral_conv = SpectralConv2d(in_channels, self.hidden_channels, modes, scaling=scaling)
+            self.spectral_conv = SpectralConv2d(
+                in_channels, self.hidden_channels, modes, scaling=scaling, channel_last=channel_last
+            )
         elif spectral_layer_type == "tucker":
             if ranks is None:
                 raise ValueError("Ranks must be provided for TuckerSpectralConv2d.")
-            self.spectral_conv = TuckerSpectralConv2d(in_channels, self.hidden_channels, modes, ranks, scaling=scaling)
+            self.spectral_conv = TuckerSpectralConv2d(
+                in_channels, self.hidden_channels, modes, ranks, scaling=scaling, channel_last=channel_last
+            )
+        elif spectral_layer_type == "separable":
+            self.spectral_conv = SeparableSpectralConv2d(
+                in_channels, self.hidden_channels, modes, scaling=scaling, channel_last=channel_last
+            )
         else:
             raise ValueError(f"Unknown spectral_layer_type: {spectral_layer_type}. Choose 'standard' or 'tucker'.")
 
@@ -325,25 +339,26 @@ class FNOBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: (B, C_in, H, W) - spatial domain
 
-        # Shortcut branch computation
+        # Shortcut branch
         x_shortcut = self.shortcut(x)  # (B, out_channels, H, W)
         if self.scaling != 1:
+            if self.channel_last:
+                x = x.permute(0, 3, 1, 2)
             x_shortcut = F.interpolate(x_shortcut, scale_factor=self.scaling, mode="bilinear", align_corners=False)
+            if self.channel_last:
+                x = x.permute(0, 2, 3, 1)
 
-        # Main branch computation
+        # Main branch
+        if self.norm is not None:
+            x = self.norm(x)  # pre norm
         x = self.spectral_conv(x)  # (B, hidden_channels, H, W)
         x = self.activation(x)  # (B, hidden_channels, H, W)
         x = self.linear(x)  # (B, out_channels, H, W)
 
-        if self.norm is not None:
-            x = self.norm(x)
-
-        x = x + x_shortcut  # (B, out_channels, H, W)
-
         if self.activation is not None:
             x = self.activation(x)
 
-        return x
+        return x + x_shortcut  # (B, out_channels, H, W)
 
 
 class FNOBlockv2(nn.Module):
@@ -1100,8 +1115,7 @@ class MLPBlock(nn.Module):
         """
         Initializes the MLP.
         Args:
-            n_dim (int): Dimension of the input coordinates (default: 2).
-            num_modes (int): Number of modes to learn.
+
             hidden_dim (int): Hidden dimension of the MLP.
             num_layers (int): Number of hidden layers in the MLP.
             activation (callable): Activation function to use (default: nn.GELU).
@@ -1112,13 +1126,14 @@ class MLPBlock(nn.Module):
 
         layers = []
         layers.append(nn.Linear(in_ch, hidden_dim))
+        self.w0 = 30
         if dropout > 0.0:
             layers.append(nn.Dropout(dropout))
         if norm is not None:
             layers.append(norm(hidden_dim))
         if activation is not None:
-            if type(activation) is Sine:
-                layers.append(activation(w0=30))
+            if activation is Sine:
+                layers.append(activation(w0=self.w0))
             else:
                 layers.append(activation())  # Or ReLU, LeakyReLU, etc.
 
@@ -1129,24 +1144,41 @@ class MLPBlock(nn.Module):
             if norm is not None:
                 layers.append(norm(hidden_dim))
             if activation is not None:
-                layers.append(activation())
+                if activation is Sine:
+                    layers.append(activation(w0=self.w0))
+                else:
+                    layers.append(activation())
 
         layers.append(nn.Linear(hidden_dim, out_ch))
 
         self.mlp = nn.Sequential(*layers)
 
-        # SIREN init
-        if type(activation) is Sine:
-            with torch.no_grad():
-                first_layer_init = True
-                for i, m in enumerate(self.mlp.modules()):
-                    if isinstance(m, nn.Linear):
-                        if first_layer_init:
-                            first_layer_init = False
-                            m.weight.uniform_(-1 / m.in_features, 1 / m.in_features)
-                        else:
-                            limit = np.sqrt(6 / m.in_features)
-                            m.weight.uniform_(-limit, limit)
+        self._init_siren(activation)
+
+    def _init_siren(self, activation):
+        """Standard SIREN initialization scheme."""
+        if activation is not Sine:
+            return
+
+        with torch.no_grad():
+            linears = [m for m in self.mlp.modules() if isinstance(m, nn.Linear)]
+            n = len(linears)
+
+            for i, m in enumerate(linears):
+                if i == 0:
+                    # First layer: scale to input range
+                    # m.weight.uniform_(-1 / m.in_features, 1 / m.in_features)
+                    m.weight.uniform_(-self.w0 / m.in_features, self.w0 / m.in_features)
+                elif i < n - 1:
+                    # Hidden layers: scale weights by 1/w0 to maintain variance
+                    limit = np.sqrt(6 / m.in_features) / self.w0
+                    m.weight.uniform_(-limit, limit)
+                else:
+                    # Final layer: Xavier for stable Galerkin attention
+                    nn.init.xavier_uniform_(m.weight)
+
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x):
 
@@ -1240,7 +1272,7 @@ class SepLITBlock(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (B, C, H, W), real part.
         """
-        batch_size, channels, H, W = x.shape
+        B, C, H, W = x.shape
 
         # Convert input to complex numbers if it is real
         x_complex = torch.complex(x, torch.zeros_like(x)) if not x.is_complex() else x
@@ -1687,8 +1719,8 @@ class LITBlock(nn.Module):
         mlp_num_layers=1,
         activation=nn.GELU,
         mlp_act=nn.GELU,
-        sinus_pe_freq=None,
         nonlinear=True,
+        separable=True,
         orthogonal_init=True,
     ):
 
@@ -1697,15 +1729,25 @@ class LITBlock(nn.Module):
         self.in_channels = in_channels
         self.m1 = m1  # Number of modes kept in height (u)
         self.m2 = m2  # Number of modes kept in width (v)
-        self.sinus_pe_freq = sinus_pe_freq
         self.nonlinear = nonlinear
+        self.separable = separable
 
-        # If sinusoidal positional encoding the final dimension is 4 * frequencies
+        self.IT_scale_forward = nn.Parameter(torch.empty(1))
+        self.IT_scale_inverse = nn.Parameter(torch.empty(1))
+        # To scale the integral transform. sigmoid(1.1)~0.75 so between 1/sqrt(N) and 1/N
+        with torch.no_grad():
+            nn.init.constant_(self.IT_scale_forward, 1.1)
+            nn.init.constant_(self.IT_scale_inverse, 1.1)
 
         in_ch = in_channels + 2 if nonlinear else 2
 
-        if sinus_pe_freq is not None:
-            in_ch = in_ch + 4 * sinus_pe_freq
+        self.pe = MLPBlock(
+            out_ch=in_channels,
+            in_ch=2,
+            hidden_dim=mlp_hidden_dim,
+            num_layers=mlp_num_layers,
+            activation=mlp_act,
+        )
 
         self.generator = MLPBlock(
             out_ch=self.m1 * self.m2,
@@ -1715,39 +1757,193 @@ class LITBlock(nn.Module):
             activation=mlp_act,
         )
         if orthogonal_init:
-
             self.ortho_init_weights(self.generator)
 
         # Learned parameters for multiplication in the transformed space (per channel).
         # self.learned_weights = nn.Parameter(torch.zeros(self.in_channels, out_channels, self.m1, self.m2))
-
-        self.learned_weights_1 = nn.Parameter(torch.zeros(self.in_channels, self.m1, self.m2))
-        # mixing
-        self.learned_weights_2 = nn.Parameter(torch.zeros(self.in_channels, self.in_channels))
-
         std = (1.0 / (in_channels)) ** 0.5
-        with torch.no_grad():
-            self.learned_weights_1.normal_(0, std)
-            self.learned_weights_2.normal_(0, std)
+        if self.separable:  # this is equivalent to a separable convolution
+            self.learned_weights_1 = nn.Parameter(torch.zeros(self.in_channels, self.m1, self.m2))
+            # mixing
+            self.learned_weights_2 = nn.Parameter(torch.zeros(self.in_channels, self.in_channels))
+            with torch.no_grad():
+                self.learned_weights_1.normal_(0, std)
+                self.learned_weights_2.normal_(0, std)
+        else:
+            self.learned_weights = nn.Parameter(torch.zeros(self.in_channels, in_channels, self.m1, self.m2))
+            with torch.no_grad():
+                self.learned_weights.normal_(0, std)
 
-        self.alpha = nn.Parameter(torch.zeros(1, 1, 1, in_channels))
+        self.alpha = nn.Parameter(torch.ones(1, 1, 1, in_channels))
 
         self.mixer = MLPBlock(in_channels, in_channels, num_layers=1, activation=activation)
 
-        self.in_norm = AdaptiveLayerNorm(in_channels, in_channels)
-        self.out_norm = nn.LayerNorm(in_channels)
+        self.norm1 = nn.RMSNorm(in_channels)
+        self.norm2 = nn.RMSNorm(in_channels)
 
     def ortho_init_weights(self, module):
-        if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
-            torch.nn.init.orthogonal_(module.weight)
-            if isinstance(module, torch.nn.Linear) and module.bias is not None:
-                module.bias.data.zero_()
+        with torch.no_grad():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
+                torch.nn.init.orthogonal_(module.weight)
+                if isinstance(module, torch.nn.Linear) and module.bias is not None:
+                    module.bias.data.zero_()
 
     def _init_weights(self, module, std=0.02):
-        if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
-            nn.init.trunc_normal_(module.weight, std=std)
-            if isinstance(module, torch.nn.Linear) and module.bias is not None:
-                module.bias.data.zero_()
+        with torch.no_grad():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
+                nn.init.trunc_normal_(module.weight, std=std)
+                if isinstance(module, torch.nn.Linear) and module.bias is not None:
+                    module.bias.data.zero_()
+
+    def forward(self, x: Tensor):
+        """
+        Performs the forward pass of the module for variable resolution input.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, H, W, C).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (B, H, W, C)
+        """
+
+        shortcut = x
+
+        # Generate kernels
+        B, H, W, C = x.shape
+
+        h_coords = torch.linspace(-1, 1, H, device=x.device)
+        w_coords = torch.linspace(-1, 1, W, device=x.device)
+        grid_h, grid_w = torch.meshgrid(h_coords, w_coords, indexing="ij")
+
+        coords = torch.stack([grid_h, grid_w], dim=-1)  # [H, W, 2]
+        coords = coords.unsqueeze(0).expand(B, -1, -1, -1)
+        pe = self.pe(coords)
+
+        x = x + pe
+
+        if self.nonlinear:
+            basis_input = torch.cat([x, coords], dim=-1)
+        else:
+            basis_input = coords
+
+        # print(gamma.shape, beta.shape, x.shape, trunk.shape)
+        basis = self.generator(basis_input)
+
+        basis = basis.view(B, H, W, self.m1, self.m2)
+        # norm_factor = torch.sqrt(torch.mean(torch.abs(basis) ** 2, dim=(1, 2), keepdim=True))
+        # basis = basis / (norm_factor + 1e-6)
+
+        xhat = torch.einsum("bhwc,bhwmn->bcmn", x, basis) / (
+            (H * W) ** torch.sigmoid(self.IT_scale_forward)
+        )  # "Spectral" representation
+
+        # Multiply by learned weigths in transformed space
+        # xhat = torch.einsum("bixy,oixy->boxy", xhat, self.learned_weights)
+        if self.separable:
+            xhat = torch.einsum("bimn, imn -> bimn", xhat, self.learned_weights_1)
+            xhat = torch.einsum("bimn,oi->bomn", xhat, self.learned_weights_2)
+        else:
+            xhat = torch.einsum("bixy,oixy->boxy", xhat, self.learned_weights)
+
+        x_rec = torch.einsum("bcmn,bhwmn->bhwc", xhat, basis) / (
+            (self.m1 * self.m2) ** torch.sigmoid(self.IT_scale_inverse)
+        )
+        x_rec = self.norm1(x_rec) * self.alpha + shortcut  # 1st shortcut
+        shortcut = x_rec
+        x_rec = self.mixer(self.norm2(x_rec)) + shortcut
+
+        return x_rec
+
+
+class FNOLITBlock(nn.Module):
+    """
+    FNO  branch  + Learnable Intregral transform block
+
+    Forward Args:
+        x (torch.Tensor): Input tensor of shape (B, C, H, W), where H and W may vary.
+
+    Forward Returns:
+        torch.Tensor: Output tensor of shape (B, out_channels, H, W) (real part)
+
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        m1,
+        m2,
+        mlp_hidden_dim=64,
+        mlp_num_layers=1,
+        separable="True",
+        activation=nn.GELU,
+        mlp_act=nn.GELU,
+        nonlinear=True,
+    ):
+
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.m1 = m1  # Number of modes kept in height (u)
+        self.m2 = m2  # Number of modes kept in width (v)
+        self.nonlinear = nonlinear
+        self.separable = separable
+
+        self.IT_scale_forward = nn.Parameter(torch.empty(1))
+        self.IT_scale_inverse = nn.Parameter(torch.empty(1))
+        nn.init.constant_(self.IT_scale_forward, 1)
+        nn.init.constant_(self.IT_scale_inverse, 1)
+
+        self.pe = MLPBlock(
+            out_ch=self.m1 * self.m2,
+            in_ch=in_channels,
+            hidden_dim=mlp_hidden_dim,
+            num_layers=mlp_num_layers,
+            activation=mlp_act,
+        )
+
+        in_ch = in_channels + 2 if nonlinear else 2
+
+        self.generator = MLPBlock(
+            out_ch=self.m1 * self.m2,
+            in_ch=in_ch,
+            hidden_dim=mlp_hidden_dim,
+            num_layers=mlp_num_layers,
+            activation=mlp_act,
+        )
+
+        self.ortho_init_weights(self.generator)
+
+        # Learned parameters for multiplication in the transformed space (per channel).
+        # self.learned_weights = nn.Parameter(torch.zeros(self.in_channels, out_channels, self.m1, self.m2))
+        std = (1.0 / (in_channels)) ** 0.5
+        if self.separable:  # this is equivalent to a separable convolution
+            self.learned_weights_1 = nn.Parameter(torch.zeros(self.in_channels, self.m1, self.m2))
+            # mixing
+            self.learned_weights_2 = nn.Parameter(torch.zeros(self.in_channels, self.in_channels))
+            with torch.no_grad():
+                self.learned_weights_1.normal_(0, std)
+                self.learned_weights_2.normal_(0, std)
+        else:
+            self.learned_weights = nn.Parameter(torch.zeros(self.in_channels, in_channels, self.m1, self.m2))
+            with torch.no_grad():
+                self.learned_weights.normal_(0, std)
+
+        self.mixer = MLPBlock(in_channels, in_channels, num_layers=1, activation=activation)
+        self.in_norm = nn.RMSNorm(in_channels)
+
+    def ortho_init_weights(self, module):
+        with torch.no_grad():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
+                torch.nn.init.orthogonal_(module.weight)
+                if isinstance(module, torch.nn.Linear) and module.bias is not None:
+                    module.bias.data.zero_()
+
+    def _init_weights(self, module, std=0.02):
+        with torch.no_grad():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
+                nn.init.trunc_normal_(module.weight, std=std)
+                if isinstance(module, torch.nn.Linear) and module.bias is not None:
+                    module.bias.data.zero_()
 
     def forward(self, x: Tensor, time: Union[None, Tensor] = None):
         """
@@ -1770,11 +1966,10 @@ class LITBlock(nn.Module):
         grid_h, grid_w = torch.meshgrid(h_coords, w_coords, indexing="ij")
 
         coords = torch.stack([grid_h, grid_w], dim=-1)  # [H, W, 2]
-        if self.sinus_pe_freq:
-            coords = sinusoidal_encoding_2d(coords, self.sinus_pe_freq).view(H, W, -1)  # [H, W, 4 * F]
         coords = coords.unsqueeze(0).expand(B, -1, -1, -1)
+        pe = self.pe(coords)
 
-        x = self.in_norm(x, time)
+        x = self.in_norm(x + pe, time)
 
         if self.nonlinear:
             basis_input = torch.cat([x, coords], dim=-1)
@@ -1788,14 +1983,21 @@ class LITBlock(nn.Module):
         # norm_factor = torch.sqrt(torch.mean(torch.abs(basis) ** 2, dim=(1, 2), keepdim=True))
         # basis = basis / (norm_factor + 1e-6)
 
-        xhat = torch.einsum("bhwc,bhwmn->bcmn", x, basis)  # "Spectral" representation
+        xhat = torch.einsum("bhwc,bhwmn->bcmn", x, basis) / (
+            (H * W) ** torch.sigmoid(self.IT_scale_forward)
+        )  # "Spectral" representation
 
         # Multiply by learned weigths in transformed space
         # xhat = torch.einsum("bixy,oixy->boxy", xhat, self.learned_weights)
-        xhat = torch.einsum("bimn, imn -> bimn", xhat, self.learned_weights_1)
-        xhat = torch.einsum("bimn,oi->bomn", xhat, self.learned_weights_2)
+        if self.separable:
+            xhat = torch.einsum("bimn, imn -> bimn", xhat, self.learned_weights_1)
+            xhat = torch.einsum("bimn,oi->bomn", xhat, self.learned_weights_2)
+        else:
+            xhat = torch.einsum("bixy,oixy->boxy", xhat, self.learned_weights)
 
-        x_rec = torch.einsum("bcmn,bhwmn->bhwc", xhat, basis)
+        x_rec = torch.einsum("bcmn,bhwmn->bhwc", xhat, basis) / (
+            (self.m1 * self.m2) ** torch.sigmoid(self.IT_scale_inverse)
+        )
         x_rec = x_rec * self.alpha + shortcut  # 1st shortcut
         shortcut = x_rec
         x_rec = self.out_norm(x_rec)
@@ -1806,24 +2008,44 @@ class LITBlock(nn.Module):
 
 
 class GalerkinTransformerBlock(nn.Module):
-    def __init__(self, dim, heads=8, mlp_dim=2048, dropout=0.1, delta=0.01):
+    def __init__(
+        self,
+        dim,
+        heads=8,
+        mlp_dim=2048,
+        dropout=0.1,
+        delta=0.01,
+        activation=nn.SiLU,
+        std_ini: float = 1,
+        scaling: float = 1e-4,
+        kv_normalization=False,
+    ):
         super().__init__()
-        self.attn = GalerkinAttention(dim, heads, delta)
+        self.attn = GalerkinAttention(dim, heads, delta, std_ini=std_ini, kv_normalization=kv_normalization)
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
+        self.scaling = nn.Parameter(torch.empty(1))
 
-        # Feed-Forward Network (FFN) standard
         self.mlp = nn.Sequential(
             nn.Linear(dim, mlp_dim),
-            nn.SiLU(),
+            activation(),
             nn.Dropout(dropout),
             nn.Linear(mlp_dim, dim),
             nn.Dropout(dropout),
         )
+        with torch.no_grad():
+            nn.init.constant_(self.scaling, scaling)
+            for m in self.mlp:
+                if isinstance(m, nn.Linear):
+                    # nn.init.xavier_uniform_(m.weight)
+                    # nn.init.xavier_uniform_(m.weight, gain=1.0)
+                    nn.init.kaiming_uniform_(m.weight, nonlinearity="leaky_relu")
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.scaling * self.attn(self.norm1(x))
+        x = x + self.scaling * self.mlp(self.norm2(x))
         return x
 
 
@@ -1858,10 +2080,12 @@ class LinearTransformerBlock(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, n_heads, activation=nn.GELU, mlp_dim=256, dropout=0.1, rmsnorm=True):
+    def __init__(
+        self, dim, n_heads, activation=nn.GELU, mlp_dim=256, dropout=0.1, rmsnorm=True, std_ini=0.02, scaling: float = 1
+    ):
         super().__init__()
 
-        self.attention = Attention(dim, dim, n_heads)
+        self.attention = Attention(dim, dim, n_heads, std_ini=std_ini)
 
         self.mlp = nn.Sequential(
             nn.Linear(dim, mlp_dim),
@@ -1870,29 +2094,36 @@ class TransformerBlock(nn.Module):
             nn.Linear(mlp_dim, dim),
             nn.Dropout(dropout),
         )
+        self.scaling = nn.Parameter(torch.empty(1))
+
         if rmsnorm:
-            self.norm1 = AdaRMSNorm(dim, dim)
+            self.norm1 = nn.RMSNorm(dim)  # AdaRMSNorm(dim, dim)
             self.norm2 = nn.RMSNorm(dim)
         else:
-            self.norm1 = AdaptiveLayerNorm(dim, dim)
+            self.norm1 = nn.LayerNorm(dim)  # AdaptiveLayerNorm(dim, dim)
             self.norm2 = nn.LayerNorm(dim)
 
-    def forward(self, x, cond=None):
+        with torch.no_grad():
+            nn.init.constant_(self.scaling, scaling)
+            nn.init.xavier_uniform_(self.mlp[0].weight)
+            nn.init.trunc_normal_(self.mlp[3].weight, std=std_ini)
+
+    def forward(self, x):
         # x: [B, N, C]
 
         res = x
-        x = self.norm1(x, cond)
+        x = self.norm1(x)
         x = self.attention(Q=x, V=x, K=x)
-        x = x + res
+        x = self.scaling * x + res
         res = x
         x = self.norm2(x)
         x = self.mlp(x)
-        x = x + res
+        x = self.scaling * x + res
 
         return x
 
 
-class LatentTemporalTransformer(nn.Module):
+class LatentTemporalTransformerFullAttention(nn.Module):
     def __init__(self, dim, n_heads, num_layers=2, mlp_factor=2, max_history=5, rmsnorm=True):
         super().__init__()
         self.max_history = max_history
@@ -1903,16 +2134,17 @@ class LatentTemporalTransformer(nn.Module):
             self.norm = nn.LayerNorm(dim)
         self.layers = nn.ModuleList([RoPETransformerBlock(dim, n_heads, dim * mlp_factor) for _ in range(num_layers)])
 
-    def forward(self, z_current, z_history=None, coords_t=None):
+    def forward(self, z_current, z_history=None, coords_t=None, update_history=True):
         """
         z_current: [B, M, C]
         z_history: [B, T_past, M, C]
         coords_t:  [B, T_total, 1] -> Real time values
+        update_history: if False, the latent history is not updated
         """
         B, M, C = z_current.shape
 
         # 1. Sequence construction [B, T, M, C]
-        if z_history is not None:
+        if z_history is not None and update_history:
             z_full = torch.cat([z_history, z_current.unsqueeze(1)], dim=1)
             z_full = z_full[:, -self.max_history :]
         else:
@@ -1956,25 +2188,310 @@ class LatentTemporalTransformer(nn.Module):
         return z_refined, z_full
 
 
+class LatentTemporalMLP(nn.Module):
+    def __init__(self, dim, max_history=3, mlp_factor=4, dropout=0.05):
+        """
+        Simple MLP for latent temporal prediction.
+        Each mode M is processed independently (Shared MLP across modes).
+
+        Args:
+            dim (int): Dimension of each latent (D).
+            max_history (int): Number of past steps used for prediction.
+            mlp_factor (int): Expansion factor for the hidden layer.
+        """
+        super().__init__()
+        self.max_history = max_history
+        self.dim = dim
+
+        # Input: [B, M, max_history * dim]
+        # Output: [B, M, dim] (the residual delta_z)
+        input_dim = max_history * dim
+        hidden_dim = dim * mlp_factor
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, dim),  # Predicts Delta Z
+        )
+        with torch.no_grad():
+            nn.init.zeros_(self.net[-1].weight)
+            nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, z_current, z_history=None):
+        """
+        z_current: [B, M, D]
+        z_history: [B, T_past, M, D]
+        """
+        B, M, D = z_current.shape
+
+        # 1. Pr�paration du contexte temporel
+        if z_history is not None:
+            # On prend les (max_history - 1) derniers pas de l'historique
+            # z_past: [B, T_selected, M, D]
+            z_past = z_history[:, -(self.max_history - 1) :]
+            # Concat avec le pr�sent: [B, T_total, M, D]
+            z_seq = torch.cat([z_past, z_current.unsqueeze(1)], dim=1)
+        else:
+            # Si pas d'historique, on r�p�te le pr�sent (fallback)
+            z_seq = z_current.unsqueeze(1).repeat(1, self.max_history, 1, 1)
+
+        # 2. Reshape pour le MLP [B, M, T_total * D]
+        # On veut que chaque mode M voit son propre historique
+        # [B, T, M, D] -> [B, M, T, D] -> [B, M, T*D]
+        x = z_seq.transpose(1, 2).reshape(B, M, -1)
+
+        # 3. Pr�diction du r�sidu
+        delta_z = self.net(x)
+
+        # 4. Int�gration d'Euler (R�siduel)
+        z_next = z_current + delta_z
+
+        return z_next
+
+
+class SpatioTemporalTransformer(nn.Module):
+    def __init__(self, dim, n_heads, num_layers=2, mlp_factor=2, max_history=10, rmsnorm=True, std_ini=0.02):
+        """
+        Spatio-temporal Transformer for latent tokens.
+        Alternates between Temporal Attention (mode-wise) and Spatial Attention (cross-mode).
+        std_ini: std used in the init of the last projection layer in the attention block
+        """
+        super().__init__()
+        self.max_history = max_history
+        self.n_heads = n_heads
+
+        # Rotary Positional Embedding for temporal dimension
+        self.rope = RoPE(dim // n_heads, max_period=max_history * 50)
+
+        # self.norm = nn.RMSNorm(dim) if rmsnorm else nn.LayerNorm(dim)
+
+        # We alternate between temporal processing and spatial mixing
+        self.layers = nn.ModuleList(
+            [
+                nn.ModuleDict(
+                    {
+                        "temporal": RoPETransformerBlock(dim, n_heads, dim * mlp_factor, std_ini=std_ini),
+                        "spatial": TransformerBlock(dim, n_heads, mlp_dim=dim * mlp_factor, std_ini=std_ini),
+                    }
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+    def forward(self, z_current, z_history=None, coords_t=None):
+        """
+        Forward pass with axial attention.
+        """
+        B, M, C = z_current.shape
+
+        # 1. Manage history buffer [B, T, M, C]
+        if z_history is not None:
+            z_full = torch.cat([z_history, z_current.unsqueeze(1)], dim=1)
+            z_full = z_full[:, -self.max_history :]
+        else:
+            z_full = z_current.unsqueeze(1)
+
+        T = z_full.shape[1]
+
+        # 2. Prepare temporal coordinates [B*M, T, 1]
+        if coords_t is None:
+            coords_t_seq = torch.arange(T, device=z_current.device).view(1, T, 1).expand(B, T, 1)
+        else:
+            coords_t_seq = coords_t[:, -T:, :]
+
+        # Replicate for each mode for the temporal RoPE
+        full_time = coords_t_seq.repeat_interleave(M, dim=0)
+
+        # 3. Interleaved Axial Attention
+        # Initial state x: [B, T, M, C]
+        x = z_full
+
+        for layer in self.layers:
+            # --- A. Temporal Attention (Independent per mode) ---
+            # Reshape to [B*M, T, C]
+            x = x.transpose(1, 2).reshape(B * M, T, C)
+            # x = self.norm(x)
+            x = layer["temporal"](x, coords=full_time, mask=None, rope=self.rope)
+
+            # Reshape back to [B, T, M, C]
+            x = x.view(B, M, T, C).transpose(1, 2)
+
+            # --- B. Spatial Attention (Mixing modes) ---
+            # Reshape to [B*T, M, C]
+            x = x.reshape(B * T, M, C)
+            # x = self.norm(x)
+            x = layer["spatial"](x)
+
+            # Reshape back to [B, T, M, C]
+            x = x.view(B, T, M, C)
+
+        # 4. Final refinement
+        # Extract last frame: [B, M, C]
+        z_refined = x[:, -1, :, :]
+
+        return z_refined, x
+
+
 class RoPETransformerBlock(nn.Module):
-    def __init__(self, dim, n_heads, mlp_dim, dropout=0.1, rmsnorm=True):
+    def __init__(self, dim, n_heads, mlp_dim, dropout=0.1, rmsnorm=True, std_ini=0.02):
         super().__init__()
 
         if rmsnorm:
-            self.norm1 = AdaRMSNorm(dim, dim)
+            self.norm1 = nn.RMSNorm(dim)  # AdaRMSNorm(dim, dim)
             self.norm2 = nn.RMSNorm(dim)
         else:
-            self.norm1 = AdaptiveLayerNorm(dim, dim)
+            self.norm1 = nn.LayerNorm(dim)  # AdaptiveLayerNorm(dim, dim)
             self.norm2 = nn.LayerNorm(dim)
 
-        self.attn = Attention(dim, dim, n_heads)
+        self.attn = Attention(dim, dim, n_heads, std_ini=std_ini)
         self.mlp = nn.Sequential(nn.Linear(dim, mlp_dim), nn.GELU(), nn.Linear(mlp_dim, dim), nn.Dropout(dropout))
+
+        for m in self.mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x, coords, mask=None, rope=None):
         # x: [B, T*M, C], time: [B, T*M, 1]
         x_norm = self.norm1(x)
         x = x + self.attn(x_norm, x_norm, x_norm, mask=mask, rope=rope, coords=coords)
         x = x + self.mlp(self.norm2(x))
+
+        return x
+
+
+class GalerkinTransolverBlock(nn.Module):
+    """Projection using a Galerkin Attention then attention then reconstruction using Galerkin Attention"""
+
+    def __init__(
+        self, dim, num_heads, modes, mlp_factor=2, dropout=0.1, activation=nn.GELU, kv_normalization=False, scaling=1.0
+    ):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.modes = modes  # M: Number of modes
+
+        self.encoder = GalerkinAttention(dim=dim, heads=num_heads, kv_normalization=kv_normalization, std_ini=1e-2)
+        self.decoder = GalerkinAttention(dim=dim, heads=num_heads, kv_normalization=kv_normalization, std_ini=1e-2)
+        self.queries_predictor = MLPBlock(out_ch=dim, in_ch=2, hidden_dim=dim, num_layers=1, activation=activation)
+        self.scaling = nn.Parameter(torch.empty(1))
+        self.latent_pe = MLPBlock(
+            out_ch=dim,
+            in_ch=2,
+            hidden_dim=dim,
+            num_layers=1,
+            activation=activation,
+        )
+
+        self.attention = Attention(
+            in_ch=dim,
+            out_ch=dim,
+            num_heads=num_heads,
+            std_ini=1e-2,
+        )
+
+        self.out_proj = MLPBlock(
+            out_ch=dim,
+            in_ch=dim,
+            hidden_dim=dim,
+            num_layers=1,
+            activation=activation,
+        )
+
+        self.norm1 = nn.RMSNorm(dim)
+        self.norm2 = nn.RMSNorm(dim)
+
+        with torch.no_grad():
+            nn.init.constant_(self.scaling, scaling)
+
+    def forward(self, x):
+
+        B, N, D = x.shape
+
+        # Add Positional encoding in latent representation before the self-attention modules
+
+        m_coords = torch.linspace(-1, 1, int(math.sqrt(self.modes)), device=x.device)
+        m1, m2 = torch.meshgrid(m_coords, m_coords, indexing="ij")
+        q_coords = torch.stack([m1, m2], dim=-1)
+        q_coords = q_coords.view(self.modes, 2)
+        q_coords = q_coords.unsqueeze(0).expand(B, -1, -1)
+        queries = self.queries_predictor(q_coords)
+        latent_pe = self.latent_pe(q_coords)
+
+        # Galerkin Cross Attention -> [B, M, C]
+        xhat = self.encoder(x=queries, context=self.norm1(x))
+        xhat = xhat + latent_pe
+
+        # Multi-head attention
+        xhat = self.attention(xhat)
+
+        # Go back to spatial domain do we need normalization here?
+        x_rec = self.decoder(x=x, context=xhat)
+        x_rec = self.scaling * self.out_proj(self.norm2(x)) + x
+
+        return x_rec
+
+
+class Transolver3Block(nn.Module):
+    def __init__(self, dim, num_heads, num_slices):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.num_slices = num_slices  # M: Number of physical states
+
+        # Geometry scaling: Projection moved to latent space
+        # Original: x_proj = Linear1(x) -> O(N*C^2)
+        # Transolver-3: s = Linear1(slice(x)) -> O(M*C^2) where M << N
+        self.linear1 = nn.Linear(dim, dim)
+        self.linear2 = nn.Linear(dim, num_slices)  # Weights generator
+        self.linear3 = nn.Linear(dim, dim)
+
+        self.attn = Attention(dim, dim, num_heads, 2e-2)
+        self.ln1 = nn.LayerNorm(dim)
+        self.ln2 = nn.LayerNorm(dim)
+
+        # Simple MLP
+        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+
+    def forward(self, x):
+        """
+        x: (B, N, C) where N is number of mesh cells
+        """
+        b, n, c = x.shape
+        residual = x
+        x = self.ln1(x)
+
+        # Generate Slice Weights (w) - Softmax over N locations
+        # w shape: (B, N, M)
+        w = F.softmax(self.linear2(x), dim=1)
+
+        # Faster Slice
+        # Calculate raw physical states: s_raw = w^T @ x
+        # d is the normalization diagonal matrix: d_jj = sum(w_ij)
+        d = w.sum(dim=1, keepdim=True)  # (B, 1, M)
+        s_raw = torch.matmul(w.transpose(1, 2), x)  # (B, M, C)
+
+        # Apply Linear1 and normalization in the compact slice domain
+        # s = Linear1(s_raw) / d
+        s = self.linear1(s_raw) / (d.transpose(1, 2) + 1e-6)  # (B, M, C)
+
+        # Physics-Attention (Self-attention in the slice domain)
+        s_updated = self.attn(s, s, s)
+
+        # Faster Deslice
+        # Apply Linear3 before mapping back to mesh domain
+        # x_out = w @ Linear3(s_updated)
+        s_out = self.linear3(s_updated)  # (B, M, C)
+        x_out = torch.matmul(w, s_out)  # (B, N, C)
+
+        # Residual and MLP
+        x = residual + x_out
+        x = x + self.mlp(self.ln2(x))
 
         return x
 
@@ -2045,7 +2562,7 @@ class LinearNOBlock(nn.Module):
     See Transolver is a Linear Transformer: Revisiting Physics-Attention through the Lens of Linear Attention
     """
 
-    def __init__(self, dim, n_tokens=64, n_heads=8, dropout=0.0, mlp_ratio=2, activation=nn.GELU):
+    def __init__(self, dim, n_tokens=64, n_heads=8, dropout=0.0, mlp_ratio=2, activation=nn.GELU, rmsnorm=True):
         super().__init__()
         self.n_heads = n_heads
         self.n_tokens = n_tokens
@@ -2054,8 +2571,13 @@ class LinearNOBlock(nn.Module):
 
         assert dim % n_heads == 0, "dim must be divisible by n_heads"
 
-        self.ln1 = nn.LayerNorm(dim)
-        self.ln2 = nn.LayerNorm(dim)
+        if rmsnorm:
+            self.norm1 = nn.RMSNorm(dim)
+            self.norm2 = nn.RMSNorm(dim)
+        else:
+            self.norm1 = nn.LayerNorm(dim)
+            self.norm2 = nn.LayerNorm(dim)
+
         self.mlp = MLPBlock(in_ch=dim, out_ch=dim, hidden_dim=dim * mlp_ratio, num_layers=1, activation=activation)
         self.dropout = nn.Dropout(dropout)
 
@@ -2071,7 +2593,7 @@ class LinearNOBlock(nn.Module):
         H = self.n_heads
         D = self.n_tokens
 
-        x_in = self.ln1(x)
+        x_in = self.norm1(x)
 
         # Q, K: [B, N, H, D], V: [B, N, H, head_dim]
         q = self.q_proj(x_in).view(B, N, H, D)
@@ -2098,7 +2620,7 @@ class LinearNOBlock(nn.Module):
 
         out = out.permute(0, 2, 1, 3).contiguous().view(B, N, C) + x
 
-        out = self.out_proj(self.ln2(out)) + out
+        out = self.out_proj(self.norm2(out)) + out
 
         return out
 
