@@ -9,6 +9,113 @@ from pathlib import Path
 class PDEBenchDataSet(Dataset):
     """
     Loads simulation data from an HDF5 file and generates time-unrolled windows.
+    """
+
+    def __init__(
+        self,
+        h5_path,
+        T_unroll=10,
+        step=None,
+        load_in_ram=False,
+        indexes=None,
+        min_id=0,
+        max_id=None,
+        shift=0.0,
+        scale=1.0,
+    ):
+        """
+        Args:
+            h5_path: Path to HDF5 file.
+            T_unroll: Length of time window.
+            step: Stride for windows.
+            load_in_ram: Load data into memory.
+            indexes: List of sample IDs (keys in HDF5) to process.
+                     If None, processes all available keys.
+            min_id: Start index for windows.
+            max_id: End index for windows.
+            shift: Input shift.
+            scale: Input scale.
+        """
+
+        if T_unroll < 1:
+            print("Warning: T_unroll must be at least 1. Setting to 1.")
+            T_unroll = 1
+
+        self.h5_path = h5_path
+        self.T_unroll = T_unroll
+        self.step = T_unroll if step is None else step
+        self.load_in_ram = load_in_ram
+        self.h5file = None
+        self.data_dict = {}
+        self.windows = []
+        self.max_t_idx = 0
+        self.shift = self._prepare_transform(shift)
+        self.scale = self._prepare_transform(scale)
+
+        with h5py.File(h5_path, "r") as f:
+            # Use provided indexes or default to all keys
+            all_keys = list(f.keys())
+            self.sample_ids = indexes if indexes is not None else all_keys
+
+            for sid in tqdm(self.sample_ids, desc="Scanning samples"):
+                # Safety check: ensure index exists
+                if sid not in f:
+                    print(f"Warning: {sid} not found in HDF5 file. Skipping.")
+                    continue
+
+                T_total = f[sid]["data"].shape[0]
+                self.max_t_idx = max(self.max_t_idx, T_total)
+
+                current_max_id = max_id if max_id is not None else T_total
+                current_max_id = min(current_max_id, T_total)
+
+                if (current_max_id - min_id) < T_unroll:
+                    continue
+
+                if self.load_in_ram:
+                    raw_data = f[sid]["data"][:]
+                    self.data_dict[sid] = torch.from_numpy(np.moveaxis(raw_data, -1, 1)).float()
+
+                # Generate windows within [min_id, current_max_id]
+                limit_t0 = current_max_id - T_unroll
+                for t0 in range(min_id, limit_t0 + 1, self.step):
+                    self.windows.append((sid, t0))
+
+        print(f"Dataset initialized with {len(self.sample_ids)} simulations.")
+        print(f"Total unrolled windows: {len(self.windows)}")
+        print(f"Status: {'RAM' if self.load_in_ram else 'Disk'} mode.")
+
+    def _prepare_transform(self, val):
+        if isinstance(val, (list, np.ndarray, torch.Tensor)):
+            tensor_val = torch.as_tensor(val).float()
+            if tensor_val.ndim == 1:
+                return tensor_val.view(1, -1, 1, 1)
+            return tensor_val
+        return val
+
+    def __len__(self):
+        return len(self.windows)
+
+    def _init_h5(self):
+        if self.h5file is None and not self.load_in_ram:
+            self.h5file = h5py.File(self.h5_path, "r", swmr=True)
+
+    def __getitem__(self, idx):
+        sid, t0 = self.windows[idx]
+
+        if self.load_in_ram:
+            fields = self.data_dict[sid][t0 : t0 + self.T_unroll]
+        else:
+            self._init_h5()
+            fields = self.h5file[sid]["data"][t0 : t0 + self.T_unroll]
+            fields = torch.from_numpy(np.moveaxis(fields, -1, 1)).float()
+
+        return (fields + self.shift) * self.scale, torch.Tensor([t0])
+
+
+class PDEBenchDataSet_old(Dataset):
+    """
+    Loads simulation data from an HDF5 file and generates time-unrolled windows.
     Optionally loads the entire dataset into RAM for faster training.
     when data is loaded from disk, there can be problems in torch.DataLoader when num_workers>0
 
@@ -68,8 +175,8 @@ class PDEBenchDataSet(Dataset):
         self.data_dict = {}
         self.windows = []
         self.max_t_idx = 0
-        self.shift = shift
-        self.scale = scale
+        self.shift = self._prepare_transform(shift)
+        self.scale = self._prepare_transform(scale)
 
         with h5py.File(h5_path, "r") as f:
             all_sample_ids = sorted(list(f.keys()))
@@ -116,6 +223,17 @@ class PDEBenchDataSet(Dataset):
             print("Status: All data loaded in RAM.")
         else:
             print("Status: Reading from Disk (Lazy Loading).")
+
+    def _prepare_transform(self, val):
+
+        if isinstance(val, (list, np.ndarray, torch.Tensor)):
+            tensor_val = torch.as_tensor(val).float()
+            # Si c'est un vecteur de taille C, on reshape en (1, C, 1, 1)
+            if tensor_val.ndim == 1:
+                return tensor_val.view(1, -1, 1, 1)
+            return tensor_val
+        # Si c'est un simple flottant, le broadcasting standard fera l'affaire
+        return val
 
     def __len__(self):
         return len(self.windows)
