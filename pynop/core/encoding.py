@@ -27,7 +27,7 @@ class RoPE(nn.Module):
 
         def rotate_half(x):
             x1, x2 = x[..., 0::2], x[..., 1::2]
-            return torch.stack((-x2, x1), dim=-1).flatten(-2)
+            return torch.stack((-x2, x1), dim=-1).reshape(x.shape)
 
         return (x * cos) + (rotate_half(x) * sin)
 
@@ -58,30 +58,64 @@ class CartesianEmbedding(nn.Module):
         batch_size, _, height, width = x.shape
         device = x.device
 
-        # Generate 1D coordinate vectors normalized to [-1, 1]
         x_lin = torch.linspace(self.minval, self.maxval, steps=width, device=device)  # Shape (W,)
         y_lin = torch.linspace(self.minval, self.maxval, steps=height, device=device)  # Shape (H,)
 
-        # Use meshgrid to create 2D grids of coordinates
-        # grid_y will have shape (H, W), grid_x will have shape (H, W)
-        # Use indexing='ij' to match the (H, W) spatial dimensions ordering
         grid_y, grid_x = torch.meshgrid(y_lin, x_lin, indexing="ij")
 
         coords = torch.stack([grid_x, grid_y], dim=-1)  # Shape (H, W, 2)
 
-        # Permute dimensions to get shape (2, H, W) and add batch dimension (1, 2, H, W)
-        # Permute moves the coordinate dimension (originally last) to the first position
-        # unsqueeze(0) adds the batch dimension at the start
         coords = coords.permute(2, 0, 1).unsqueeze(0)  # Shape (1, 2, H, W)
 
         # Expand for the batch size to match the input tensor batch size
         coords = coords.expand(batch_size, -1, -1, -1)  # Shape (B, 2, H, W)
 
-        # Concatenate with the input tensor along the channel dimension
         # Output shape (B, C_in + 2, H, W)
         output = torch.cat([x, coords], dim=1)
 
         return output
+
+
+class TimestepEmbedder(nn.Module):
+    """
+    Embeds scalar timesteps into vector representations.
+    From https://github.com/facebookresearch/tuna-2/blob/main/tuna/models/misc.py
+    """
+
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        half = dim // 2
+        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
+            device=t.device
+        )
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t, dtype):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size).to(dtype)
+        t_emb = self.mlp(t_freq)
+        return t_emb
 
 
 def timestep_embedding(timesteps, dim, max_period=10000):
@@ -131,6 +165,77 @@ class TimestepEmbedding(nn.Module):
 
         return embedding
 
+
+class AdaptivePE2d(nn.Module):
+    def __init__(self, dim):
+        
+        super().__init__()
+        assert dim % 4 == 0
+        self.num_frequencies = dim // 4
+        self.register_buffer("indices", torch.arange(self.num_frequencies).float())
+
+    def forward(self, coords):
+        """
+        Args:
+            coords: [H, W, 2]
+        """
+        H, W, _ = coords.shape
+        device = coords.device
+
+        max_freq_h = float(H) / 2.0
+        max_freq_w = float(W) / 2.0
+
+        log_h = math.log(max_freq_h) if max_freq_h > 1 else 0.0
+        log_w = math.log(max_freq_w) if max_freq_w > 1 else 0.0
+
+        freq_h = torch.exp(self.indices * (log_h / max(1, self.num_frequencies - 1))).to(device)
+        freq_w = torch.exp(self.indices * (log_w / max(1, self.num_frequencies - 1))).to(device)
+
+        angles_h = coords[:, :, 0:1] * freq_h * math.pi
+        angles_w = coords[:, :, 1:2] * freq_w * math.pi
+
+        pe_h = torch.stack([torch.sin(angles_h), torch.cos(angles_h)], dim=-1)
+        pe_w = torch.stack([torch.sin(angles_w), torch.cos(angles_w)], dim=-1)
+
+        return torch.cat([pe_h.flatten(2), pe_w.flatten(2)], dim=-1)
+
+
+def positional_encoding_2d(d_model, H=512, W=512):
+
+    # implementation of the classical PE adpated to 2D cartesian grids
+
+    # d_model must be divisible by 4 (sin/cos for H and sin/cos for W)
+    assert d_model % 4 == 0, "d_model must be a multiple of 4 for 2D PE"
+
+    pe = torch.zeros(d_model, H, W)
+
+    # Split d_model in two: one half for H, one half for W
+    d_half = d_model // 2
+
+    # Compute div_term for the half dimension
+    # Using the classic 10000 base from Vaswani et al.
+    div_term = torch.exp(torch.arange(0, d_half, 2).float() * -(math.log(10000.0) / d_half))
+
+    # Create position grids
+    pos_h = torch.arange(0, H).unsqueeze(1)
+    pos_w = torch.arange(0, W).unsqueeze(1)
+
+    # Compute encodings for H (rows)
+    pe_h = torch.zeros(H, d_half)
+    pe_h[:, 0::2] = torch.sin(pos_h * div_term)
+    pe_h[:, 1::2] = torch.cos(pos_h * div_term)
+
+    # Compute encodings for W (columns)
+    pe_w = torch.zeros(W, d_half)
+    pe_w[:, 0::2] = torch.sin(pos_w * div_term)
+    pe_w[:, 1::2] = torch.cos(pos_w * div_term)
+
+    # Expand and concatenate to create the 2D grid [d_model, H, W]
+    # [H, 1, d_half] + [1, W, d_half] -> [H, W, d_model]
+    pe[0:d_half, :, :] = pe_h.transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
+    pe[d_half:, :, :] = pe_w.transpose(0, 1).unsqueeze(1).repeat(1, H, 1)
+
+    return pe
 
 def sin_positional_encoding_2d(coords, d_model, max_freq=32.0):
     """
