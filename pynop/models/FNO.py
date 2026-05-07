@@ -51,7 +51,8 @@ class FNO(nn.Module):
         modes: Union[int, Sequence[int]],
         hidden_channels: Sequence[int] = (64, 64, 64, 64),
         blocks: Union[str, Sequence[str]] = "FNO",
-        spectral_compression_factor: Sequence = (1, 1, 1),
+        spectral_layer_type: str = "standard",
+        spectral_compression_factor: Union[None, Sequence] = (1, 1, 1),
         activation=nn.GELU,
         norm=LayerNorm2d,
         fixed_pos_encoding: bool = True,
@@ -59,12 +60,14 @@ class FNO(nn.Module):
         trainable_pos_encoding_modes=(16, 16),  # Only useful if pos_encoding == 'trainable'
         trainable_pos_encoding_dims=8,
         block_kwargs: dict = {},
+        dt: float = 1.0,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.fixed_pos_encoding = fixed_pos_encoding
         self.trainable_pos_encoding = trainable_pos_encoding
+        self.dt = dt
 
         assert isinstance(hidden_channels, abc.Sequence), "hidden_channels must be a sequence"
 
@@ -98,8 +101,11 @@ class FNO(nn.Module):
         for i, channels in enumerate(hidden_channels):
             in_channels = hidden_channels[0] if i == 0 else hidden_channels[i - 1]
             block = REGISTERED_FNO.get(blocks[i], FNOBlock)
-            ranks = [in_channels, channels, np.prod(modes)]
-            ranks = np.ceil(np.divide(ranks, spectral_compression_factor)).astype(int)
+            if spectral_compression_factor is not None:
+                ranks = [in_channels, channels, np.prod(modes)]
+                ranks = np.ceil(np.divide(ranks, spectral_compression_factor)).astype(int)
+            else:
+                ranks = None
             self.ops.append(
                 block(
                     in_channels=in_channels,
@@ -107,7 +113,7 @@ class FNO(nn.Module):
                     modes=modes,
                     activation=activation,
                     normalization=norm,
-                    spectral_layer_type="tucker",
+                    spectral_layer_type=spectral_layer_type,
                     ranks=ranks,
                     **block_kwargs,  # Additional keyword arguments for the block
                 )
@@ -115,26 +121,18 @@ class FNO(nn.Module):
 
         self.projection = nn.Conv2d(hidden_channels[-1], out_channels, 1, bias=True)
 
-    def forward(self, x, residual=False, return_coords=False, **kwargs):
+    def forward(self, x, return_derivative=True, **kwargs):
 
-        if residual:
+        if not return_derivative:
             if self.in_channels > self.out_channels:
                 shortcut = x[:, -self.out_channels :, ...]
             elif self.in_channels == self.out_channels:
                 shortcut = x
             else:
-                residual = False
-
-        if return_coords and not self.fixed_pos_encoding:
-            raise ValueError(
-                "return_coords is only available when fixed_pos_encoding or trainable_pos_encoding is True"
-            )
+                return_derivative = True
 
         if self.fixed_pos_encoding:
             x = self.grid_encoding(x)
-
-            if return_coords:
-                coords = x[:, -2:, :, :]
 
         if self.trainable_pos_encoding:
             pos_embeddings = torch.fft.irfftn(self.pos_embedding_weights, s=x.shape[-2:])
@@ -149,10 +147,7 @@ class FNO(nn.Module):
 
         x = self.projection(x)
 
-        if residual:
-            x = x + shortcut
-
-        if self.fixed_pos_encoding and return_coords:
-            return x, coords
-        else:
+        if return_derivative:
             return x
+        else:
+            return x * self.dt + shortcut
