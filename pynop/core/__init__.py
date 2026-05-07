@@ -6,3 +6,4 @@ from .utils import *
 from .norm import *
 from .loss import *
 from .encoding import *
+from .initialization import *
