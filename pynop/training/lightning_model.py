@@ -45,6 +45,7 @@ class TrainingConfig:
         1.2  # Increase loss with the timestep during autoregressive training: temporal_weighting**timestep
     )
     train_mode: str = "prediction"  # if "autoencoder", train only the enocder/decoer part in CausalLNO
+    VAELoss_weight: float = 1e-4  # Only for VAE training (if train_mode="autoencoder")
 
     def to_json_dict(self):
         def serialize_value(v):
@@ -80,6 +81,26 @@ class CurriculumCheckpoint(ModelCheckpoint):
             super().on_validation_end(trainer, pl_module)
 
 
+def jacobian_regularization(model_input, derivative, n_projections=1):
+    reg = 0.0
+    for _ in range(n_projections):
+        v = torch.randn_like(derivative)
+
+        # JVP: Calcule le gradient de (derivative * v) par rapport a model_input
+        jvp = torch.autograd.grad(
+            outputs=derivative,
+            inputs=model_input,
+            grad_outputs=v,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+
+        reg += torch.mean(jvp**2)
+
+    return reg / n_projections
+
+
 class MultiStepNOModel(pl.LightningModule):
 
     def __init__(
@@ -96,6 +117,8 @@ class MultiStepNOModel(pl.LightningModule):
         self.scheduler_config = scheduler_config
         self.loss_fn = self.train_config.loss_fn if self.train_config.loss_fn is not None else []
         self.derivative_loss_weight = self.train_config.derivative_loss_weight
+
+        assert self.train_config.n_slices > 0, "n_slices must be > 0"
 
         if not isinstance(self.loss_fn, Iterable):
             self.loss_fn = [self.loss_fn]
@@ -161,22 +184,41 @@ class MultiStepNOModel(pl.LightningModule):
         n = self.train_config.n_slices
         t_norm = self.train_config.time_normalization
 
-        epoch = self.current_epoch
-        max_AR_steps = int(min(T_unroll - n, self.train_config.max_autoregressive_steps))
-        min_AR_steps = max(self.train_config.min_autoregressive_steps, 0)
-        min_AR_steps = int(min(min_AR_steps, T_unroll - n))
+        # epoch = self.current_epoch
+        # max_AR_steps = int(min(T_unroll - n, self.train_config.max_autoregressive_steps))
+        # min_AR_steps = max(self.train_config.min_autoregressive_steps, 0)
+        # min_AR_steps = int(min(min_AR_steps, T_unroll - n))
 
-        if self.train_config.start_autoregressive is not None and self.train_config.final_autoregressive is not None:
-            nint = max_AR_steps - min_AR_steps + 1
-            delta = (self.train_config.final_autoregressive - self.train_config.start_autoregressive) // nint
-            if epoch < self.train_config.start_autoregressive:
+        # if self.train_config.start_autoregressive is not None and self.train_config.final_autoregressive is not None:
+        #     nint = max_AR_steps - min_AR_steps + 1
+        #     delta = (self.train_config.final_autoregressive - self.train_config.start_autoregressive) // nint
+        #     if epoch < self.train_config.start_autoregressive:
+        #         AR_steps = min_AR_steps
+        #     elif delta > 0:
+        #         AR_steps = int(
+        #             min(max(min_AR_steps + (epoch - self.train_config.start_autoregressive) // delta, 0), max_AR_steps)
+        #         )
+        #     else:
+        #         AR_steps = max_AR_steps
+        # else:
+        #     AR_steps = min_AR_steps
+
+        epoch = self.current_epoch
+        max_AR_steps = int(min(T_unroll - n - 1, self.train_config.max_autoregressive_steps))
+        min_AR_steps = max(self.train_config.min_autoregressive_steps, 0)
+        min_AR_steps = int(min(min_AR_steps, T_unroll - n - 1))
+
+        start_ep = self.train_config.start_autoregressive
+        final_ep = self.train_config.final_autoregressive
+
+        if start_ep is not None and final_ep is not None:
+            if epoch < start_ep:
                 AR_steps = min_AR_steps
-            elif delta > 0:
-                AR_steps = int(
-                    min(max(min_AR_steps + (epoch - self.train_config.start_autoregressive) // delta, 0), max_AR_steps)
-                )
-            else:
+            elif epoch >= final_ep:
                 AR_steps = max_AR_steps
+            else:
+                progress = (epoch - start_ep) / (final_ep - start_ep)
+                AR_steps = int(min_AR_steps + progress * (max_AR_steps - min_AR_steps))
         else:
             AR_steps = min_AR_steps
         # ----------------------------------
@@ -191,12 +233,16 @@ class MultiStepNOModel(pl.LightningModule):
 
         indiv_losses = [0] * (len(self.loss_fn))
         derivative_loss = 0
+        step_losses = []
 
-        # On commence à t = n-1 pour prédire le slice n
+        # On commence à t = n-1 pour prédire le slice t+1. n doit être > 0
         for t in range(n - 1, T_unroll - 1):
             # Auto regressive predictions
-            # if num_predictions < AR_steps and preds is not None:
-            if num_predictions >= (T_unroll - 1 - (n - 1) - AR_steps) and preds is not None:
+            ARmode = num_predictions >= (T_unroll - 1 - (n - 1) - AR_steps) and preds is not None
+            # if num_predictions < AR_steps and preds is not None:  # AR first
+            if ARmode:  # AR last
+                # if self.train_config.noise_level > 0:
+                #     preds = add_noise(preds, self.train_config.noise_level, max_amplitude=1e-2, positive=False)
                 current_input = torch.cat([current_input[:, 1:, ...], preds.unsqueeze(1)], dim=1)
                 AR_preds += 1
                 time_weighting_factor = gamma**AR_preds
@@ -204,7 +250,7 @@ class MultiStepNOModel(pl.LightningModule):
                 # TEACHER FORCING
                 real_window = inputs[:, t - (n - 1) : t + 1, ...]
                 if self.train_config.noise_level > 0:
-                    current_input = add_noise(real_window, self.train_config.noise_level, positive=False)
+                    current_input = add_noise(real_window, self.train_config.noise_level, max_val=0.1, positive=False)
                 else:
                     current_input = real_window
                 time_weighting_factor = 1.0
@@ -213,9 +259,10 @@ class MultiStepNOModel(pl.LightningModule):
             current_time = (time_idx + (t + 1)) / t_norm
 
             model_input = current_input.reshape(B, -1, H, W)
-            derivative = self.model(model_input, time=current_time)
 
-            # compute the function at t+dt using prediction at t
+            derivative = self.model(model_input, time=current_time, return_derivative=True)
+
+            # compute the function at t+dt
             preds = current_input[:, -1, ...] + self.model.dt * derivative
 
             targets_t = inputs[:, t + 1, ...]
@@ -231,22 +278,26 @@ class MultiStepNOModel(pl.LightningModule):
             l = (
                 time_weighting_factor
                 * self.derivative_loss_weight
-                * self.derivative_loss_fn(derivative, targets_t, inputs[:, t, ...], self.model.dt)
+                * self.derivative_loss_fn(derivative, targets_t, current_input[:, -1, ...], self.model.dt)
             )
             derivative_loss += l.item()
             loss += l
 
             with torch.no_grad():
-                RMSE += torch.sqrt(torch.mean((preds - targets_t) ** 2))
+                temp_RMSE = torch.sqrt(torch.mean((preds - targets_t) ** 2))
+                RMSE += temp_RMSE
+                if ARmode:
+                    step_losses.append(temp_RMSE.item())
 
             num_predictions += 1
 
             # Troncature des gradients (BPTT)
-            if AR_preds % self.detach_every_k == 0:
+            if AR_preds > 0 and AR_preds % self.detach_every_k == 0:
                 preds = preds.detach()
 
         if num_predictions > 0:
             loss = loss / num_predictions
+            derivative_loss /= num_predictions
             with torch.no_grad():
                 RMSE = RMSE / num_predictions
                 for i, _ in enumerate(indiv_losses):
@@ -256,6 +307,10 @@ class MultiStepNOModel(pl.LightningModule):
         # Logging
         # self.log("LFE", low_freq_err, on_epoch=True, prog_bar=True)
         # self.log("HFE", high_freq_err, on_epoch=True, prog_bar=True)
+
+        if ARmode:
+            for i, step_loss in enumerate(step_losses):
+                self.log(f"step_{i+1}", step_loss, on_step=False, on_epoch=True, prog_bar=True)
         for i, loss_fn in enumerate(self.loss_fn):
             self.log(f"loss_{i}", indiv_losses[i], on_step=True, on_epoch=True, prog_bar=True)
         self.log("nMSEdt", derivative_loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -288,9 +343,7 @@ class MultiStepNOModel(pl.LightningModule):
             # 2. Forward pass.
             current_time = (time_idx + t + 1) / t_norm
 
-            preds = self.model(current_input.view(B, -1, H, W), time=current_time)
-            # the network predict the derivative
-            preds = current_input[:, -1, ...] + self.model.dt * preds
+            preds = self.model(current_input.view(B, -1, H, W), time=current_time, return_derivative=False)
 
             targets_t = inputs[:, t + 1, ...]
             for i, loss_fn in enumerate(self.loss_fn):
@@ -298,7 +351,10 @@ class MultiStepNOModel(pl.LightningModule):
                 # print(t, i, l)
                 loss += self.loss_weights[i] * loss_fn(preds, targets_t)
 
-            RMSE += torch.sqrt(torch.mean((preds - targets_t) ** 2))
+            mse_per_sample = torch.mean((preds - targets_t) ** 2, dim=[1, 2, 3])
+            rmse_per_sample = torch.sqrt(mse_per_sample)
+            RMSE += torch.mean(rmse_per_sample)
+            # RMSE += torch.sqrt(torch.mean((preds - targets_t) ** 2))
 
             num_predictions += 1
 
@@ -330,12 +386,23 @@ class CausalNOModel(pl.LightningModule):
         self.optimizer = optimizer
         self.scheduler_config = scheduler_config
         self.loss_fn = self.train_config.loss_fn if self.train_config.loss_fn is not None else []
-        self.derivative_loss_weight = self.train_config.derivative_loss_weight
-        self.warmup = max(0, min(train_config.n_slices, self.model.memory - 1))
         self.train_mode = train_config.train_mode
+        self.derivative_loss_weight = self.train_config.derivative_loss_weight
+        self.beta_factor = 1
+        self.beta_max_epoch = 1
+
+        if self.train_mode == "predict":
+            self.autoencoder = False
+            self.time_attention = True
+
+        else:
+            self.time_attention = False
+            self.autoencoder = True
 
         if not isinstance(self.loss_fn, Iterable):
             self.loss_fn = [self.loss_fn]
+
+        self.warmup = max(0, min(train_config.n_slices, self.model.memory - 1))
 
         self.loss_weights = (
             [self.train_config.loss_weights]
@@ -345,14 +412,16 @@ class CausalNOModel(pl.LightningModule):
 
         self.detach_every_k = self.train_config.detach_grad_steps
         self.train_loss_avg = MeanMetric()
+        self.derivative_loss_fn = NormalizedTimeDerivativeMSE()
 
         if len(self.loss_weights) != len(self.loss_fn):
             self.loss_weights = [self.loss_weights[0]] * len(self.loss_fn)
 
-        self.derivative_loss_fn = NormalizedTimeDerivativeMSE()
-
         print(f"Loss functions: {self.loss_fn}, with weights: {self.loss_weights}")
-        print(f"Derivative loss  {self.derivative_loss_fn}, with weight: {self.derivative_loss_weight}")
+        print(f"Training mode:{self.train_mode}")
+        print("Time-attention:", self.time_attention)
+        if self.autoencoder:
+            print("VAE loss weight", self.train_config.VAELoss_weight)
 
     def forward(self, x, training=True, **kwargs):
         return self.model(x, training=training, **kwargs)
@@ -395,27 +464,7 @@ class CausalNOModel(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         inputs, time_idx = batch
         B, T_unroll, C, H, W = inputs.shape
-        n = self.warmup
         t_norm = self.train_config.time_normalization
-
-        epoch = self.current_epoch
-        max_AR_steps = int(min(T_unroll - n, self.train_config.max_autoregressive_steps))
-        min_AR_steps = max(self.train_config.min_autoregressive_steps, 0)
-        min_AR_steps = int(min(min_AR_steps, T_unroll - n))
-
-        if self.train_config.start_autoregressive is not None and self.train_config.final_autoregressive is not None:
-            nint = max_AR_steps - min_AR_steps + 1
-            delta = (self.train_config.final_autoregressive - self.train_config.start_autoregressive) // nint
-            if epoch < self.train_config.start_autoregressive:
-                AR_steps = min_AR_steps
-            elif delta > 0:
-                AR_steps = int(
-                    min(max(min_AR_steps + (epoch - self.train_config.start_autoregressive) // delta, 0), max_AR_steps)
-                )
-            else:
-                AR_steps = max_AR_steps
-        else:
-            AR_steps = min_AR_steps
 
         loss = 0.0
         RMSE = 0.0
@@ -427,72 +476,132 @@ class CausalNOModel(pl.LightningModule):
         time_weighting_factor = 1
         indiv_losses = [0] * (len(self.loss_fn))
         derivative_loss = 0
+        VAELoss = 0
 
-        for t in range(self.warmup):
-            current_time = (time_idx + t + 1) / t_norm
-            # We only care about the updated history here
-            # with torch.no_grad():  # Optional:
-            _, history = self.model(inputs[:, t, ...], time=current_time, history=history, return_derivative=True)
+        if self.autoencoder:
+            flat_inputs = inputs.reshape(-1, C, H, W)
+            flat_time = time_idx + torch.arange(T_unroll, device=time_idx.device).view(1, T_unroll)
+            flat_time = flat_time.reshape(-1, 1)
+            preds, _, VAELoss = self.model(
+                flat_inputs,
+                time=flat_time,
+                history=history,
+                timeattention=False,
+                sampling=True,
+                # latent_noise=self.train_config.noise_level,
+            )
+            # linear increase
+            beta_factor = min((self.current_epoch + 1) / self.beta_max_epoch, 1) * self.beta_factor
+            VAELoss = self.train_config.VAELoss_weight * beta_factor * VAELoss
+            loss += VAELoss
 
-        for t in range(n - 1, T_unroll - 1):
-            # Auto regressive predictions
-            current_time = (time_idx + (t + 1)) / t_norm
-            # if num_predictions < AR_steps and preds is not None:
-            if num_predictions >= (T_unroll - 1 - (n - 1) - AR_steps) and preds is not None:
-                current_input = preds
-                AR_preds += 1
-                time_weighting_factor = gamma**AR_preds
-                derivative, history = self.model(
-                    current_input, time=current_time, history=history, return_derivative=True
-                )
-            else:
-                # TEACHER FORCING
-                current_input = inputs[:, t]
-                if self.train_config.noise_level > 0:
-                    current_input = add_noise(current_input, self.train_config.noise_level, positive=False)
-                else:
-                    current_input = current_input
-                derivative, history = self.model(
-                    current_input, time=current_time, history=history, return_derivative=True, timeattention=True
-                )
-                time_weighting_factor = 1.0
-
-            # compute the function at t+dt using prediction at t
-            preds = current_input + self.model.dt * derivative
-
-            # Loss between pred and targets
             for i, loss_fn in enumerate(self.loss_fn):
-                l = time_weighting_factor * self.loss_weights[i] * loss_fn(preds, inputs[:, t + 1, ...])
-                # l = time_weighting_factor * self.loss_weights[i] * loss_fn(preds, delta)
+                l = time_weighting_factor * self.loss_weights[i] * loss_fn(preds, flat_inputs)
                 indiv_losses[i] += l.item()
                 loss += l
 
-            # # loss over the derivative
-            l = (
-                time_weighting_factor
-                * self.derivative_loss_weight
-                * self.derivative_loss_fn(derivative, inputs[:, t + 1, ...], inputs[:, t, ...], self.model.dt)
-            )
-            derivative_loss += l.item()
-            loss += l
-
             with torch.no_grad():
-                RMSE += torch.sqrt(torch.mean((preds - inputs[:, t + 1, ...]) ** 2))
+                RMSE = torch.sqrt(torch.mean((preds - flat_inputs) ** 2))
 
-            num_predictions += 1
+        else:
+            epoch = self.current_epoch
+            max_AR_steps = int(min(T_unroll - self.warmup - 1, self.train_config.max_autoregressive_steps))
+            min_AR_steps = max(self.train_config.min_autoregressive_steps, 0)
+            min_AR_steps = int(min(min_AR_steps, T_unroll - self.warmup - 1))
 
-            # Troncature des gradients (BPTT)
-            if num_predictions % self.detach_every_k == 0:
-                preds = preds.detach()
-                if history is not None:
-                    history.detach()
+            start_ep = self.train_config.start_autoregressive
+            final_ep = self.train_config.final_autoregressive
 
-        if num_predictions > 0:
-            loss = loss / num_predictions
-            with torch.no_grad():
-                RMSE = RMSE / num_predictions
-                for i, _ in enumerate(indiv_losses):
-                    indiv_losses[i] = indiv_losses[i] / num_predictions
+            if start_ep is not None and final_ep is not None:
+                if epoch < start_ep:
+                    AR_steps = min_AR_steps
+                elif epoch >= final_ep:
+                    AR_steps = max_AR_steps
+                else:
+                    progress = (epoch - start_ep) / (final_ep - start_ep)
+                    AR_steps = int(min_AR_steps + progress * (max_AR_steps - min_AR_steps))
+            else:
+                AR_steps = min_AR_steps
+
+            # Fill the latent history
+            for t in range(self.warmup):
+                current_time = (time_idx + t) / t_norm
+                # We only care about the updated history here
+                # with torch.no_grad():  # Optional:
+                _, history, _ = self.model(
+                    inputs[:, t, ...],
+                    time=current_time,
+                    history=history,
+                    timeattention=True,
+                    sampling=False,
+                    latent_noise=self.train_config.noise_level,
+                )
+
+            for t in range(self.warmup, T_unroll - 1):
+
+                current_time = (time_idx + t) / t_norm
+
+                # Auto regressive predictions
+                ARmode = (
+                    (AR_steps > 0)
+                    and (num_predictions >= T_unroll - 1 - self.warmup - AR_steps)
+                    and (preds is not None)
+                )
+
+                if ARmode:
+                    # Auto-Regressive
+                    current_input = preds
+                    AR_preds += 1
+                    time_weighting_factor = gamma**AR_preds
+                else:
+                    # Teacher Forcing
+                    current_input = inputs[:, t]
+                    time_weighting_factor = 1.0
+
+                preds, history, _ = self.model(
+                    current_input,
+                    time=current_time,
+                    history=history,
+                    timeattention=True,
+                    sampling=False,
+                    latent_noise=self.train_config.noise_level,
+                )
+
+                target = inputs[:, t + 1, ...]
+
+                # Loss between pred and targets
+                for i, loss_fn in enumerate(self.loss_fn):
+                    l = time_weighting_factor * self.loss_weights[i] * loss_fn(preds, target)
+                    indiv_losses[i] += l.item()
+                    loss += l
+
+                # derivative loss
+                derivative = (preds - current_input) / self.model.dt
+                l = (
+                    time_weighting_factor
+                    * self.derivative_loss_weight
+                    * self.derivative_loss_fn(derivative, target, current_input, self.model.dt)
+                )
+                derivative_loss += l.item()
+                loss += l
+
+                with torch.no_grad():
+                    RMSE += torch.sqrt(torch.mean((preds - target) ** 2))
+
+                num_predictions += 1
+
+                # Troncature des gradients (BPTT)
+                if num_predictions % self.detach_every_k == 0:
+                    preds = preds.detach()
+                    if history is not None:
+                        history = history.detach()
+
+            if num_predictions > 0:
+                loss = loss / num_predictions
+                with torch.no_grad():
+                    RMSE = RMSE / num_predictions
+                    for i, _ in enumerate(indiv_losses):
+                        indiv_losses[i] = indiv_losses[i] / num_predictions
 
         self.train_loss_avg.update(loss)
         # Logging
@@ -500,8 +609,11 @@ class CausalNOModel(pl.LightningModule):
         # self.log("HFE", high_freq_err, on_epoch=True, prog_bar=True)
         for i, loss_fn in enumerate(self.loss_fn):
             self.log(f"loss_{i}", indiv_losses[i], on_step=True, on_epoch=True, prog_bar=True)
-        self.log("nMSEdt", derivative_loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("AR_steps", int(AR_steps), prog_bar=True)
+        if self.autoencoder:
+            self.log("VAELoss", VAELoss, on_step=True, on_epoch=True, prog_bar=True)
+        else:
+            self.log("nMSEdt", derivative_loss, on_step=True, on_epoch=True, prog_bar=True)
+            self.log("AR_steps", int(AR_steps), prog_bar=True)
         self.log("loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("avg_loss", self.train_loss_avg.compute(), prog_bar=True)
         self.log("RMSE", RMSE, on_step=True, on_epoch=True, prog_bar=True)
@@ -511,7 +623,6 @@ class CausalNOModel(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         inputs, time_idx = batch
         B, T_unroll, C, H, W = inputs.shape
-        n = self.train_config.n_slices
         t_norm = self.train_config.time_normalization
 
         loss = 0.0
@@ -522,39 +633,55 @@ class CausalNOModel(pl.LightningModule):
         num_predictions = 0
         indiv_losses = [0.0] * len(self.loss_fn)
 
-        for t in range(self.warmup):
-            current_time = (time_idx + t) / t_norm
-            _, history = self.model(inputs[:, t, ...], time=current_time, history=history, return_derivative=False)
+        if self.autoencoder:
+            flat_inputs = inputs.view(-1, C, H, W)
+            flat_time = time_idx / t_norm
 
-        for t in range(self.warmup, T_unroll - 1):
-
-            if preds is None:
-                current_input = inputs[:, 0, ...]
-            else:
-                current_input = preds
-
-            # 2. Forward pass.
-            current_time = (time_idx + t + 1) / t_norm
-
-            preds, history = self.model(
-                current_input,
-                time=current_time,
+            preds, _, _ = self.model(
+                flat_inputs,
+                time=flat_time,
                 history=history,
-                return_derivative=False,  # return inpur + derivative*dt
+                timeattention=self.time_attention,
+                # latent_noise=self.train_config.noise_level,
             )
-            targets_t = inputs[:, t + 1, ...]
-            for i, loss_fn in enumerate(self.loss_fn):
-                l = self.loss_weights[i] * loss_fn(preds, targets_t)
-                indiv_losses[i] += l.item()
-                loss = loss + l
 
-            RMSE += torch.sqrt(torch.mean((preds - targets_t) ** 2))
+            RMSE = torch.sqrt(torch.mean((preds - flat_inputs) ** 2))
 
-            num_predictions += 1
+        else:
+            # Build the latent history
+            for t in range(self.warmup):
+                current_time = (time_idx + t) / t_norm
+                _, history, _ = self.model(
+                    inputs[:, t, ...], time=current_time, history=history, timeattention=self.time_attention
+                )
 
-        if num_predictions > 0:
-            loss = loss / num_predictions
-            RMSE = RMSE / num_predictions
+            for t in range(self.warmup, T_unroll - 1):
+                # fully autoregressive rollout
+                if preds is not None:
+                    current_input = preds
+                else:
+                    current_input = inputs[:, t]
+
+                current_time = (time_idx + t) / t_norm
+
+                preds, history, _ = self.model(
+                    current_input, time=current_time, history=history, timeattention=self.time_attention, sampling=False
+                )
+
+                targets_t = inputs[:, t + 1, ...]
+
+                for i, loss_fn in enumerate(self.loss_fn):
+                    l = self.loss_weights[i] * loss_fn(preds, targets_t)
+                    indiv_losses[i] += l.item()
+                    loss = loss + l
+
+                RMSE += torch.sqrt(torch.mean((preds - targets_t) ** 2))
+
+                num_predictions += 1
+
+            if num_predictions > 0:
+                loss = loss / num_predictions
+                RMSE = RMSE / num_predictions
 
         self.log("val_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log("val_RMSE", RMSE, on_step=True, on_epoch=True, prog_bar=True, logger=True)
@@ -631,6 +758,7 @@ class CausalNOModel_old(pl.LightningModule):
 
         indiv_losses = [0] * len(self.loss_fn)
         loss = 0.0
+        derivative_loss = 0.0
 
         # --- MODE AUTO-ENCODEUR  ---
         if getattr(self, "train_mode", "standard") == "autoencoder":
@@ -715,7 +843,7 @@ class CausalNOModel_old(pl.LightningModule):
                         current_input = add_noise(current_input, self.train_config.noise_level)
                     time_weight = 1.0
 
-                target_time = (time_idx + (t + 1)) / t_norm
+                target_time = (time_idx + t) / t_norm
 
                 # Forward pass
                 derivative, history = self.model(
@@ -755,6 +883,7 @@ class CausalNOModel_old(pl.LightningModule):
 
         for i, loss_fn in enumerate(self.loss_fn):
             self.log(f"loss_{i}", indiv_losses[i], on_step=True, on_epoch=True, prog_bar=True)
+
         self.log("RMSE", RMSE, on_step=True, on_epoch=True, prog_bar=True)
         self.log("loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("avg_loss", self.train_loss_avg.compute(), prog_bar=True)
