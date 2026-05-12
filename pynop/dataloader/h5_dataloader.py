@@ -113,58 +113,24 @@ class PDEBenchDataSet(Dataset):
         return (fields + self.shift) * self.scale, torch.Tensor([t0])
 
 
-class PDEBenchDataSet_old(Dataset):
-    """
-    Loads simulation data from an HDF5 file and generates time-unrolled windows.
-    Optionally loads the entire dataset into RAM for faster training.
-    when data is loaded from disk, there can be problems in torch.DataLoader when num_workers>0
+class RDDataSet(Dataset):
 
-    Parameters
-    ----------
-    h5_path : str
-        Path to the HDF5 file containing the simulation data. Each group within the HDF5 file
-        is expected to represent a single simulation run, containing a 'data' key.
-    T_unroll : int, optional
-        The length of the time window (number of timesteps) to extract from each simulation.
-    step : int, optional
-        The stride (step size) used when generating consecutive time windows from a simulation.
-        If None, `step` defaults to `T_unroll`, resulting in non-overlapping windows.
-    format : str, optional
-        Data format specification (currently unused, default is 'pdebench').
-    load_in_ram: bool, Default False
-    split_type: "train", "val" or None (loads all)
-    split_ratio: ratio for the training set
-    n_samples: maximum number of samples
-    seed: for reproductibility
-
-    To generate train/val sets with distincts samples do:
-    train_set = pynop.PDEBenchDataSet(
-    datapath, T_unroll=10, step=10, load_in_ram=True, split_type="train", split_ratio=0.9, n_samples=100, seed=42
-    )
-    val_set = pynop.PDEBenchDataSet(
-        datapath, T_unroll=10, step=10, load_in_ram=True, split_type="val", split_ratio=0.9, n_samples=100, seed=42
-    )
-
-    """
-
+    # Load the field in the data field as well as the porosity field
     def __init__(
         self,
         h5_path,
         T_unroll=10,
         step=None,
         load_in_ram=False,
-        split_type=None,
-        split_ratio=0.8,
-        n_samples=None,
+        indexes=None,
         min_id=0,
         max_id=None,
         shift=0.0,
         scale=1.0,
-        seed=42,
     ):
 
         if T_unroll < 1:
-            print("Warning, T_unroll must ba at least 1. Setting it to 1 to continue")
+            print("Warning: T_unroll must be at least 1. Setting to 1.")
             T_unroll = 1
 
         self.h5_path = h5_path
@@ -173,73 +139,57 @@ class PDEBenchDataSet_old(Dataset):
         self.load_in_ram = load_in_ram
         self.h5file = None
         self.data_dict = {}
+        self.porosity_dict = {}
         self.windows = []
-        self.max_t_idx = 0
         self.shift = self._prepare_transform(shift)
         self.scale = self._prepare_transform(scale)
 
         with h5py.File(h5_path, "r") as f:
-            all_sample_ids = sorted(list(f.keys()))
+            all_keys = list(f.keys())
+            self.sample_ids = indexes if indexes is not None else all_keys
 
-            if split_type is not None:
-                import random
+            for sid in tqdm(self.sample_ids, desc="Scanning samples"):
+                if sid not in f:
+                    continue
 
-                random.seed(seed)
-                random.shuffle(all_sample_ids)
-                if n_samples is not None:
-                    n_samples = min(len(all_sample_ids), n_samples)
-                    all_sample_ids = all_sample_ids[:n_samples]
-
-                n_train = int(len(all_sample_ids) * split_ratio)
-                if split_type == "train":
-                    self.sample_ids = all_sample_ids[:n_train]
-                elif split_type == "val":
-                    self.sample_ids = all_sample_ids[n_train:]
-            else:
-                self.sample_ids = all_sample_ids
-
-            for sid in tqdm(self.sample_ids, desc=f"Scanning {split_type or 'all'}"):
+                # On vérifie la cohérence temporelle entre data et porosity
                 T_total = f[sid]["data"].shape[0]
-                self.max_t_idx = max(self.max_t_idx, T_total)
+                assert f[sid]["porosity"].shape[0] == T_total, f"Time mismatch in {sid}"
 
-                current_max_id = max_id if max_id is not None else T_total
-                current_max_id = min(current_max_id, T_total)
-
+                current_max_id = min(max_id if max_id is not None else T_total, T_total)
                 if (current_max_id - min_id) < T_unroll:
                     continue
 
                 if self.load_in_ram:
+                    # Load main field (T, C, H, W)
                     raw_data = f[sid]["data"][:]
                     self.data_dict[sid] = torch.from_numpy(np.moveaxis(raw_data, -1, 1)).float()
 
-                # Windows in [min_id, current_max_id]
+                    raw_p = f[sid]["porosity"][:]
+                    # Add channel dim if missing: (T, H, W) -> (T, 1, H, W)
+                    p_tensor = torch.from_numpy(raw_p).float()
+                    if p_tensor.ndim == 3:  # (T, H, W)
+                        p_tensor = p_tensor.unsqueeze(1)
+                    elif p_tensor.ndim == 4:  # (T, H, W, C)
+                        p_tensor = p_tensor.permute(0, 3, 1, 2)
+                    self.porosity_dict[sid] = p_tensor
+
                 limit_t0 = current_max_id - T_unroll
                 for t0 in range(min_id, limit_t0 + 1, self.step):
                     self.windows.append((sid, t0))
 
-        print(f"Split {split_type}: {len(self.sample_ids)} simulations")
-        print(f"Total unrolled windows: {len(self.windows)}")
-        if self.load_in_ram:
-            print("Status: All data loaded in RAM.")
-        else:
-            print("Status: Reading from Disk (Lazy Loading).")
-
     def _prepare_transform(self, val):
-
         if isinstance(val, (list, np.ndarray, torch.Tensor)):
             tensor_val = torch.as_tensor(val).float()
-            # Si c'est un vecteur de taille C, on reshape en (1, C, 1, 1)
             if tensor_val.ndim == 1:
                 return tensor_val.view(1, -1, 1, 1)
             return tensor_val
-        # Si c'est un simple flottant, le broadcasting standard fera l'affaire
         return val
 
     def __len__(self):
         return len(self.windows)
 
     def _init_h5(self):
-        """Initialise le file handle pour le multi-processing (Disk mode uniquement)."""
         if self.h5file is None and not self.load_in_ram:
             self.h5file = h5py.File(self.h5_path, "r", swmr=True)
 
@@ -247,14 +197,23 @@ class PDEBenchDataSet_old(Dataset):
         sid, t0 = self.windows[idx]
 
         if self.load_in_ram:
-            # --- RAM ---
             fields = self.data_dict[sid][t0 : t0 + self.T_unroll]
+            p = self.porosity_dict[sid][t0 : t0 + self.T_unroll]
+            fields = torch.cat([fields, p], dim=1)  # Concat on Channel dim
         else:
-            # --- DISK ---
             self._init_h5()
-            fields = self.h5file[sid]["data"][t0 : t0 + self.T_unroll]
-            # (T, X, Y, C) -> (T, C, X, Y)
-            fields = torch.from_numpy(np.moveaxis(fields, -1, 1)).float()
+            # Get data slice
+            raw_f = self.h5file[sid]["data"][t0 : t0 + self.T_unroll]
+            fields = torch.from_numpy(np.moveaxis(raw_f, -1, 1)).float()
+
+            raw_p = self.h5file[sid]["porosity"][t0 : t0 + self.T_unroll]
+            p = torch.from_numpy(raw_p).float()
+            # Handle axis movement according to shape
+            if p.ndim == 3:  # (T_unroll, H, W)
+                p = p.unsqueeze(1)
+            else:  # (T_unroll, H, W, C)
+                p = p.permute(0, 3, 1, 2)
+            fields = torch.cat([fields, p], dim=1)
 
         return (fields + self.shift) * self.scale, torch.Tensor([t0])
 
