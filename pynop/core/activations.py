@@ -4,7 +4,6 @@ from torch import nn
 import torch
 import torch.nn.functional as F
 
-
 ACT_DICT: dict[str, type] = {
     "relu": nn.ReLU,
     "relu6": nn.ReLU6,
@@ -37,6 +36,7 @@ class ModReLU(nn.Module):
         scale = F.relu(mag + self.bias) / (mag + self.eps)
         return z * scale
 
+
 class TaylorSoftmax(nn.Module):
     def __init__(self, dim=-1, order=2):
         super().__init__()
@@ -65,6 +65,7 @@ class TaylorSoftmax(nn.Module):
         # 3. Normalize
         return poly / poly.sum(dim=self.dim, keepdim=True)
 
+
 class Sine(nn.Module):
     """Sinusoidal activation with scaling"""
 
@@ -87,7 +88,12 @@ def gumbel_softmax(logits: torch.Tensor, tau: Union[torch.Tensor, float] = 1.0, 
     y = F.softmax(y, dim=dim)
 
     if hard:
-        _, y_hard = y.max(dim=dim)
-        y_one_hot = torch.zeros_like(y).scatter_(dim, y_hard.unsqueeze(dim), 1.0)
-        y = (y_one_hot - y).detach() + y  # detach because argmax is non differentiable
+        # Straight-Through estimator
+        # Keepdim=True simplifies the tensor alignment for scatter
+        _, max_indices = y.max(dim=dim, keepdim=True)
+        y_one_hot = torch.zeros_like(y).scatter_(dim, max_indices, 1.0)
+
+        # Forward uses y_one_hot, Backward uses y gradients
+        y = (y_one_hot - y).detach() + y
+
     return y
