@@ -101,35 +101,39 @@ class FNO(nn.Module):
         for i, channels in enumerate(hidden_channels):
             in_channels = hidden_channels[0] if i == 0 else hidden_channels[i - 1]
             block = REGISTERED_FNO.get(blocks[i], FNOBlock)
-            if spectral_compression_factor is not None:
+            if spectral_layer_type == "tucker":
+                if spectral_compression_factor is None:
+                    ranks = (1, 1, 1)
                 ranks = [in_channels, channels, np.prod(modes)]
                 ranks = np.ceil(np.divide(ranks, spectral_compression_factor)).astype(int)
-            else:
-                ranks = None
-            self.ops.append(
-                block(
-                    in_channels=in_channels,
-                    out_channels=channels,
-                    modes=modes,
-                    activation=activation,
-                    normalization=norm,
-                    spectral_layer_type=spectral_layer_type,
-                    ranks=ranks,
-                    **block_kwargs,  # Additional keyword arguments for the block
+                self.ops.append(
+                    block(
+                        in_channels=in_channels,
+                        out_channels=channels,
+                        modes=modes,
+                        activation=activation,
+                        normalization=norm,
+                        spectral_layer_type=spectral_layer_type,
+                        ranks=ranks,
+                        **block_kwargs,  # Additional keyword arguments for the block
+                    )
                 )
-            )
+            else:
+                self.ops.append(
+                    block(
+                        in_channels=in_channels,
+                        out_channels=channels,
+                        modes=modes,
+                        activation=activation,
+                        normalization=norm,
+                        spectral_layer_type=spectral_layer_type,
+                        **block_kwargs,  # Additional keyword arguments for the block
+                    )
+                )
 
         self.projection = nn.Conv2d(hidden_channels[-1], out_channels, 1, bias=True)
 
-    def forward(self, x, return_derivative=True, **kwargs):
-
-        if not return_derivative:
-            if self.in_channels > self.out_channels:
-                shortcut = x[:, -self.out_channels :, ...]
-            elif self.in_channels == self.out_channels:
-                shortcut = x
-            else:
-                return_derivative = True
+    def forward(self, x):
 
         if self.fixed_pos_encoding:
             x = self.grid_encoding(x)
@@ -147,7 +151,4 @@ class FNO(nn.Module):
 
         x = self.projection(x)
 
-        if return_derivative:
-            return x
-        else:
-            return x * self.dt + shortcut
+        return x
