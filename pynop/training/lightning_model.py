@@ -5,13 +5,15 @@ import torch.optim as optim
 import torch.nn.functional as F
 from pathlib import Path
 import os
+import copy
 import json
 from typing import Any, Iterable
 from torchmetrics import MeanMetric
 from pytorch_lightning.callbacks import ModelCheckpoint
 from dataclasses import dataclass, asdict
 from ..core import add_noise
-from ..core.loss import DWMSELoss, NormalizedTimeDerivativeMSE
+from ..core.loss import DWMSELoss, NormalizedTimeDerivativeMSE, SIGReg, preprocess_to_sigreg, SpectralLoss, SobolevLoss
+from ..core.utils import sample_square_crop_boxes, apply_square_crop, make_inpainted_input
 
 default_scheduler_config = [
     {
@@ -30,6 +32,7 @@ default_opt_config = {"optimizer": "AdamW", "lr": 1e-3, "betas": (0.9, 0.999), "
 
 @dataclass
 class TrainingConfig:
+    dt: float = 1
     start_autoregressive: Any = None  # start o fthe autoregressive training
     final_autoregressive: Any = None  # epoch at which the number of autoregressive steps is maximum
     min_autoregressive_steps: int = 0  # minimum number of autoregressive steps (after start_autoregressive epochs)
@@ -40,12 +43,10 @@ class TrainingConfig:
     loss_weights: Any = 1.0
     noise_level: float = 0  # no noise if 0
     time_normalization: float = 1
-    n_slices: int = 2  # Only for MultiStepModel
+    n_slices: int = 2  # Number of slices in a single sample
     temporal_weighting: float = (
         1.2  # Increase loss with the timestep during autoregressive training: temporal_weighting**timestep
     )
-    train_mode: str = "prediction"  # if "autoencoder", train only the enocder/decoer part in CausalLNO
-    VAELoss_weight: float = 1e-4  # Only for VAE training (if train_mode="autoencoder")
 
     def to_json_dict(self):
         def serialize_value(v):
@@ -81,26 +82,6 @@ class CurriculumCheckpoint(ModelCheckpoint):
             super().on_validation_end(trainer, pl_module)
 
 
-def jacobian_regularization(model_input, derivative, n_projections=1):
-    reg = 0.0
-    for _ in range(n_projections):
-        v = torch.randn_like(derivative)
-
-        # JVP: Calcule le gradient de (derivative * v) par rapport a model_input
-        jvp = torch.autograd.grad(
-            outputs=derivative,
-            inputs=model_input,
-            grad_outputs=v,
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True,
-        )[0]
-
-        reg += torch.mean(jvp**2)
-
-    return reg / n_projections
-
-
 class MultiStepNOModel(pl.LightningModule):
 
     def __init__(
@@ -114,6 +95,7 @@ class MultiStepNOModel(pl.LightningModule):
         self.model = model
         self.train_config = train_config
         self.optimizer = optimizer
+        self.dt = train_config.dt
         self.scheduler_config = scheduler_config
         self.loss_fn = self.train_config.loss_fn if self.train_config.loss_fn is not None else []
         self.derivative_loss_weight = self.train_config.derivative_loss_weight
@@ -184,25 +166,6 @@ class MultiStepNOModel(pl.LightningModule):
         n = self.train_config.n_slices
         t_norm = self.train_config.time_normalization
 
-        # epoch = self.current_epoch
-        # max_AR_steps = int(min(T_unroll - n, self.train_config.max_autoregressive_steps))
-        # min_AR_steps = max(self.train_config.min_autoregressive_steps, 0)
-        # min_AR_steps = int(min(min_AR_steps, T_unroll - n))
-
-        # if self.train_config.start_autoregressive is not None and self.train_config.final_autoregressive is not None:
-        #     nint = max_AR_steps - min_AR_steps + 1
-        #     delta = (self.train_config.final_autoregressive - self.train_config.start_autoregressive) // nint
-        #     if epoch < self.train_config.start_autoregressive:
-        #         AR_steps = min_AR_steps
-        #     elif delta > 0:
-        #         AR_steps = int(
-        #             min(max(min_AR_steps + (epoch - self.train_config.start_autoregressive) // delta, 0), max_AR_steps)
-        #         )
-        #     else:
-        #         AR_steps = max_AR_steps
-        # else:
-        #     AR_steps = min_AR_steps
-
         epoch = self.current_epoch
         max_AR_steps = int(min(T_unroll - n - 1, self.train_config.max_autoregressive_steps))
         min_AR_steps = max(self.train_config.min_autoregressive_steps, 0)
@@ -230,6 +193,7 @@ class MultiStepNOModel(pl.LightningModule):
         AR_preds = 0
         gamma = self.train_config.temporal_weighting
         time_weighting_factor = 1
+        ARmode = False
 
         indiv_losses = [0] * (len(self.loss_fn))
         derivative_loss = 0
@@ -256,14 +220,12 @@ class MultiStepNOModel(pl.LightningModule):
                 time_weighting_factor = 1.0
 
             # Forward pass
-            current_time = (time_idx + (t + 1)) / t_norm
-
             model_input = current_input.reshape(B, -1, H, W)
 
-            derivative = self.model(model_input, time=current_time, return_derivative=True)
+            derivative = self.model(model_input)
 
             # compute the function at t+dt
-            preds = current_input[:, -1, ...] + self.model.dt * derivative
+            preds = current_input[:, -1, ...] + self.dt * derivative
 
             targets_t = inputs[:, t + 1, ...]
 
@@ -271,17 +233,17 @@ class MultiStepNOModel(pl.LightningModule):
             for i, loss_fn in enumerate(self.loss_fn):
                 l = time_weighting_factor * self.loss_weights[i] * loss_fn(preds, targets_t)
                 # l = time_weighting_factor * self.loss_weights[i] * loss_fn(preds, delta)
-                indiv_losses[i] += l.item()
-                loss += l
+                indiv_losses[i] = indiv_losses[i] + l.item()
+                loss = loss + l
 
             # # loss over the derivative
             l = (
                 time_weighting_factor
                 * self.derivative_loss_weight
-                * self.derivative_loss_fn(derivative, targets_t, current_input[:, -1, ...], self.model.dt)
+                * self.derivative_loss_fn(derivative, targets_t, current_input[:, -1, ...], self.dt)
             )
-            derivative_loss += l.item()
-            loss += l
+            derivative_loss = derivative_loss + l.item()
+            loss = loss + l
 
             with torch.no_grad():
                 temp_RMSE = torch.sqrt(torch.mean((preds - targets_t) ** 2))
@@ -341,9 +303,7 @@ class MultiStepNOModel(pl.LightningModule):
                 current_input = torch.cat([current_input[:, 1:, ...], preds.unsqueeze(1)], dim=1)
 
             # 2. Forward pass.
-            current_time = (time_idx + t + 1) / t_norm
-
-            preds = self.model(current_input.view(B, -1, H, W), time=current_time, return_derivative=False)
+            preds = self.model(current_input.view(B, -1, H, W)) * self.dt + current_input[:, -1, ...]
 
             targets_t = inputs[:, t + 1, ...]
             for i, loss_fn in enumerate(self.loss_fn):
@@ -354,7 +314,6 @@ class MultiStepNOModel(pl.LightningModule):
             mse_per_sample = torch.mean((preds - targets_t) ** 2, dim=[1, 2, 3])
             rmse_per_sample = torch.sqrt(mse_per_sample)
             RMSE += torch.mean(rmse_per_sample)
-            # RMSE += torch.sqrt(torch.mean((preds - targets_t) ** 2))
 
             num_predictions += 1
 
@@ -576,11 +535,11 @@ class CausalNOModel(pl.LightningModule):
                     loss += l
 
                 # derivative loss
-                derivative = (preds - current_input) / self.model.dt
+                derivative = (preds - current_input) / self.dt
                 l = (
                     time_weighting_factor
                     * self.derivative_loss_weight
-                    * self.derivative_loss_fn(derivative, target, current_input, self.model.dt)
+                    * self.derivative_loss_fn(derivative, target, current_input, self.dt)
                 )
                 derivative_loss += l.item()
                 loss += l
@@ -689,13 +648,47 @@ class CausalNOModel(pl.LightningModule):
         return loss
 
 
-class CausalNOModel_old(pl.LightningModule):
+@dataclass
+class AETrainingConfig:
+
+    sigreg_weight: float = 0.3
+    mse_weight: float = 1
+    mae_weight: float = 1
+    crop_ratio: float = 0.15
+    inpaint_mask_ratio: float = 0.35
+    sobolev_weight: float = 0
+    spectral_weight: float = 0
+
+    def to_json_dict(self):
+        def serialize_value(v):
+            # Handle lists or tuples recursively
+            if isinstance(v, (list, tuple)):
+                return [serialize_value(i) for i in v]
+
+            # Handle classes or types
+            if callable(v) or isinstance(v, type):
+                return v.__name__ if hasattr(v, "__name__") else v.__class__.__name__
+
+            # Handle custom class instances
+            if hasattr(v, "__class__") and type(v).__module__ != "builtins":
+                return v.__class__.__name__
+
+            return v
+
+        return {k: serialize_value(v) for k, v in asdict(self).items()}
+
+    def save(self, path: str):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.to_json_dict(), f, indent=4)
+
+
+class AutoEncoderModel(pl.LightningModule):
 
     def __init__(
         self,
         model,
         optimizer,
-        train_config=TrainingConfig(),
+        train_config=AETrainingConfig(),
         scheduler_config=None,
     ):
         super().__init__()
@@ -703,16 +696,37 @@ class CausalNOModel_old(pl.LightningModule):
         self.train_config = train_config
         self.optimizer = optimizer
         self.scheduler_config = scheduler_config
-        self.loss_fn = self.train_config.loss_fn
-        self.loss_weights = self.train_config.loss_weights
-        self.detach_every_k = self.train_config.detach_grad_steps
+        self.inpaint_mask_ratio = train_config.inpaint_mask_ratio
+        self.sigreg_weight = train_config.sigreg_weight
+        self.mse_weight = train_config.mse_weight
+        self.mae_weight = train_config.mae_weight
+        self.sigreg_loss_func = SIGReg()
+        self.crop_ratio = train_config.crop_ratio
+
+        self.spectral_loss_fun = SpectralLoss(beta=2)
+        self.sobolev_loss_fun = SobolevLoss(l1=1.0, l2=1.0)
+        self.sobolev_weigth = train_config.sobolev_weight
+        self.spectral_weigth = train_config.spectral_weight
+
+        self.frozen_model = copy.deepcopy(model)
+
+        print(f"Loss weight: \nMAE {self.mae_weight:.2e}\nMSE {self.mse_weight:.2e}\nSIGReg {self.sigreg_weight:.2e}\n")
+
+        for param in self.frozen_model.parameters():
+            param.requires_grad_(False)
+        self.frozen_model.eval()
+
         self.train_loss_avg = MeanMetric()
-        self.warmup = min(train_config.n_slices, self.model.max_history)
-        self.train_mode = train_config.train_mode
-        self.derivative_loss_weight = self.train_config.derivative_loss_weight
 
     def forward(self, x, training=True, **kwargs):
-        return self.model(x, training=training, residual=False, **kwargs)
+        return self.model(x, training=training, **kwargs)
+
+    def crop_resize_views(self, images, clean_recon, masked_recon):
+        top, left, crop_size = sample_square_crop_boxes(images, crop_ratio=self.crop_ratio)
+        crop_images = apply_square_crop(images, top, left, crop_size)
+        crop_clean_recon = apply_square_crop(clean_recon, top, left, crop_size)
+        crop_masked_recon = apply_square_crop(masked_recon, top, left, crop_size)
+        return crop_images, crop_clean_recon, crop_masked_recon
 
     def configure_optimizers(self):
 
@@ -746,229 +760,417 @@ class CausalNOModel_old(pl.LightningModule):
         else:
             return self.optimizer
 
+    def judge_encode(self, x):
+        return self.frozen_model.encode(x)
+
+    def sync_frozen_model(self):
+        self.frozen_model.load_state_dict(self.model.state_dict())
+        self.frozen_model.eval()
+
     def on_train_epoch_start(self):
         self.train_loss_avg.reset()
 
     def training_step(self, batch, batch_idx):
         inputs, time_idx = batch
-
         B, T_unroll, C, H, W = inputs.shape
-        n = self.train_config.n_slices
-        t_norm = self.train_config.time_normalization
 
-        indiv_losses = [0] * len(self.loss_fn)
         loss = 0.0
-        derivative_loss = 0.0
+        RMSE = 0.0
 
-        # --- MODE AUTO-ENCODEUR  ---
-        if getattr(self, "train_mode", "standard") == "autoencoder":
-            # Flattening the sequence
-            # [B, T, C, H, W] -> [B*T, C, H, W]
-            x_flat = inputs.view(-1, C, H, W)
+        images = inputs.reshape(-1, C, H, W)
+        masked_images = make_inpainted_input(images, mask_ratio=self.inpaint_mask_ratio)
 
-            # We need a time tensor, even if it's not used by the autoencoder model
-            dummy_time = torch.zeros((B * T_unroll, 1), device=inputs.device)
+        z_clean, w = self.model.encode(images)
+        clean_recon = self.model.decode(z_clean, w, H, W)
+        z_masked, w = self.model.encode(masked_images)
+        masked_recon = self.model.decode(z_masked, w, H, W)
 
-            # Forward pass without any history and without residual
-            preds, _ = self.model(x_flat, time=dummy_time, history=None, autoencoder=True, residual=False)
-
+        if self.mse_weight > 0:
+            clean_recon_z = self.judge_encode(clean_recon)[0]
+            masked_recon_z = self.judge_encode(masked_recon)[0]
+            crop_images, crop_clean_recon, crop_masked_recon = self.crop_resize_views(images, clean_recon, masked_recon)
             with torch.no_grad():
-                RMSE = torch.sqrt(torch.mean((preds - x_flat) ** 2))
+                target_z = self.judge_encode(crop_images)[0]
 
-            for i, loss_fn in enumerate(self.loss_fn):
-                l = self.loss_weights[i] * loss_fn(preds, x_flat)
-                indiv_losses[i] += l.item()
-                loss += l
-
+            consistency_loss = F.mse_loss(clean_recon_z, masked_recon_z)
+            clean_crop_loss = F.mse_loss(target_z, self.judge_encode(crop_clean_recon)[0])
+            masked_crop_loss = F.mse_loss(target_z, self.judge_encode(crop_masked_recon)[0])
+            mse_loss = self.mse_weight * (consistency_loss + clean_crop_loss + masked_crop_loss) / 3
         else:
-            epoch = self.current_epoch
-            max_AR_steps = int(min(T_unroll - n, self.train_config.max_autoregressive_steps))
-            min_AR_steps = max(self.train_config.min_autoregressive_steps, 0)
-            min_AR_steps = int(min(min_AR_steps, T_unroll - n))
+            mse_loss = 0
 
-            if (
-                self.train_config.start_autoregressive is not None
-                and self.train_config.final_autoregressive is not None
-            ):
-                nint = max_AR_steps - min_AR_steps + 1
-                delta = (self.train_config.final_autoregressive - self.train_config.start_autoregressive) // nint
-                if epoch < self.train_config.start_autoregressive:
-                    AR_steps = min_AR_steps
-                elif delta > 0:
-                    AR_steps = int(
-                        min(
-                            max(min_AR_steps + (epoch - self.train_config.start_autoregressive) // delta, 0),
-                            max_AR_steps,
-                        )
-                    )
-                else:
-                    AR_steps = max_AR_steps
-            else:
-                AR_steps = min_AR_steps
-
-            # MODE PREDICTION ----------------------------------
-
-            RMSE = 0.0
-            preds = None
-            history = None  # <--- Initialize Latent History
-            num_predictions = 0
-            AR_count = 0
-            gamma = self.train_config.temporal_weighting
-
-            # --- PHASE 1: WARM-UP (No Loss) ---
-            # Encode ground truth frames into latent history
-
-            for t in range(self.warmup):
-                current_time = (time_idx + t) / t_norm
-                # We only care about the updated history here
-                with torch.no_grad():  # Optional: disable grads for warm-up to save memory
-                    _, history = self.model(
-                        inputs[:, t, ...], time=current_time, history=history, residual=self.train_config.residual
-                    )
-
-            # --- PHASE 2: PREDICTION LOOP ---
-            # Start predicting from the first frame after warm-up
-            for t in range(self.warmup, T_unroll - 1):
-
-                # Decide between Teacher Forcing and AR
-                is_ar = num_predictions >= (T_unroll - 1 - self.warmup - AR_steps) and preds is not None
-
-                if is_ar:
-                    current_input = preds
-                    AR_count += 1
-                    time_weight = gamma**AR_count
-                else:
-                    current_input = inputs[:, t, ...]
-                    if self.train_config.noise_level > 0:
-                        current_input = add_noise(current_input, self.train_config.noise_level)
-                    time_weight = 1.0
-
-                target_time = (time_idx + t) / t_norm
-
-                # Forward pass
-                derivative, history = self.model(
-                    current_input,
-                    time=target_time,
-                    history=history,
-                    return_derivative=True,
+        mae = self.mae_weight * 0.5 * (F.l1_loss(images, clean_recon) + F.l1_loss(images, masked_recon))
+        t_norm = torch.norm(images, p=2, dim=(-3, -2, -1))
+        mae = (
+            self.mae_weight
+            # * 0.5
+            * (
+                torch.mean(torch.norm(clean_recon - images, p=2, dim=(-3, -2, -1)) / t_norm)
+                # + torch.mean(torch.norm(masked_recon - images, p=2, dim=(-3, -2, -1)) / t_norm)
+            )
+        )
+        sigreg_loss = 0
+        if self.sigreg_weight > 0:
+            sigreg_loss = (
+                self.sigreg_weight
+                * 0.5
+                * (
+                    self.sigreg_loss_func(preprocess_to_sigreg(z_clean))
+                    + self.sigreg_loss_func(preprocess_to_sigreg(z_masked))
                 )
+            )
 
-                # print(t, batch_idx, torch.isnan(preds).any(), torch.isnan(history).any())
-                targets_t = inputs[:, t + 1, ...]
-                for i, loss_fn in enumerate(self.loss_fn):
-                    l = time_weight * self.loss_weights[i] * loss_fn(preds, targets_t)
-                    indiv_losses[i] += l.item()
-                    loss = loss + l
-                # loss += self.loss_fn(preds - model_input[:, -2:, ...], targets_t - model_input[:, -2:, ...])
+        sobolev_loss = (
+            self.sobolev_weigth * self.sobolev_loss_fun(images, clean_recon) if self.sobolev_weigth > 0 else 0
+        )
+        spectral_loss = (
+            self.spectral_weigth * self.spectral_loss_fun(images, clean_recon) if self.spectral_weigth > 0 else 0
+        )
 
-                with torch.no_grad():
-                    RMSE += torch.sqrt(torch.mean((preds - targets_t) ** 2))
-
-                num_predictions += 1
-
-                # Troncature des gradients (BPTT)
-                if AR_count % self.detach_every_k == 0:
-                    preds = preds.detach()
-
-            if num_predictions > 0:
-                loss = loss / num_predictions
-                with torch.no_grad():
-                    RMSE = RMSE / num_predictions
-                    for i, _ in enumerate(indiv_losses):
-                        indiv_losses[i] = indiv_losses[i] / num_predictions
-
-            self.log("AR_steps", int(AR_steps), prog_bar=True)
+        loss = mse_loss + sigreg_loss + mae + sobolev_loss + spectral_loss
 
         self.train_loss_avg.update(loss)
 
-        for i, loss_fn in enumerate(self.loss_fn):
-            self.log(f"loss_{i}", indiv_losses[i], on_step=True, on_epoch=True, prog_bar=True)
+        with torch.no_grad():
+            RMSE = torch.sqrt(torch.mean((clean_recon - images) ** 2)) / images.shape[0]
 
-        self.log("RMSE", RMSE, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        if self.mae_weight > 0:
+            self.log(f"mae", mae.item(), on_step=True, on_epoch=True, prog_bar=True)
+        if self.mse_weight > 0:
+            self.log(f"consistency_loss", consistency_loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log(f"clean_crop_loss", clean_crop_loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log(f"masked_crop_loss", masked_crop_loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log(f"total_mse_loss", mse_loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+        if self.sigreg_weight > 0:
+            self.log(f"sigreg_loss", sigreg_loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+        if self.sobolev_weigth > 0:
+            self.log("sobolev_loss", sobolev_loss, on_step=True, on_epoch=True, prog_bar=True)
+        if self.spectral_weigth > 0:
+            self.log("spectral_loss", spectral_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("total_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("avg_loss", self.train_loss_avg.compute(), prog_bar=True)
+        self.log(f"RMSE", RMSE.item(), on_step=True, on_epoch=True, prog_bar=True)
         self.log("lr", self.optimizer.param_groups[0]["lr"], prog_bar=True)
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        # Triggered strictly after backward and optimizer.step()
+        self.sync_frozen_model()
 
+    def validation_step(self, batch, batch_idx):
         inputs, time_idx = batch
         B, T_unroll, C, H, W = inputs.shape
-        t_norm = self.train_config.time_normalization
 
-        indiv_losses = [0] * len(self.loss_fn)
         loss = 0.0
 
-        # --- MODE AUTO-ENCODEUR (Phase 1) ---
-        if getattr(self, "train_mode", "standard") == "autoencoder":
-            # On traite toutes les frames du batch comme des exemples indépendants
-            # [B, T, C, H, W] -> [B*T, C, H, W]
-            x_flat = inputs.view(-1, C, H, W)
+        images = inputs.reshape(-1, C, H, W)
+        masked_images = make_inpainted_input(images, mask_ratio=self.inpaint_mask_ratio)
 
-            # We need a time tensor, even if it's not used by the autoencoder model
-            dummy_time = torch.zeros((B * T_unroll, 1), device=inputs.device)
+        z_clean, w = self.model.encode(images)
+        clean_recon = self.model.decode(z_clean, w, H, W)
+        z_masked, w = self.model.encode(masked_images)
+        masked_recon = self.model.decode(z_masked, w, H, W)
 
-            # Forward pass without any history
-            preds, _ = self.model(x_flat, time=dummy_time, history=None, autoencoder=True, residual=False)
-            RMSE = torch.sqrt(torch.mean((preds - x_flat) ** 2))
-
-            loss = 0.0
-            for i, loss_fn in enumerate(self.loss_fn):
-                l = self.loss_weights[i] * loss_fn(preds, x_flat)
-                indiv_losses[i] += l.item()
-                loss += l
-
+        if self.mse_weight > 0:
+            clean_recon_z = self.judge_encode(clean_recon)[0]
+            masked_recon_z = self.judge_encode(masked_recon)[0]
+            crop_images, crop_clean_recon, crop_masked_recon = self.crop_resize_views(images, clean_recon, masked_recon)
+            target_z = self.judge_encode(crop_images)[0]
+            consistency_loss = F.mse_loss(clean_recon_z, masked_recon_z)
+            clean_crop_loss = F.mse_loss(target_z, self.judge_encode(crop_clean_recon)[0])
+            masked_crop_loss = F.mse_loss(target_z, self.judge_encode(crop_masked_recon)[0])
+            mse_loss = self.mse_weight * (consistency_loss + clean_crop_loss + masked_crop_loss) / 3
         else:
-
-            RMSE = 0.0
-            preds = None
-            history = None
-            num_predictions = 0
-            # fil the history with the latent representation of past timesteps
-            for t in range(self.warmup):
-                current_time = (time_idx + t) / t_norm
-                _, history = self.model(
-                    inputs[:, t, ...], time=current_time, history=history, residual=self.train_config.residual
+            mse_loss = 0
+        sigreg_loss = 0
+        if self.sigreg_weight > 0:
+            sigreg_loss = (
+                self.sigreg_weight
+                * 0.5
+                * (
+                    self.sigreg_loss_func(preprocess_to_sigreg(z_clean))
+                    + self.sigreg_loss_func(preprocess_to_sigreg(z_masked))
                 )
+            )
+        mae = self.mae_weight * 0.5 * (F.l1_loss(images, clean_recon) + F.l1_loss(images, masked_recon))
+        sobolev_loss = (
+            self.sobolev_weigth * self.sobolev_loss_fun(images, clean_recon) if self.sobolev_weigth > 0 else 0
+        )
+        spectral_loss = (
+            self.spectral_weigth * self.spectral_loss_fun(images, clean_recon) if self.spectral_weigth > 0 else 0
+        )
 
-            for t in range(self.warmup, T_unroll - 1):
+        loss = mse_loss + sigreg_loss + mae + sobolev_loss + spectral_loss
 
-                if preds is None:
-                    current_input = inputs[:, 0, ...]
-                else:
-                    current_input = preds
+        with torch.no_grad():
+            RMSE = torch.sqrt(torch.mean((clean_recon - images) ** 2)) / images.shape[0]
 
-                # 2. Forward pass.
-                current_time = (time_idx + t + 1) / t_norm
+        if self.mse_weight > 0:
+            self.log(f"val_consistency_loss", consistency_loss.item(), on_step=False, on_epoch=True, prog_bar=True)
+            self.log(f"val_clean_crop_loss", clean_crop_loss.item(), on_step=False, on_epoch=True, prog_bar=True)
+            self.log(f"val_masked_crop_loss", masked_crop_loss.item(), on_step=False, on_epoch=True, prog_bar=True)
+            self.log(f"val_total_mse_loss", mse_loss.item(), on_step=False, on_epoch=True, prog_bar=True)
+        if self.sigreg_weight > 0:
+            self.log(f"val_sigreg_loss", sigreg_loss.item(), on_step=False, on_epoch=True, prog_bar=True)
+        if self.mae_weight > 0:
+            self.log(f"val_mae", mae.item(), on_step=False, on_epoch=True, prog_bar=True)
+        if self.sobolev_weigth > 0:
+            self.log("val_sobolev_loss", sobolev_loss, on_step=False, on_epoch=True, prog_bar=True)
+        if self.spectral_weigth > 0:
+            self.log("val_spectral_loss", spectral_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log(f"val_RMSE", RMSE.item(), on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val_total_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
 
-                preds, history = self.model(
-                    current_input,
-                    time=current_time,
-                    history=history,  # <--- Pass the history
-                    residual=self.train_config.residual,
+        return loss
+
+
+class AutoEncoderModelv2(pl.LightningModule):
+
+    def __init__(
+        self,
+        model,
+        optimizer,
+        train_config=AETrainingConfig(),
+        scheduler_config=None,
+    ):
+        super().__init__()
+        self.model = model
+        self.train_config = train_config
+        self.optimizer = optimizer
+        self.scheduler_config = scheduler_config
+        self.inpaint_mask_ratio = train_config.inpaint_mask_ratio
+        self.sigreg_weight = train_config.sigreg_weight
+        self.mse_weight = train_config.mse_weight
+        self.mae_weight = train_config.mae_weight
+        self.sigreg_loss_func = SIGReg()
+        self.crop_ratio = train_config.crop_ratio
+
+        self.spectral_loss_fun = SpectralLoss(beta=2)
+        self.sobolev_loss_fun = SobolevLoss(l1=1.0, l2=1.0)
+        self.sobolev_weigth = train_config.sobolev_weight
+        self.spectral_weigth = train_config.spectral_weight
+
+        self.frozen_model = copy.deepcopy(model)
+
+        print(f"Loss weight: \nMAE {self.mae_weight:.2e}\nMSE {self.mse_weight:.2e}\nSIGReg {self.sigreg_weight:.2e}\n")
+
+        for param in self.frozen_model.parameters():
+            param.requires_grad_(False)
+        self.frozen_model.eval()
+
+        self.train_loss_avg = MeanMetric()
+
+    def forward(self, x, training=True, **kwargs):
+        return self.model(x, training=training, **kwargs)
+
+    def crop_resize_views(self, images, clean_recon, masked_recon):
+        top, left, crop_size = sample_square_crop_boxes(images, crop_ratio=self.crop_ratio)
+        crop_images = apply_square_crop(images, top, left, crop_size)
+        crop_clean_recon = apply_square_crop(clean_recon, top, left, crop_size)
+        crop_masked_recon = apply_square_crop(masked_recon, top, left, crop_size)
+        return crop_images, crop_clean_recon, crop_masked_recon
+
+    def configure_optimizers(self):
+
+        # Configure the schedulers if given self.scheduler_config
+        # Else return optimizers (can be a list of optimizers)
+
+        # Schedulers
+        schedulers = []
+        if hasattr(self, "scheduler_config") and self.scheduler_config:
+            for sch_cfg in self.scheduler_config:
+                sch_cfg = dict(sch_cfg)  # copy
+                sch_class = sch_cfg.pop("scheduler")
+                # Get scheduler params
+                lightning_keys = ["interval", "monitor", "frequency", "strict"]
+                lightning_params = {k: sch_cfg.pop(k) for k in lightning_keys if k in sch_cfg}
+                scheduler = sch_class(self.optimizer, **sch_cfg)
+
+                # Lightning scheduler dict
+                sch_dict = {"scheduler": scheduler}
+                # Set scheduler params
+                sch_dict["interval"] = lightning_params.get("interval", "epoch")
+                if "monitor" in lightning_params:
+                    sch_dict["monitor"] = lightning_params["monitor"]
+                sch_dict["frequency"] = lightning_params.get("frequency", 1)
+                sch_dict["strict"] = lightning_params.get("strict", True)
+                schedulers.append(sch_dict)
+
+        if schedulers:
+            # returns a list of dict in the "lr_scheduler" key
+            return [self.optimizer], schedulers
+        else:
+            return self.optimizer
+
+    def judge_encode(self, x):
+        return self.frozen_model.encode(x)
+
+    def sync_frozen_model(self):
+        self.frozen_model.load_state_dict(self.model.state_dict())
+        self.frozen_model.eval()
+
+    def on_train_epoch_start(self):
+        self.train_loss_avg.reset()
+
+    def training_step(self, batch, batch_idx):
+        inputs, time_idx = batch
+        B, T_unroll, C, H, W = inputs.shape
+
+        loss = 0.0
+        RMSE = 0.0
+
+        h_coords = torch.linspace(-1, 1, H, device=inputs.device)
+        w_coords = torch.linspace(-1, 1, W, device=inputs.device)
+        grid_h, grid_w = torch.meshgrid(h_coords, w_coords, indexing="ij")
+        out_coords = torch.stack([grid_h, grid_w], dim=-1).unsqueeze(0)
+
+        images = inputs.reshape(-1, C, H, W)
+        masked_images = make_inpainted_input(images, mask_ratio=self.inpaint_mask_ratio)
+
+        z_clean = self.model.encode(images)
+        clean_recon = self.model.decode(z_clean, out_coords)
+        z_masked = self.model.encode(masked_images)
+        masked_recon = self.model.decode(z_masked, out_coords)
+
+        if self.mse_weight > 0:
+            clean_recon_z = self.judge_encode(clean_recon)[0]
+            masked_recon_z = self.judge_encode(masked_recon)[0]
+            crop_images, crop_clean_recon, crop_masked_recon = self.crop_resize_views(images, clean_recon, masked_recon)
+            with torch.no_grad():
+                target_z = self.judge_encode(crop_images)[0]
+
+            consistency_loss = F.mse_loss(clean_recon_z, masked_recon_z)
+            clean_crop_loss = F.mse_loss(target_z, self.judge_encode(crop_clean_recon)[0])
+            masked_crop_loss = F.mse_loss(target_z, self.judge_encode(crop_masked_recon)[0])
+            mse_loss = self.mse_weight * (consistency_loss + clean_crop_loss + masked_crop_loss) / 3
+        else:
+            mse_loss = 0
+
+        mae = self.mae_weight * 0.5 * (F.l1_loss(images, clean_recon) + F.l1_loss(images, masked_recon))
+        t_norm = torch.norm(images, p=2, dim=(-3, -2, -1))
+        mae = (
+            self.mae_weight
+            # * 0.5
+            * (
+                torch.mean(torch.norm(clean_recon - images, p=2, dim=(-3, -2, -1)) / t_norm)
+                # + torch.mean(torch.norm(masked_recon - images, p=2, dim=(-3, -2, -1)) / t_norm)
+            )
+        )
+        sigreg_loss = 0
+        if self.sigreg_weight > 0:
+            sigreg_loss = (
+                self.sigreg_weight
+                * 0.5
+                * (
+                    self.sigreg_loss_func(preprocess_to_sigreg(z_clean))
+                    + self.sigreg_loss_func(preprocess_to_sigreg(z_masked))
                 )
-                # print(t, batch_idx, torch.isnan(preds).any(), torch.isnan(history).any())
-                targets_t = inputs[:, t + 1, ...]
-                for i, loss_fn in enumerate(self.loss_fn):
-                    l = self.loss_weights[i] * loss_fn(preds, targets_t)
-                    indiv_losses[i] += l.item()
-                    loss = loss + l
+            )
 
-                RMSE += torch.sqrt(torch.mean((preds - targets_t) ** 2))
+        sobolev_loss = (
+            self.sobolev_weigth * self.sobolev_loss_fun(images, clean_recon) if self.sobolev_weigth > 0 else 0
+        )
+        spectral_loss = (
+            self.spectral_weigth * self.spectral_loss_fun(images, clean_recon) if self.spectral_weigth > 0 else 0
+        )
 
-                num_predictions += 1
+        loss = mse_loss + sigreg_loss + mae + sobolev_loss + spectral_loss
 
-                if (num_predictions) % self.detach_every_k == 0:
-                    preds = preds.detach()
+        self.train_loss_avg.update(loss)
 
-            if num_predictions > 0:
-                loss = loss / num_predictions
-                RMSE = RMSE / num_predictions
+        with torch.no_grad():
+            RMSE = torch.sqrt(torch.mean((clean_recon - images) ** 2)) / images.shape[0]
 
-        self.log("val_RMSE", RMSE, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        if self.mae_weight > 0:
+            self.log(f"mae", mae.item(), on_step=True, on_epoch=True, prog_bar=True)
+        if self.mse_weight > 0:
+            self.log(f"consistency_loss", consistency_loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log(f"clean_crop_loss", clean_crop_loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log(f"masked_crop_loss", masked_crop_loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+            self.log(f"total_mse_loss", mse_loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+        if self.sigreg_weight > 0:
+            self.log(f"sigreg_loss", sigreg_loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+        if self.sobolev_weigth > 0:
+            self.log("sobolev_loss", sobolev_loss, on_step=True, on_epoch=True, prog_bar=True)
+        if self.spectral_weigth > 0:
+            self.log("spectral_loss", spectral_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("total_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("avg_loss", self.train_loss_avg.compute(), prog_bar=True)
+        self.log(f"RMSE", RMSE.item(), on_step=True, on_epoch=True, prog_bar=True)
+        self.log("lr", self.optimizer.param_groups[0]["lr"], prog_bar=True)
+        return loss
 
-        for i, loss_fn in enumerate(self.loss_fn):
-            self.log(f"val_loss_{i}", indiv_losses[i], on_step=True, on_epoch=True, prog_bar=True)
-        self.log("val_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        # Triggered strictly after backward and optimizer.step()
+        self.sync_frozen_model()
+
+    def validation_step(self, batch, batch_idx):
+        inputs, time_idx = batch
+        B, T_unroll, C, H, W = inputs.shape
+
+        loss = 0.0
+
+        h_coords = torch.linspace(-1, 1, H, device=inputs.device)
+        w_coords = torch.linspace(-1, 1, W, device=inputs.device)
+        grid_h, grid_w = torch.meshgrid(h_coords, w_coords, indexing="ij")
+        out_coords = torch.stack([grid_h, grid_w], dim=-1).unsqueeze(0)
+
+        images = inputs.reshape(-1, C, H, W)
+        masked_images = make_inpainted_input(images, mask_ratio=self.inpaint_mask_ratio)
+
+        z_clean = self.model.encode(images)
+        clean_recon = self.model.decode(z_clean, out_coords)
+        z_masked = self.model.encode(masked_images)
+        masked_recon = self.model.decode(z_masked, out_coords)
+
+        if self.mse_weight > 0:
+            clean_recon_z = self.judge_encode(clean_recon)[0]
+            masked_recon_z = self.judge_encode(masked_recon)[0]
+            crop_images, crop_clean_recon, crop_masked_recon = self.crop_resize_views(images, clean_recon, masked_recon)
+            target_z = self.judge_encode(crop_images)[0]
+            consistency_loss = F.mse_loss(clean_recon_z, masked_recon_z)
+            clean_crop_loss = F.mse_loss(target_z, self.judge_encode(crop_clean_recon)[0])
+            masked_crop_loss = F.mse_loss(target_z, self.judge_encode(crop_masked_recon)[0])
+            mse_loss = self.mse_weight * (consistency_loss + clean_crop_loss + masked_crop_loss) / 3
+        else:
+            mse_loss = 0
+        sigreg_loss = 0
+        if self.sigreg_weight > 0:
+            sigreg_loss = (
+                self.sigreg_weight
+                * 0.5
+                * (
+                    self.sigreg_loss_func(preprocess_to_sigreg(z_clean))
+                    + self.sigreg_loss_func(preprocess_to_sigreg(z_masked))
+                )
+            )
+        mae = self.mae_weight * 0.5 * (F.l1_loss(images, clean_recon) + F.l1_loss(images, masked_recon))
+        sobolev_loss = (
+            self.sobolev_weigth * self.sobolev_loss_fun(images, clean_recon) if self.sobolev_weigth > 0 else 0
+        )
+        spectral_loss = (
+            self.spectral_weigth * self.spectral_loss_fun(images, clean_recon) if self.spectral_weigth > 0 else 0
+        )
+
+        loss = mse_loss + sigreg_loss + mae + sobolev_loss + spectral_loss
+
+        with torch.no_grad():
+            RMSE = torch.sqrt(torch.mean((clean_recon - images) ** 2)) / images.shape[0]
+
+        if self.mse_weight > 0:
+            self.log(f"val_consistency_loss", consistency_loss.item(), on_step=False, on_epoch=True, prog_bar=True)
+            self.log(f"val_clean_crop_loss", clean_crop_loss.item(), on_step=False, on_epoch=True, prog_bar=True)
+            self.log(f"val_masked_crop_loss", masked_crop_loss.item(), on_step=False, on_epoch=True, prog_bar=True)
+            self.log(f"val_total_mse_loss", mse_loss.item(), on_step=False, on_epoch=True, prog_bar=True)
+        if self.sigreg_weight > 0:
+            self.log(f"val_sigreg_loss", sigreg_loss.item(), on_step=False, on_epoch=True, prog_bar=True)
+        if self.mae_weight > 0:
+            self.log(f"val_mae", mae.item(), on_step=False, on_epoch=True, prog_bar=True)
+        if self.sobolev_weigth > 0:
+            self.log("val_sobolev_loss", sobolev_loss, on_step=False, on_epoch=True, prog_bar=True)
+        if self.spectral_weigth > 0:
+            self.log("val_spectral_loss", spectral_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log(f"val_RMSE", RMSE.item(), on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val_total_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
 
         return loss
