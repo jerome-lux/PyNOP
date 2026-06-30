@@ -22,72 +22,65 @@ class LayerNorm2d(nn.LayerNorm):
 
 
 class AdaRMSNorm(nn.Module):
-    def __init__(self, feature_dim, condition_dim, eps=1e-6):
+    """Adaptive RMSNorm"""
+
+    def __init__(self, feature_dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        # Standard learnable gain for the fallback case
         self.weight = nn.Parameter(torch.ones(feature_dim))
+        self.to_gamma = nn.Linear(feature_dim, feature_dim)
 
-        # Adaptive gain projection
-        self.to_gamma = nn.Linear(condition_dim, feature_dim)
-
-        # Zero-init ensures we start with identity mapping
+        # Initialize to zero so modulation starts as an identity mapping
         nn.init.zeros_(self.to_gamma.weight)
         nn.init.zeros_(self.to_gamma.bias)
 
-    def forward(self, x, condition=None):
-        # Calculate RMS
-        # x: (batch, seq_len, feature_dim)
+    def forward(self, x: torch.Tensor, condition: torch.Tensor = None) -> torch.Tensor:
+        # Compute RMS normalization
         rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         x_normed = x * rms
 
         if condition is not None:
-            # Generate adaptive gain: (batch, feature_dim)
             gamma = self.to_gamma(condition)
-            for i in range(x.ndim - 2):
+            for _ in range(x.ndim - 2):
                 gamma = gamma.unsqueeze(1)
-            # Add 1 to ensure stability and broadcast to (batch, 1, feature_dim)
-            return x_normed * (1 + gamma)
-        else:
-            # Fallback to standard RMSNorm with learned weight
-            return x_normed * self.weight
+            # Apply base weight modulated by adaptive scaling
+            return x_normed * self.weight * (1 + gamma)
+
+        return x_normed * self.weight
 
 
 class AdaptiveLayerNorm(nn.Module):
-    def __init__(self, channels, cond_dim=1):
+    """Adaptive LayerNorm using chunk splitting to prevent batch resizing bugs."""
+
+    def __init__(self, channels: int, eps: float = 1e-5):
         super().__init__()
         self.channels = channels
-        self.eps = 1e-5
+        self.eps = eps
 
         self.weight = nn.Parameter(torch.ones(channels))
         self.bias = nn.Parameter(torch.zeros(channels))
 
-        self.cond_mlp = nn.Sequential(nn.Linear(cond_dim, channels * 2))
+        # Output 2 * channels for scale (gamma) and shift (beta)
+        self.cond_mlp = nn.Linear(channels, channels * 2)
 
-        nn.init.zeros_(self.cond_mlp[0].weight)
-        nn.init.zeros_(self.cond_mlp[0].bias)
+        nn.init.zeros_(self.cond_mlp.weight)
+        nn.init.zeros_(self.cond_mlp.bias)
 
-    def forward(self, x, cond):
-        """
-        x: [B, ..., C] (peut �tre [B, N, C] ou [B, H, W, C])
-        cond: [B, cond_dim] (temps ou signal global)
-        """
-
+    def forward(self, x: torch.Tensor, cond: torch.Tensor = None) -> torch.Tensor:
         x_norm = F.layer_norm(x, (self.channels,), weight=None, bias=None, eps=self.eps)
-        if cond is None:
 
+        if cond is None:
             return self.weight * x_norm + self.bias
 
-        # [B, C*2] -> [B, 2, C]
-        ada_params = self.cond_mlp(cond).view(-1, 2, self.channels)
-        gamma = ada_params[:, 0, :]  # [B, C]
-        beta = ada_params[:, 1, :]  # [B, C]
+        gamma, beta = self.cond_mlp(cond).chunk(2, dim=-1)  # Both are [B, channels]
 
+        # Dynamic broadcasting matching tensor dimensions
         for _ in range(x.dim() - 2):
             gamma = gamma.unsqueeze(1)
             beta = beta.unsqueeze(1)
 
-        return (self.weight + gamma) * x_norm + (self.bias + beta)
+        # Standard scale and shift conditioning setup
+        return self.weight * (1 + gamma) * x_norm + (self.bias + beta)
 
 
 class ComplexLayerNorm(nn.Module):
