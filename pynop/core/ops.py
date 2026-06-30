@@ -1,11 +1,14 @@
 import math
+from warnings import warn
 from typing import Union
+
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.fft
 import torch.nn.init as init
-import numpy as np
+
 from torch.nn.utils import spectral_norm
 from .norm import LayerNorm2d
 from .utils import get_same_padding_2d
@@ -393,15 +396,17 @@ class TuckerSpectralConv2d(nn.Module):
         max_spectral_modes_y = W // 2 + 1
 
         if self.modes_x > max_spectral_modes_x:
-            raise ValueError(
+            warn(
                 f"Number of modes in x ({self.modes_x}) exceeds available spectral dimension in height ({max_spectral_modes_x}) "
-                f"for input spatial size ({H}, {W}). modes_x must be <= H."
+                f"for input spatial size ({H}, {W}). modes_x must be <= H. "
             )
+            self.modes_x = max_spectral_modes_x
         if self.modes_y > max_spectral_modes_y:
-            raise ValueError(
+            warn(
                 f"Number of modes in y ({self.modes_y}) exceeds available spectral dimension in width ({max_spectral_modes_y}) "
                 f"for input spatial size ({H}, {W}). modes_y must be <= W//2 + 1."
             )
+            self.modes_y = max_spectral_modes_y
 
         # 1. FFT
         x_ft = torch.fft.rfft2(x, dim=(-2, -1), norm="ortho")  # (B, C_in, H, W//2 + 1), cfloat
@@ -490,15 +495,17 @@ class SpectralConv2d(nn.Module):
         max_spectral_modes_y = W // 2 + 1
 
         if self.modes_x > max_spectral_modes_x:
-            raise ValueError(
+            warn(
                 f"Number of modes in x ({self.modes_x}) exceeds available spectral dimension in height ({max_spectral_modes_x}) "
-                f"for input spatial size ({H}, {W}). modes_x must be <= H."
+                f"for input spatial size ({H}, {W}). modes_x must be <= H. "
             )
+            self.modes_x = max_spectral_modes_x
         if self.modes_y > max_spectral_modes_y:
-            raise ValueError(
+            warn(
                 f"Number of modes in y ({self.modes_y}) exceeds available spectral dimension in width ({max_spectral_modes_y}) "
                 f"for input spatial size ({H}, {W}). modes_y must be <= W//2 + 1."
             )
+            self.modes_y = max_spectral_modes_y
 
         x_ft = torch.fft.rfft2(x, dim=(-2, -1), norm="ortho")
         x_ft_low_modes = x_ft[:, :, : self.modes_x, : self.modes_y]
@@ -574,15 +581,17 @@ class SeparableSpectralConv2d(nn.Module):
         max_spectral_modes_y = W // 2 + 1
 
         if self.modes_x > max_spectral_modes_x:
-            raise ValueError(
+            warn(
                 f"Number of modes in x ({self.modes_x}) exceeds available spectral dimension in height ({max_spectral_modes_x}) "
-                f"for input spatial size ({H}, {W}). modes_x must be <= H."
+                f"for input spatial size ({H}, {W}). modes_x must be <= H. "
             )
+            self.modes_x = max_spectral_modes_x
         if self.modes_y > max_spectral_modes_y:
-            raise ValueError(
+            warn(
                 f"Number of modes in y ({self.modes_y}) exceeds available spectral dimension in width ({max_spectral_modes_y}) "
                 f"for input spatial size ({H}, {W}). modes_y must be <= W//2 + 1."
             )
+            self.modes_y = max_spectral_modes_y
 
         xhat = torch.fft.rfft2(x, dim=(-2, -1), norm="ortho")
         xhat = xhat[:, :, : self.modes_x, : self.modes_y]
@@ -605,126 +614,158 @@ class SeparableSpectralConv2d(nn.Module):
 
 class GalerkinAttention(nn.Module):
     def __init__(
-        self, dim: int, heads: int = 8, delta: float = 1e-2, std_ini: float = 1e-2, kv_normalization: bool = False
+        self,
+        dim: int,
+        heads: int = 8,
+        delta: float = 1e-2,
+        std_ini: float = 1e-2,
+        kv_normalization: bool = False,
     ):
+        """Linear Galerkin Attention acting as an integral operator.
+
+        Args:
+            dim: Input feature dimension.
+            heads: Number of attention heads.
+            delta: Identity weight for diagonally dominant initialization.
+            std_ini: Standard deviation for output projection initialization.
+            kv_normalization: If True, applies RMSNorm to Key and Value.
+        """
         super().__init__()
         self.heads = heads
         self.head_dim = dim // heads
         self.kv_norm = kv_normalization
 
-        self.to_q = nn.Linear(dim, dim, bias=False)
-        self.to_k = nn.Linear(dim, dim, bias=False)
-        self.to_v = nn.Linear(dim, dim, bias=False)
+        self.to_q = nn.Linear(dim, dim)
+        self.to_k = nn.Linear(dim, dim)
+        self.to_v = nn.Linear(dim, dim)
 
         if kv_normalization:
-            self.k_norm = nn.LayerNorm(self.head_dim)
-            self.v_norm = nn.LayerNorm(self.head_dim)
-
-        self.apply(lambda m: self.init_weights(m, delta))
+            self.k_norm = nn.RMSNorm(self.head_dim)
+            self.v_norm = nn.RMSNorm(self.head_dim)
 
         self.out_proj = nn.Linear(dim, dim, bias=False)
 
-        with torch.no_grad():
-            nn.init.trunc_normal_(self.out_proj.weight, std=std_ini)
+        # Initialize weights
+        self.init_weights(delta, std_ini)
 
-    def init_weights(self, module, delta=0.01):
-        """
-        Diagonally dominant rescaled initialization: W = W_xavier + delta * I
-        As described in Section 5.1 of the paper.
-        """
-        if isinstance(module, nn.Linear):
-            # Xavier uniform initialization
-            nn.init.xavier_uniform_(module.weight)
-            # Weight scaling/Identity trick
+    def init_weights(self, delta: float, std_ini: float):
+        """Applies specific initializations to projections."""
+        for layer in [self.to_q, self.to_k, self.to_v]:
+            nn.init.xavier_uniform_(layer.weight)
             with torch.no_grad():
-                d_out, d_in = module.weight.size()
-                identity = torch.eye(d_out, d_in).to(module.weight.device)
-                module.weight.add_(identity, alpha=delta)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
+                d_out, d_in = layer.weight.size()
+                identity = torch.eye(d_out, d_in, device=layer.weight.device)
+                layer.weight.add_(identity, alpha=delta)
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
 
-    def forward(self, x, context=None):
-        """
-        x: [batch, M, dim] (Tokens latents / Queries)
-        context: [batch, N, dim] (Points de la grille / Contecontextt)
-        """
+        nn.init.trunc_normal_(self.out_proj.weight, std=std_ini)
 
-        if context is None:  # Self-attention
+    def forward(self, x: torch.Tensor, context: torch.Tensor = None) -> torch.Tensor:
+        """Forward pass for Galerkin Attention.
+
+        Args:
+            x: Query tensor of shape [B, M, dim]
+            context: Context tensor of shape [B, N, dim]
+        """
+        if context is None:
             context = x
+
         b, m, d = x.shape
-        n = context.size(1)  # Nombre de points grille
+        n = context.size(1)
         h = self.heads
 
-        # Q: [b, h, M, d_h]
+        # Project and split heads -> [B, h, T, d_h]
         q = self.to_q(x).view(b, m, h, self.head_dim).transpose(1, 2)
-        # K, V: [b, h, N, d_h]
         k = self.to_k(context).view(b, n, h, self.head_dim).transpose(1, 2)
         v = self.to_v(context).view(b, n, h, self.head_dim).transpose(1, 2)
+
         if self.kv_norm:
             k = self.k_norm(k)
             v = self.v_norm(v)
 
-        # if rope is not None:
-        #     q = rope(q, coords)
-        #     k = rope(k, coords_context)
+        # Kernel matrix computation (K^T * V) / n -> [B, h, d_h, d_h]
+        kernel = torch.matmul(k.transpose(-1, -2), v) / n
 
-        # Calcul de l'opérateur sur la grille N
-        # (K^T * V) / n  -> Taille [d_h, d_h]
-        context = torch.matmul(k.transpose(-1, -2), v) / n
+        # Continuous operator projection Q * Kernel -> [B, h, M, d_h]
+        out = torch.matmul(q, kernel)
 
-        # Projection sur les queries M
-        # Q * Context -> Taille [b, h, M, d_h]
-        out = torch.matmul(q, context)
-
+        # Reshape back to original dim
         out = out.transpose(1, 2).reshape(b, m, d)
-
         return self.out_proj(out)
 
 
-class SoftmaxKernelAttention(nn.Module):
-    """
-    Linear attention via independent softmax on Q and K.
-    Approximates full softmax attention in O(N·D) instead of O(N²).
+class LinearAttentionELU(nn.Module):
+    """Linear Cross-Attention for continuous.
 
-    Ref: Tsai et al. 2019 "Transformer Dissection"
-         Katharopoulos et al. 2020 "Transformers are RNNs"
+    Compatible with high-resolution target queries (N) and latent modes (M).
+    Memory complexity: O(N + M) instead of O(N * M).
     """
 
-    def __init__(self, dim, num_heads=8):
+    def __init__(self, d_model, n_heads=4):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.out_proj = nn.Linear(dim, dim)
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
 
-    def forward(self, x, context=None):
-        if context is None:
-            context = x
-        B, Sq, C = x.shape
-        Sk = context.shape[1]
+        # Projections for Queries (from continuous coordinates/MLP)
+        self.q_proj = nn.Linear(d_model, d_model)
+        # Projections for Latent Modes (K and V)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
 
-        q = self.q_proj(x).view(B, Sq, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(context).view(B, Sk, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(context).view(B, Sk, self.num_heads, self.head_dim).transpose(1, 2)
+        self.out_proj = nn.Linear(d_model, d_model)
 
-        # Softmax indépendant sur la dimension features (dim=-1)
-        # → chaque token a une distribution sur les head_dim features
-        # C'est la décomposition : exp(q·k^T) ≈ softmax(q) · softmax(k)^T * head_dim
-        q = torch.softmax(q, dim=-1)  # [B, H, Sq, D]
-        k = torch.softmax(k, dim=-1)  # [B, H, Sk, D]
+        # phi
+        self.phi = nn.ELU(alpha=1.0)
 
-        # Agrégation linéaire O(N·D²)
-        kv = torch.matmul(k.transpose(-2, -1), v)  # [B, H, D, D]
-        num = torch.matmul(q, kv)  # [B, H, Sq, D]
+    def forward(self, x, context):
+        """Forward pass.
 
-        # Normalisation
-        k_sum = k.sum(dim=2)  # [B, H, D]
-        den = (q * k_sum.unsqueeze(2)).sum(dim=-1, keepdim=True)  # [B, H, Sq, 1]
+        Args:
+            q (Tensor): Continuous queries from target coordinates.
+                Shape: [B, N, d_model] where N = H_target * W_target
+            context (Tensor): Encoded latent features.  Shape: [B, M,
+            d_model]
 
-        out = num / (den + 1e-6)
-        out = out.transpose(1, 2).reshape(B, Sq, C)
+        Returns:
+            Tensor: Projected continuous physical field.
+                Shape: [B, N, d_model]
+        """
+        B, N, _ = x.shape
+        _, M, _ = context.shape
+
+        # 1. Project and split into heads
+        # Shape: [B, n_heads, N/M, d_head]
+        q = self.q_proj(x).view(B, N, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+        k = self.k_proj(context).view(B, M, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+        v = self.v_proj(context).view(B, M, self.n_heads, self.d_head).permute(0, 2, 1, 3)
+
+        # 2. Apply non-negative feature mapping (crucial for stability)
+        # Scale factor helps preventing gradient saturation before ELU
+        scale = 1.0 / self.d_head**-0.25
+        q = self.phi(q * scale) + 1.0
+        k = self.phi(k * scale) + 1.0
+
+        # k: [B, heads, M, d_head] -> k.transpose(-2, -1): [B, heads, d_head, M]
+        # v: [B, heads, M, d_head]
+        context = torch.matmul(k.transpose(-2, -1), v)
+
+        # 4. Compute the normalizer denominator to bind the operator (sum(K))
+        # k_sum: [B, heads, d_head, 1]
+        k_sum = k.sum(dim=-2, keepdim=True).transpose(-2, -1)
+        # denom: [B, heads, N, 1]
+        denom = torch.matmul(q, k_sum).clamp(1e-6)
+
+        # 5. Project queries onto the context matrix -> O(N) memory
+        # num: [B, heads, N, d_head]
+        num = torch.matmul(q, context)
+
+        # 6. Normalize and merge heads (Partition of unity)
+        # out: [B, heads, N, d_head] -> [B, N, d_model]
+        out = num / denom
+        out = out.permute(0, 2, 1, 3).contiguous().view(B, N, self.d_model)
+
         return self.out_proj(out)
 
 
@@ -744,70 +785,84 @@ class LinearAttention(nn.Module):
         # x: [batch, seq_q, dim], context: [batch, seq_k, dim]
         B, N, C = x.shape
 
-        if torch.isnan(x).any():
-            print("NaN detected in x!")
+        # if torch.isnan(x).any():
+        #     print("NaN detected in x!")
 
         q = self.q_proj(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(context).view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(context).view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
-        q = F.elu(q / (q.norm(dim=-1, keepdim=True) + 1e-6)) + 1.0  # [B, H, Sq, D]
-        k = F.elu(k / (k.norm(dim=-1, keepdim=True) + 1e-6)) + 1.0
+        q = q.softmax(dim=-1)
+        k = k.softmax(dim=-2)
 
-        # Apply activation for linear attention (e.g., ELU + 1)
-        kv = torch.matmul(k.transpose(-2, -1), v)  # [B, H, D, D]
-        num = torch.matmul(q, kv)  # [B, H, Sq, D]
+        scores = torch.matmul(k.transpose(-2, -1), v) / N  # [B, H, D, D]
+        att = torch.matmul(q, scores)  # [B, H, Sq, D]
 
-        # Normalisation : Z = q · (Σ_i k_i)
-        k_sum = k.sum(dim=2)  # [B, H, D]
-        den = (q * k_sum.unsqueeze(2)).sum(dim=-1, keepdim=True)  # [B, H, Sq, 1]
-        out = num / (den + 1e-6)
-
-        out = out.transpose(1, 2).reshape(B, N, C)
-        return self.out_proj(out)
+        att = att.transpose(1, 2).reshape(B, N, C)
+        return self.out_proj(att)
 
 
 class Attention(nn.Module):
-    def __init__(self, in_ch, out_ch, num_heads, std_ini=1):
+    """Multi-Head Attention with standardized normal initialization and SDPA optimization."""
+
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        num_heads: int,
+        std_ini: float = 0.02,
+    ):
         super().__init__()
         assert out_ch % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = out_ch // num_heads
 
-        self.wq = nn.Linear(in_ch, out_ch, bias=False)
-        self.wk = nn.Linear(in_ch, out_ch, bias=False)
-        self.wv = nn.Linear(in_ch, out_ch, bias=False)
-        self.out_proj = nn.Linear(out_ch, out_ch, bias=False)
+        # Combined QKV projection can be faster, but keeping separated for RoPE clarity
+        self.wq = nn.Linear(in_ch, out_ch)
+        self.wk = nn.Linear(in_ch, out_ch)
+        self.wv = nn.Linear(in_ch, out_ch)
+        self.out_proj = nn.Linear(out_ch, out_ch)
 
-        # nn.init.kaiming_uniform_(self.wq.weight, nonlinearity="relu")
-        # nn.init.kaiming_uniform_(self.wk.weight, nonlinearity="relu")
-        # nn.init.kaiming_uniform_(self.wv.weight, nonlinearity="relu")
+        self._init_weights(std_ini)
+
+    def _init_weights(self, std_ini: float):
+        """Standardized normal initialization for attention weights."""
         with torch.no_grad():
-            nn.init.xavier_uniform_(self.wq.weight, gain=1)
-            nn.init.xavier_uniform_(self.wk.weight, gain=1)
-            nn.init.xavier_uniform_(self.wv.weight, gain=1)
+            nn.init.trunc_normal_(self.wq.weight, std=std_ini)
+            nn.init.trunc_normal_(self.wk.weight, std=std_ini)
+            nn.init.trunc_normal_(self.wv.weight, std=std_ini)
             nn.init.trunc_normal_(self.out_proj.weight, std=std_ini)
 
-    def split_heads(self, x):
-        B, N, C = x.shape
+    def split_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """Reshape input to [B, num_heads, N, head_dim]."""
+        B, N, _ = x.shape
         return x.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
-    def forward(self, Q, K, V, mask=None, rope=None, coords=None):
-        q = self.split_heads(self.wq(Q))  # [B, n_h, L, head_dim]
+    def forward(
+        self,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        mask: torch.Tensor = None,
+        rope: nn.Module = None,
+        coords: torch.Tensor = None,
+        causal_attn: bool = False,
+    ) -> torch.Tensor:
+        # Project and split heads -> [B, n_h, N, head_dim]
+        q = self.split_heads(self.wq(Q))
         k = self.split_heads(self.wk(K))
         v = self.split_heads(self.wv(V))
 
+        # Apply Rotary Position Embeddings if available (Su et al., 2021)
         if rope is not None and coords is not None:
-            q = rope(q, coords)  # [B, n_h, L, head_dim]
+            q = rope(q, coords)
             k = rope(k, coords)
 
-        attn = (q @ k.transpose(-2, -1)) / (self.head_dim**0.5)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=causal_attn)
 
-        if mask is not None:
-            attn = attn.masked_fill(mask, -1e9)
+        # Reshape back to [B, N, out_ch]
+        out = out.transpose(1, 2).contiguous().view(Q.shape[0], Q.shape[1], -1)
 
-        attn = F.softmax(attn, dim=-1)
-        out = (attn @ v).transpose(1, 2).contiguous().view(Q.shape[0], Q.shape[1], -1)
         return self.out_proj(out)
 
 
