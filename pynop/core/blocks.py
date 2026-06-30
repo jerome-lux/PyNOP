@@ -1,7 +1,7 @@
 import math
 from posixpath import sep
 from typing import Tuple, Any
-from typing import Callable, Union, Sequence
+from typing import Callable, Union, Sequence, Optional
 import numpy as np
 from functools import partial
 from sympy import ln
@@ -9,14 +9,21 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from torchvision.ops import SqueezeExcitation
+from einops import rearrange
 
 from .utils import make_tuple
 from .ops import *
-from .norm import AdaptiveLayerNorm, LayerNorm2d, AdaptiveLayerNorm, AdaRMSNorm
+from .norm import AdaptiveLayerNorm, LayerNorm2d, AdaptiveLayerNorm, AdaRMSNorm, GRN
 from .activations import Sine, gumbel_softmax
-from .encoding import RoPE
-from einops import rearrange
-from pynop.core.utils import print_stats
+from .encoding import (
+    RoPE,
+    IntegratedPositionalEncoding,
+    GaussianFourierEmbedding,
+    GaussianIntegratedPositionalEncoding,
+    FourierEmbedding,
+    AdaptiveFourierEmbedding,
+)
+from .utils import print_stats
 
 # TODO: implement FNO block with  differential kernels (i.e. conv when the kernel is rescaled by 1/h and the mean is substracted)
 # It would allows to capture the high frequencies while keeping the resolution invariance, far better and more grounded than  the U-FNO! see neuralop for an implementation
@@ -1107,82 +1114,131 @@ class ComplexMLPBlock(nn.Module):
 
 
 class MLPBlock(nn.Module):
-    """
-    MLP block
-    """
-
-    def __init__(self, in_ch, out_ch, hidden_dim=64, num_layers=2, activation=nn.GELU, norm=None, dropout=0.0):
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        hidden_dim: int = 64,
+        num_layers: int = 2,
+        activation: nn.Module = nn.GELU,
+        norm: nn.Module = None,
+        dropout: float = 0.0,
+    ):
         """
-        Initializes the MLP.
-        Args:
-
-            hidden_dim (int): Hidden dimension of the MLP.
-            num_layers (int): Number of hidden layers in the MLP.
-            activation (callable): Activation function to use (default: nn.GELU).
-            norm (callable): Normalization layer to use (default: nn.LayerNorm).
-            dropout (float): Dropout rate (default 0.0).
+        Standard Multi-Layer Perceptron (MLP) block.
+        in_ch:       Number of input channels
+        out_ch:      Number of output channels
+        hidden_dim:  Hidden dimension size
+        num_layers:  Total number of layers including hidden layers
+        activation:  Activation layer class (e.g., nn.GELU)
+        norm:        Normalization layer class (e.g., nn.LayerNorm)
+        dropout:     Dropout probability
         """
         super().__init__()
 
         layers = []
+
+        # First layer
         layers.append(nn.Linear(in_ch, hidden_dim))
-        self.w0 = 30
-        if dropout > 0.0:
-            layers.append(nn.Dropout(dropout))
         if norm is not None:
             layers.append(norm(hidden_dim))
         if activation is not None:
-            if activation is Sine:
-                layers.append(activation(w0=self.w0))
-            else:
-                layers.append(activation())  # Or ReLU, LeakyReLU, etc.
+            layers.append(activation())
+        if dropout > 0.0:
+            layers.append(nn.Dropout(dropout))
 
+        # Hidden layers (num_layers must be > 1)
         for _ in range(num_layers - 1):
             layers.append(nn.Linear(hidden_dim, hidden_dim))
-            if dropout > 0.0:
-                layers.append(nn.Dropout(dropout))
             if norm is not None:
                 layers.append(norm(hidden_dim))
             if activation is not None:
-                if activation is Sine:
-                    layers.append(activation(w0=self.w0))
-                else:
-                    layers.append(activation())
+                layers.append(activation())
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
 
+        # Output projection layer
         layers.append(nn.Linear(hidden_dim, out_ch))
 
         self.mlp = nn.Sequential(*layers)
+        self._init_weights()
 
-        self._init_siren(activation)
-
-    def _init_siren(self, activation):
-        """Standard SIREN initialization scheme."""
-        if activation is not Sine:
-            return
-
+    def _init_weights(self):
+        """Kaiming uniform initialization optimized for rectifier-like activations."""
         with torch.no_grad():
-            linears = [m for m in self.mlp.modules() if isinstance(m, nn.Linear)]
+            for m in self.mlp:
+                if isinstance(m, nn.Linear):
+                    nn.init.kaiming_uniform_(m.weight, a=0, mode="fan_in", nonlinearity="leaky_relu")
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+            # Xavier uniform setup for the final linear projection layer
+            nn.init.xavier_uniform_(self.mlp[-1].weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, ..., in_ch] - Input feature tensor
+        Returns: [B, ..., out_ch] - Projected output tensor
+        """
+        return self.mlp(x)
+
+
+class SirenBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, hidden_dim: int = 64, num_layers: int = 2, w0: float = 30.0):
+        """
+        Sinusoidal Representation Network (SIREN) block.
+        in_ch:      Number of input channels
+        out_ch:     Number of output channels
+        hidden_dim: Hidden dimension size
+        num_layers: Total number of layers including hidden layers
+        w0:         Frequency scaling factor (30.0 is standard for coordinates)
+        """
+        super().__init__()
+        self.w0 = w0
+
+        layers = []
+
+        # First layer
+        layers.append(nn.Linear(in_ch, hidden_dim))
+        layers.append(Sine(w0=self.w0))
+
+        # Hidden layers
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(Sine(w0=self.w0))
+
+        # Output projection layer
+        layers.append(nn.Linear(hidden_dim, out_ch))
+
+        self.siren = nn.Sequential(*layers)
+        self._init_siren()
+
+    def _init_siren(self):
+        """SIREN uniform initialization scheme to preserve distribution variance."""
+        with torch.no_grad():
+            linears = [m for m in self.siren if isinstance(m, nn.Linear)]
             n = len(linears)
 
             for i, m in enumerate(linears):
                 if i == 0:
-                    # First layer: scale to input range
-                    # m.weight.uniform_(-1 / m.in_features, 1 / m.in_features)
-                    m.weight.uniform_(-self.w0 / m.in_features, self.w0 / m.in_features)
+                    # Map input domain properly by scaling bounds with w0
+                    m.weight.uniform_(-1.0 / m.in_features, 1.0 / m.in_features)
                 elif i < n - 1:
-                    # Hidden layers: scale weights by 1/w0 to maintain variance
-                    limit = np.sqrt(6 / m.in_features) / self.w0
+                    # Calibrate variance for subsequent sine activations
+                    limit = math.sqrt(6.0 / m.in_features) / self.w0
                     m.weight.uniform_(-limit, limit)
                 else:
-                    # Final layer: Xavier for stable Galerkin attention
+                    # Final layer standard Xavier initialization
                     nn.init.xavier_uniform_(m.weight)
 
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x):
-
-        return self.mlp(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, ..., in_ch] - Input coordinate or feature tensor
+        Returns: [B, ..., out_ch] - Reconstructed signal representation
+        """
+        return self.siren(x)
 
 
 class SepLITBlock(nn.Module):
@@ -2011,20 +2067,21 @@ class GalerkinTransformerBlock(nn.Module):
     def __init__(
         self,
         dim,
-        heads=8,
-        mlp_dim=2048,
+        heads=4,
+        mlp_dim=512,
         dropout=0.1,
         delta=0.01,
-        activation=nn.SiLU,
+        activation=nn.GELU(),
         std_ini: float = 1,
-        scaling: float = 1e-4,
         kv_normalization=False,
+        scaling: float = 1,
     ):
         super().__init__()
         self.attn = GalerkinAttention(dim, heads, delta, std_ini=std_ini, kv_normalization=kv_normalization)
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.scaling = nn.Parameter(torch.empty(1))
+        # self.norm1 = nn.LayerNorm(dim)
+        # self.norm2 = nn.LayerNorm(dim)
+        # self.scaling = nn.Parameter(torch.empty(1))
+        self.scaling = scaling
 
         self.mlp = nn.Sequential(
             nn.Linear(dim, mlp_dim),
@@ -2034,57 +2091,61 @@ class GalerkinTransformerBlock(nn.Module):
             nn.Dropout(dropout),
         )
         with torch.no_grad():
-            nn.init.constant_(self.scaling, scaling)
+            # nn.init.constant_(self.scaling, scaling)
             for m in self.mlp:
                 if isinstance(m, nn.Linear):
-                    # nn.init.xavier_uniform_(m.weight)
-                    # nn.init.xavier_uniform_(m.weight, gain=1.0)
                     nn.init.kaiming_uniform_(m.weight, nonlinearity="leaky_relu")
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        x = x + self.scaling * self.attn(self.norm1(x))
-        x = x + self.scaling * self.mlp(self.norm2(x))
+        x = x + self.attn(x) * 1 / math.sqrt(2 * self.scaling)
+        x = x + self.mlp(x) * 1 / math.sqrt(2 * self.scaling)
         return x
 
 
-class LinearTransformerBlock(nn.Module):
+class GalerkinCrossAttentionBlock(nn.Module):
+    """ """
 
-    def __init__(self, dim, n_heads=4, activation=nn.GELU, mlp_dim=512, dropout=0.0, rmsnorm=True, type="softmax"):
+    def __init__(self, dim: int, heads: int, mlp_dim: int, dropout: float, activation: Callable):
         super().__init__()
-
-        if rmsnorm:
-            self.norm1 = nn.RMSNorm(dim)
-            self.norm2 = nn.RMSNorm(dim)
-        else:
-            self.norm1 = nn.LayerNorm(dim)
-            self.norm2 = nn.LayerNorm(dim)
-
-        if type == "softmax":
-            self.attn = SoftmaxKernelAttention(dim, n_heads)
-        elif type == "galerkin":
-            self.attn = GalerkinAttention(dim, n_heads)
-        else:
-            self.attn = LinearAttention(dim, n_heads)
-
+        self.attn = GalerkinAttention(dim=dim, heads=heads, kv_normalization=False, std_ini=1e-2)
         self.mlp = nn.Sequential(
-            nn.Linear(dim, mlp_dim), activation(), nn.Dropout(dropout), nn.Linear(mlp_dim, dim), nn.Dropout(dropout)
+            nn.Linear(dim, mlp_dim),
+            activation(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout),
         )
+        for m in self.mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, nonlinearity="leaky_relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
-    def forward(self, x):
-        # Pre-norm architecture
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+    def forward(self, q, context):
+        # Reduction step: context is [B, M_in, D], q_latent is [B, M_out, D]
+        x = self.attn(x=q, context=context)
+        x = x + self.mlp(x)
         return x
 
 
 class TransformerBlock(nn.Module):
+    """Pre-LN Transformer block with standardized initialization."""
+
     def __init__(
-        self, dim, n_heads, activation=nn.GELU, mlp_dim=256, dropout=0.1, rmsnorm=True, std_ini=0.02, scaling: float = 1
+        self,
+        dim: int,
+        n_heads: int,
+        activation: Callable = nn.GELU,
+        mlp_dim: int = 256,
+        dropout: float = 0.1,
+        rmsnorm: bool = True,
+        std_ini: float = 0.02,
+        scaling: Union[None, float] = None,
     ):
         super().__init__()
-
+        # Attention layer assumed to handle its own input projection init
         self.attention = Attention(dim, dim, n_heads, std_ini=std_ini)
 
         self.mlp = nn.Sequential(
@@ -2094,32 +2155,39 @@ class TransformerBlock(nn.Module):
             nn.Linear(mlp_dim, dim),
             nn.Dropout(dropout),
         )
-        self.scaling = nn.Parameter(torch.empty(1))
 
-        if rmsnorm:
-            self.norm1 = nn.RMSNorm(dim)  # AdaRMSNorm(dim, dim)
-            self.norm2 = nn.RMSNorm(dim)
-        else:
-            self.norm1 = nn.LayerNorm(dim)  # AdaptiveLayerNorm(dim, dim)
-            self.norm2 = nn.LayerNorm(dim)
+        # RMSNorm (Zhang & Sennrich, 2019) or standard LayerNorm
+        self.norm1 = nn.RMSNorm(dim) if rmsnorm else nn.LayerNorm(dim)
+        self.norm2 = nn.RMSNorm(dim) if rmsnorm else nn.LayerNorm(dim)
 
+        # Depth-scaled initialization constraint (e.g., Megatron-LM / GPT-2)
+        # Scale output projections by 1 / sqrt(2 * n_layers) to prevent variance explosion
+        self.out_std = std_ini / math.sqrt(2 * scaling) if scaling is not None else std_ini
+
+        self._init_weights(std_ini)
+
+    def _init_weights(self, std_ini: float):
+        """Standardized normal initialization across layers."""
         with torch.no_grad():
-            nn.init.constant_(self.scaling, scaling)
-            nn.init.xavier_uniform_(self.mlp[0].weight)
-            nn.init.trunc_normal_(self.mlp[3].weight, std=std_ini)
+            # Input projection: Standard normal variation
+            nn.init.trunc_normal_(self.mlp[0].weight, std=std_ini)
+            if self.mlp[0].bias is not None:
+                nn.init.zeros_(self.mlp[0].bias)
 
-    def forward(self, x):
+            # Output projection: Scaled by depth to stabilize residual stream
+            nn.init.trunc_normal_(self.mlp[3].weight, std=self.out_std)
+            if self.mlp[3].bias is not None:
+                nn.init.zeros_(self.mlp[3].bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        causal_attn: bool = False,
+    ) -> torch.Tensor:
         # x: [B, N, C]
-
-        res = x
-        x = self.norm1(x)
-        x = self.attention(Q=x, V=x, K=x)
-        x = self.scaling * x + res
-        res = x
-        x = self.norm2(x)
-        x = self.mlp(x)
-        x = self.scaling * x + res
-
+        # Clean Pre-LN residual stream
+        x = x + self.attention(Q=self.norm1(x), V=self.norm1(x), K=self.norm1(x), causal_attn=causal_attn)
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
@@ -2437,65 +2505,6 @@ class GalerkinTransolverBlock(nn.Module):
         return x_rec
 
 
-class Transolver3Block(nn.Module):
-    def __init__(self, dim, num_heads, num_slices):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.num_slices = num_slices  # M: Number of physical states
-
-        # Geometry scaling: Projection moved to latent space
-        # Original: x_proj = Linear1(x) -> O(N*C^2)
-        # Transolver-3: s = Linear1(slice(x)) -> O(M*C^2) where M << N
-        self.linear1 = nn.Linear(dim, dim)
-        self.linear2 = nn.Linear(dim, num_slices)  # Weights generator
-        self.linear3 = nn.Linear(dim, dim)
-
-        self.attn = Attention(dim, dim, num_heads, 2e-2)
-        self.ln1 = nn.LayerNorm(dim)
-        self.ln2 = nn.LayerNorm(dim)
-
-        # Simple MLP
-        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
-
-    def forward(self, x):
-        """
-        x: (B, N, C) where N is number of mesh cells
-        """
-        b, n, c = x.shape
-        residual = x
-        x = self.ln1(x)
-
-        # Generate Slice Weights (w) - Softmax over N locations
-        # w shape: (B, N, M)
-        w = F.softmax(self.linear2(x), dim=1)
-
-        # Faster Slice
-        # Calculate raw physical states: s_raw = w^T @ x
-        # d is the normalization diagonal matrix: d_jj = sum(w_ij)
-        d = w.sum(dim=1, keepdim=True)  # (B, 1, M)
-        s_raw = torch.matmul(w.transpose(1, 2), x)  # (B, M, C)
-
-        # Apply Linear1 and normalization in the compact slice domain
-        # s = Linear1(s_raw) / d
-        s = self.linear1(s_raw) / (d.transpose(1, 2) + 1e-6)  # (B, M, C)
-
-        # Physics-Attention (Self-attention in the slice domain)
-        s_updated = self.attn(s, s, s)
-
-        # Faster Deslice
-        # Apply Linear3 before mapping back to mesh domain
-        # x_out = w @ Linear3(s_updated)
-        s_out = self.linear3(s_updated)  # (B, M, C)
-        x_out = torch.matmul(w, s_out)  # (B, N, C)
-
-        # Residual and MLP
-        x = residual + x_out
-        x = x + self.mlp(self.ln2(x))
-
-        return x
-
-
 class TransolverBlock(nn.Module):
     """
     Base block for Transolver++
@@ -2559,13 +2568,14 @@ class TransolverBlock(nn.Module):
 
 class LinearNOBlock(nn.Module):
     """
-    See Transolver is a Linear Transformer: Revisiting Physics-Attention through the Lens of Linear Attention
+    Implementation of LinearNO.
+    Ref: "Transolver Is a Linear Transformer: Revisiting Physics-Attention..." (2026)
     """
 
     def __init__(self, dim, n_tokens=64, n_heads=8, dropout=0.0, mlp_ratio=2, activation=nn.GELU, rmsnorm=True):
         super().__init__()
         self.n_heads = n_heads
-        self.n_tokens = n_tokens
+        self.n_tokens = n_tokens  # This is 'M' (number of slices/latent tokens)
         self.dim = dim
         self.head_dim = dim // n_heads
 
@@ -2578,51 +2588,446 @@ class LinearNOBlock(nn.Module):
             self.norm1 = nn.LayerNorm(dim)
             self.norm2 = nn.LayerNorm(dim)
 
-        self.mlp = MLPBlock(in_ch=dim, out_ch=dim, hidden_dim=dim * mlp_ratio, num_layers=1, activation=activation)
-        self.dropout = nn.Dropout(dropout)
-
-        # Projections
-        self.q_proj = nn.Linear(dim, n_tokens * n_heads)
-        self.k_proj = nn.Linear(dim, n_tokens * n_heads)
+        # Asymmetric learnable projections for linear attention (Eq. 8 & 9)
+        # Slicing projections project onto M latent spaces per head
+        self.q_proj = nn.Linear(dim, n_heads * n_tokens)
+        self.k_proj = nn.Linear(dim, n_heads * n_tokens)
         self.v_proj = nn.Linear(dim, dim)
 
         self.out_proj = nn.Linear(dim, dim)
+        self.mlp = MLPBlock(in_ch=dim, out_ch=dim, hidden_dim=dim * mlp_ratio, num_layers=1, activation=activation)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, N, C = x.shape
         H = self.n_heads
-        D = self.n_tokens
+        M = self.n_tokens
+        D = self.head_dim
 
+        # Step 1: Pre-normalization
         x_in = self.norm1(x)
 
-        # Q, K: [B, N, H, D], V: [B, N, H, head_dim]
-        q = self.q_proj(x_in).view(B, N, H, D)
-        k = self.k_proj(x_in).view(B, N, H, D)
-        v = self.v_proj(x_in).view(B, N, H, self.head_dim)
+        # Step 2: Projections & Shape transformation
+        # q, k shape: [B, N, H, M] -> [B, H, N, M]
+        q = self.q_proj(x_in).view(B, N, H, M).permute(0, 2, 1, 3)
+        k = self.k_proj(x_in).view(B, N, H, M).permute(0, 2, 1, 3)
+        # v shape: [B, N, H, D] -> [B, H, N, D]
+        v = self.v_proj(x_in).view(B, N, H, D).permute(0, 2, 1, 3)
 
-        # phi(Q): Softmax along tokens D
-        q = torch.softmax(q, dim=-1)
+        # Step 3: Apply asymmetric kernel normalizations (Eq. 8)
+        # phi(Q): Softmax over slice dimension M (row-wise for Q)
+        phi_q = torch.softmax(q, dim=-1)  # [B, H, N, M]
 
-        # psi(K)^T:  Softmax along N
-        k_t = k.permute(0, 2, 3, 1)  # [B, H, D, N]
-        k_t = torch.softmax(k_t, dim=-1)
+        # psi(K)^T: Softmax over grid dimension N (row-wise for K^T)
+        # We transpose N and M for K to apply softmax row-by-row on K^T
+        k_t = k.permute(0, 1, 3, 2)  # [B, H, M, N]
+        psi_k_t = torch.softmax(k_t, dim=-1)  # [B, H, M, N]
 
-        # Linear Attention
-        # V  [B, H, N, head_dim]
-        v = v.permute(0, 2, 1, 3)
+        # Step 4: Canonical Linear Attention computation (Eq. 9)
+        # Global context formulation: psi(K)^T @ V -> [B, H, M, N] @ [B, H, N, D] = [B, H, M, D]
+        global_context = torch.matmul(psi_k_t, v)
 
-        # (D, N) @ (N, head_dim) -> (D, head_dim)
-        global_context = torch.matmul(k_t, v)
+        # Deslicing: phi(Q) @ global_context -> [B, H, N, M] @ [B, H, M, D] = [B, H, N, D]
+        attn_out = torch.matmul(phi_q, global_context)
 
-        # Deslicing
-        q = q.permute(0, 2, 1, 3)
-        out = torch.matmul(q, global_context)  # [B, H, N, head_dim]
+        # Step 5: Post-projections & Residual blocks
+        attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, N, C)
+        x = x + self.dropout(self.out_proj(attn_out))
 
-        out = out.permute(0, 2, 1, 3).contiguous().view(B, N, C) + x
-
-        out = self.out_proj(self.norm2(out)) + out
-
+        # MLP block
+        out = x + self.mlp(self.norm2(x))
         return out
+
+
+import math
+import torch
+import torch.nn as nn
+
+
+class PEBlock(nn.Module):
+    """Positional Encoding Block supporting multiple encoding strategies across
+
+    1D, 2D, and 3D space.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        method: str = "fourier",
+        **kwargs,
+    ):
+        super().__init__()
+
+        if not isinstance(in_features, int) or in_features <= 0:
+            raise ValueError(f"in_features must be positive, got {in_features}")
+        if not isinstance(out_features, int) or out_features <= 0:
+            raise ValueError(f"out_features must be positive, got {out_features}")
+
+        valid_methods = {
+            "random_fourier",
+            "fourier",
+            "ipe",
+            "random_ipe",
+            "siren",
+            "mlp",
+            "adaptive",
+            None,
+        }
+        if method not in valid_methods:
+            print(f"Method '{method}' not supported. Defaulting to 'fourier'.")
+            method = "fourier"
+
+        self.method = method
+        self.in_features = in_features
+        self.out_features = out_features
+
+        mlp_dim = kwargs.get("mlp_dim", out_features)
+        mlp_act = kwargs.get("mlp_act", nn.GELU)
+        mlp_layers = kwargs.get("mlp_layers", 2)
+
+        match method:
+            case "random_fourier":
+                scale = kwargs.get("scale", 10.0)
+                self.pe = GaussianFourierEmbedding(in_features, out_features, scale)
+
+            case "fourier":
+                max_freq = kwargs.get("max_freq", 128.0)
+                self.pe = FourierEmbedding(in_features, out_features, max_freq=max_freq)
+
+            case "ipe":
+                max_freq = kwargs.get("max_freq", 128.0)
+                self.pe = IntegratedPositionalEncoding(in_features, out_features, max_freq=max_freq)
+
+            case "random_ipe":
+                scale = kwargs.get("scale", 10.0)
+                self.pe = GaussianIntegratedPositionalEncoding(in_features, out_features, scale=scale)
+
+            case "siren":
+                self.pe = SirenBlock(
+                    out_ch=out_features,
+                    in_ch=in_features,
+                    hidden_dim=mlp_dim,
+                    num_layers=mlp_layers,
+                    w0=30,
+                )
+
+            case "mlp":
+                self.pe = MLPBlock(
+                    out_ch=out_features,
+                    in_ch=in_features,
+                    hidden_dim=mlp_dim,
+                    num_layers=mlp_layers,
+                    activation=mlp_act,
+                )
+            case "adaptive":
+                self.pe = AdaptiveFourierEmbedding(
+                    in_features=in_features, out_features=out_features, base_max_freq=kwargs.get("max_freq", 128.0)
+                )
+            case None:
+                self.pe = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Applies positional encoding dynamically based on input coordinates.
+
+        Args:
+            x (torch.Tensor): Coordinates of shape [B, N, in_features] or [B,
+              H, W, in_features]. We assume that the coordinates are normalized beween 1 and -1
+
+        Returns:
+            torch.Tensor: Encoded positions.
+        """
+        if x.ndim == 3:
+            B, N, C = x.shape
+            flat = True
+        elif x.ndim == 4:
+            B, H, W, C = x.shape
+            flat = False
+        else:
+            raise ValueError("Input tensor must be B, N, C (flattened coordinates) or B, H, W, C")
+
+        if x.shape[-1] != self.in_features:
+            raise ValueError(f"Input last dim ({x.shape[-1]}) mismatch with in_features ({self.in_features})")
+
+        if self.method in ["ipe", "random_ipe"]:
+            # 1. Compute grid spacing under the uniform domain [-1, 1]^C
+            if flat:
+                # Case [B, N, C]: No explicit spatial structure.
+                # We fall back to assuming a hypercube grid: N^(1/C) points per axis.
+                grid_res = math.pow(N, 1.0 / C)
+                # Cell size is identical for all dimensions in this fallback scenario
+                cell_size_values = [2.0 / grid_res] * C
+            else:
+                # Case [B, H, W, C]: Dimensions are explicit (e.g., C=2 for 2D).
+                # Each axis has its own sample density.
+                # Assuming domain width is 2.0 (from -1 to 1) for both axes:
+                dx = 2.0 / H
+                dy = 2.0 / W
+                cell_size_values = [dx, dy]
+
+            # 2. Create the tensor aligned with the input device and dtype
+            # Shape: [C] (matches the last dimension of x)
+            cell_size = torch.tensor(cell_size_values, dtype=x.dtype, device=x.device)
+
+            # Pass coordinates and the axis-specific spacing vector
+            return self.pe(x, cell_size=cell_size)
+
+        elif self.method == "adaptive":
+            if flat:
+                res = tuple([int(N ** (1.0 / C)) for _ in range(C)])
+            else:
+                res = (H, W)
+            return self.pe(x, resolution=res)
+
+        return self.pe(x)
+
+
+class MHSlicingBlock(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        num_slices: int,
+        num_heads: int,
+        temp: float = 1.0,
+        use_gumbel: bool = False,
+    ):
+        """
+        Multi-Head Slicing Block inspired by Transolver.
+        in_features:  Dimension C of input features from mesh points
+        out_features: Total hidden dimension (must be divisible by num_heads)
+        num_slices:   Number of physical states/slices M per head
+        num_heads:    Number of heads H
+        """
+        super().__init__()
+        self.M = num_slices
+        self.H = num_heads
+        self.d_k = out_features // num_heads
+        self.gumbel = use_gumbel
+
+        assert out_features % num_heads == 0, "out_features must be divisible by num_heads"
+
+        # Separate projections for weights per head: H * M outputs
+        self.weight_proj = nn.Linear(in_features, self.H * self.M)
+
+        temp_ini = torch.log(torch.exp(torch.tensor(temp)) - 1.0)
+        self.temp = nn.Parameter(temp_ini)
+
+        # Projection of input features before slicing
+        self.linear1 = nn.Linear(in_features, out_features)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        """
+        x: [B, N, C] - Input tensor from mesh points
+        Returns:
+            s: [B, M, out_features] - Sliced physics tokens with combined heads
+        """
+        B, N, C = x.shape
+
+        # --- 1. COMPUTE MULTI-HEAD SLICE WEIGHTS (w) AND DIAGONAL (d) ---
+        # Project and reshape to isolate heads: [B, N, H, M]
+        weight_logits = self.weight_proj(x).view(B, N, self.H, self.M)
+        temp = F.softplus(self.temp) + 0.05
+        if self.gumbel:
+            w = gumbel_softmax(weight_logits, temp, dim=-1)
+        else:
+            w = torch.softmax(weight_logits / temp, dim=-1)
+
+        # d represents the sum of weights per slice per head
+        # Sum over N -> [B, 1, H, M]
+        d = w.sum(dim=1, keepdim=True)
+
+        # --- 2. PREPARE SLICE INPUT AND PROJECTION ---
+        # Apply linear1 and reshape to separate heads: [B, N, H, d_k]
+        # Then permute to [B, H, N, d_k] for batch matrix multiplication
+        x_projected = self.linear1(x).view(B, N, self.H, self.d_k).permute(0, 2, 1, 3)
+
+        # Permute w to [B, H, M, N]
+        w_t = w.permute(0, 2, 3, 1)
+
+        # Slicing via batch matrix multiplication: [B, H, M, N] @ [B, H, N, d_k]
+        s_raw = torch.matmul(w_t, x_projected)  # Shape: [B, H, M, d_k]
+
+        # --- 3. FASTER SLICE WITH MULTI-HEAD DIAGONAL INVERSION ---
+        # Permute d from [B, 1, H, M] to [B, H, M, 1] to align with s_raw
+        d_inv = 1.0 / (d.permute(0, 2, 3, 1) + 1e-8)
+
+        # Scale sliced tokens per head
+        s_heads = s_raw * d_inv  # Shape: [B, H, M, d_k]
+
+        # --- 4. COMBINE HEADS FOR DOWNSTREAM ATTENTION BLOCKS ---
+        # [B, H, M, d_k] -> [B, M, H, d_k] -> [B, M, out_features]
+        s = s_heads.permute(0, 2, 1, 3).contiguous().view(B, self.M, -1)
+
+        return s, w
+
+
+class MHDeslicingBlock(nn.Module):
+    def __init__(self, in_features: int, out_features: int, num_slices: int, num_heads: int):
+        """
+        Args:
+            in_features: Latent dimension D [B, M, D], must be divisible by num_heads.
+            out_features: Output physical dimension C.
+            num_slices: Number of slices M.
+            num_heads: Number of heads H.
+        """
+        super().__init__()
+        self.M = num_slices
+        self.H = num_heads
+        self.d_k = in_features // num_heads
+        assert in_features % num_heads == 0, "in_features must be divisible by num_heads"
+
+        # Per-head projection: d_k -> d_k (reduced space, symmetric to linear1)
+        self.linear3 = nn.Linear(self.d_k, self.d_k)
+        # Final projection after head recombination: D -> out_features
+        self.linear_out = nn.Linear(in_features, out_features)
+
+    def forward(self, s: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            s: Latent tokens from attention layers [B, M, D].
+            w: Slicing weights from SlicingBlock [B, N, H, M].
+        Returns:
+            x_out: Output tensor [B, N, out_features].
+        """
+        B, M, D = s.shape
+
+        # --- 1. SPLIT INTO HEADS AND PROJECT ---
+        # [B, M, D] -> [B, M, H, d_k] -> [B, H, M, d_k]
+        s_heads = s.view(B, M, self.H, self.d_k).permute(0, 2, 1, 3)
+        # Per-head projection (Faster Deslice)
+        s_heads = self.linear3(s_heads)  # [B, H, M, d_k]
+
+        # --- 2. PER-HEAD SPATIAL RECONSTRUCTION ---
+        # [B, N, H, M] -> [B, H, N, M]
+        w_deslice = w.permute(0, 2, 1, 3)
+        # [B, H, N, M] @ [B, H, M, d_k] -> [B, H, N, d_k]
+        x_out_heads = torch.matmul(w_deslice, s_heads)
+
+        # --- 3. HEAD RECOMBINATION ---
+        # [B, H, N, d_k] -> [B, N, H, d_k] -> [B, N, D]
+        x_out = x_out_heads.permute(0, 2, 1, 3).contiguous().view(B, -1, D)
+
+        # --- 4. FINAL PROJECTION ---
+        x_out = self.linear_out(x_out)  # [B, N, out_features]
+
+        return x_out
+
+
+class SlicingBlock(nn.Module):
+    def __init__(self, in_features: int, out_features: int, num_slices: int, temp: float = 1.0):
+        super().__init__()
+        self.M = num_slices
+        self.weight_proj = nn.Linear(in_features, num_slices)  # ? w ? R^{N�M}
+        self.linear1 = nn.Linear(in_features, out_features)  # x_proj
+        temp_ini = torch.log(torch.exp(torch.tensor(temp)) - 1.0)
+        self.temp = nn.Parameter(temp_ini)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        temp = F.softplus(self.temp) + 0.05
+
+        # w ? [B, N, M]
+        w = torch.softmax(self.weight_proj(x) / temp, dim=-1)
+
+        # d ? [B, M] � somme des poids par slice
+        d = w.sum(dim=1)  # [B, M]
+
+        # s_raw = w? x_proj : [B, M, N] @ [B, N, D] ? [B, M, D]
+        s_raw = self.linear1(torch.bmm(w.permute(0, 2, 1), x))
+
+        # Normalisation diagonale
+        s = s_raw / (d.unsqueeze(-1) + 1e-8)  # [B, M, D]
+
+        return s, w
+
+
+class DeslicingBlock(nn.Module):
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+
+        self.linear3 = nn.Linear(in_features, out_features)
+
+    def forward(self, s_prime, w):
+        # s_prime : [B, M, D],  w : [B, N, M]
+
+        # Faster deslice (Eq. 3)
+        s_out = self.linear3(s_prime)  # [B, M, C_out]
+
+        # Reprojection vers N : w @ s_out ? [B, N, M] @ [B, M, C_out]
+        x_out = torch.bmm(w, s_out)  # [B, N, C_out]
+
+        return x_out
+
+
+class TransolverBlockv3(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int,
+        num_slices: int,
+        num_heads: int = 4,
+        num_layers: int = 1,
+        dim_feedforward: Optional[int] = None,
+        dropout: float = 0.1,
+        temp: float = 1.0,
+    ):
+        """
+        Complete Transolver3 Block combining Slicing, L Attention Layers, and Deslicing.
+        in_features:     Input/output physical channels per mesh point (C)
+        hidden_features: Latent dimension for attention layers (D)
+        num_slices:      Number of physical slices M
+        num_heads:       Number of heads H
+        num_layers:      Number of attention layers L
+        dim_feedforward: Hidden dimension of FFN (defaults to 4 * hidden_features)
+        """
+        super().__init__()
+        if dim_feedforward is None:
+            dim_feedforward = 4 * hidden_features
+
+        self.norm = nn.LayerNorm(in_features)
+
+        # Slicing: Mesh space [B, N, C] -> Slice space [B, M, D]
+        self.slicing = SlicingBlock(
+            in_features=in_features,
+            out_features=hidden_features,
+            num_slices=num_slices,
+            temp=temp,
+        )
+        # L Layers of Transformer Attention on slice space
+        self.attention_layers = nn.ModuleList(
+            [
+                TransformerBlock(
+                    dim=hidden_features,
+                    n_heads=num_heads,
+                    mlp_dim=dim_feedforward,
+                    dropout=dropout,
+                    activation=nn.GELU,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        # Deslicing: Slice space [B, M, D] -> Mesh space [B, N, C]
+        self.deslicing = DeslicingBlock(
+            in_features=hidden_features,
+            out_features=in_features,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, N, C] - Input mesh tensor
+        Returns: [B, N, C] - Output mesh tensor
+        """
+        # Pre-norm + r�siduelle
+        residual = x
+        x = self.norm(x)
+
+        s, w = self.slicing(x)
+        for layer in self.attention_layers:
+            s = layer(s)
+        x_out = self.deslicing(s, w)
+
+        return residual + x_out
 
 
 class IAETBlock(nn.Module):
