@@ -13,8 +13,15 @@ from ..core.encoding import AdaptiveRoPE2D, IntegratedPositionalEncoding, Adapti
 
 
 class WindowAttention(nn.Module):
+    """Window-based self-attention layer with rotary positional encoding."""
 
     def __init__(self, dim: int, num_heads: int):
+        """Initialize the attention layer.
+
+        Args:
+            dim: Size of each token embedding.
+            num_heads: Number of attention heads. The embedding size must be divisible by this value.
+        """
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -30,13 +37,24 @@ class WindowAttention(nn.Module):
         coords: torch.Tensor,  # [B*nW, win_h, win_w, 2]  absolute coordinates(y,x) in [-1, 1]
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Apply window attention to a batch of local tokens.
+
+        Args:
+            x: Input tokens with shape [B*nW, N, dim].
+            coords: Absolutecoordinates (of original grid) reshaped as [num_windows, win_h*win_w, win_h*win_w, 2]
+            mask: Optional attention mask with shape [num_windows, win_h*win_w, win_h*win_w].
+
+        Returns:
+            A tensor of shape [B*nW, N, dim] containing the attended features.
+        """
+
         b_win, n, c = x.shape
         h = self.num_heads
 
         qkv = self.qkv(x).reshape(b_win, n, 3, h, self.d_head).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # [B*nW, H, N, d_head]
 
-        # RoPE appliqu� sur q et k uniquement
+        # Apply RoPE to queries and keys only.
         q = self.rope.rotate(q, coords)
         k = self.rope.rotate(k, coords)
 
@@ -53,17 +71,16 @@ class WindowAttention(nn.Module):
 
 
 class WindowCrossAttention(nn.Module):
-    """
-    Local cross-attention using learnable queries per window.
-    """
+    """Local cross-attention module that compresses tokens into a small learnable query grid."""
 
     def __init__(self, in_ch: int, dim: int, num_heads: int, m: int = 1):
-        """
+        """Initialize the cross-attention module.
+
         Args:
-            in_ch: Input dimension for key/value.
-            dim: Output dimension for queries/keys/values.
-            num_heads: Number of attention heads.
-            m: Grid size of the learnable queries (m*m queries).
+            in_ch: Input feature dimension for the keys and values.
+            dim: Hidden dimension used for the queries, keys, values, and output projection.
+            num_heads: Number of attention heads. The dimension must be divisible by this value.
+            m: Side length of the learnable query grid, yielding $m^2$ queries per window.
         """
         super().__init__()
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
@@ -73,7 +90,7 @@ class WindowCrossAttention(nn.Module):
         self.m = m
         self.scale = self.d_head**-0.5
 
-        # Learnable queries defined in target dim
+        # Learnable queries defined in the target latent space.
         self.latent_queries = nn.Parameter(torch.randn(1, m * m, dim) * 0.02)
 
         self.q_proj = nn.Linear(dim, dim, bias=True)
@@ -81,15 +98,15 @@ class WindowCrossAttention(nn.Module):
         self.v_proj = nn.Linear(in_ch, dim, bias=True)
         self.out_proj = nn.Linear(dim, dim)
 
-        # self.rope = AdaptiveRoPE2D(self.d_head) # Assumed defined elsewhere
-
     def forward(self, x: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
-        """
+        """Compress a set of local tokens into a learned query grid.
+
         Args:
-            x: Input tokens of shape [B_win, N_in, in_ch].
-            coords: Absolute coordinates of shape [B_win, N_in, 2].
+            x: Input tokens with shape [B_win, N_in, in_ch].
+            coords: Absolute coordinates for the input tokens with shape [B_win, N_in, 2].
+
         Returns:
-            Aggregated tokens of shape [B_win, m*m, dim].
+            Aggregated tokens with shape [B_win, m*m, dim].
         """
         b_win, n, _ = x.shape
         h = self.num_heads
@@ -102,8 +119,7 @@ class WindowCrossAttention(nn.Module):
         k = self.k_proj(x).reshape(b_win, n, h, self.d_head).transpose(1, 2)
         v = self.v_proj(x).reshape(b_win, n, h, self.d_head).transpose(1, 2)
 
-        # Apply position encoding on keys (placeholder for your RoPE logic)
-        # k = self.rope.rotate(k, coords)
+        # Position encoding on keys can be added here if needed.
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = F.softmax(attn, dim=-1)
@@ -113,6 +129,8 @@ class WindowCrossAttention(nn.Module):
 
 
 class AdaptiveSwinBlock(nn.Module):
+    """A Swin-style transformer block with local window attention and optional shifted windows."""
+
     def __init__(
         self,
         dim: int,
@@ -122,6 +140,16 @@ class AdaptiveSwinBlock(nn.Module):
         mlp_factor: int = 4,
         shift: bool = False,
     ):
+        """Initialize the Swin block.
+
+        Args:
+            dim: Feature dimension of each token.
+            grid_windows: Number of windows along the height and width axes, provided as (nw_h, nw_w).
+            num_heads: Number of attention heads in the local window attention module.
+            activation: Activation class used by the MLP subnetwork.
+            mlp_factor: Expansion factor for the hidden size of the MLP.
+            shift: If True, use shifted windows in the attention operation.
+        """
         super().__init__()
         self.dim = dim
         self.nw_h, self.nw_w = grid_windows
@@ -151,31 +179,39 @@ class AdaptiveSwinBlock(nn.Module):
         return attn_mask.masked_fill(attn_mask != 0, -100.0).masked_fill(attn_mask == 0, 0.0)
 
     def _build_coords(self, h, w, win_h, win_w, shift_h, shift_w, b, device):
+        """Build absolute coordinates for tokens after window partitioning.
+
+        Returns a tensor of shape [B*nW, win_h*win_w, 2] in the range [-1, 1].
         """
-        Coordonnees absolues de chaque token apres partitionnement en fenetres.
-        Retourne [B*nW, win_h*win_w, 2] en espace [-1, 1].
-        Le pas inter-pixel est 2/H et 2/W (coordonnees image globales).
-        """
-        # Grille globale AVANT shift (positions des tokens dans l'image)
+        # Global grid before shifting.
         gy = (torch.arange(h, device=device).float() / h) * 2 - 1  # [-1, 1)
         gx = (torch.arange(w, device=device).float() / w) * 2 - 1
         cy, cx = torch.meshgrid(gy, gx, indexing="ij")  # [H, W]
         coords_img = torch.stack([cy, cx], dim=-1)  # [H, W, 2]
 
-        # Applique le m�me roll que sur x
+        # Apply the same shift to the coordinates as to the feature map.
         if shift_h > 0 or shift_w > 0:
             coords_img = torch.roll(coords_img, shifts=(-shift_h, -shift_w), dims=(0, 1))
 
-        # Partitionne exactement comme x_win
+        # Partition the coordinates exactly like the feature tokens.
         coords_win = coords_img.view(self.nw_h, win_h, self.nw_w, win_w, 2)
         coords_win = coords_win.permute(0, 2, 1, 3, 4).contiguous()  # [nW_h, nW_w, win_h, win_w, 2]
         coords_win = coords_win.view(self.nw_h * self.nw_w, win_h, win_w, 2)
 
-        # Repete sur le batch
+        # Repeat over the batch dimension.
         coords_win = coords_win.unsqueeze(0).expand(b, -1, -1, -1, -1)  # [B, nW, win_h, win_w, 2]
         return coords_win.reshape(b * self.nw_h * self.nw_w, win_h, win_w, 2)
 
     def forward(self, x: torch.Tensor, use_mask: bool = True) -> torch.Tensor:
+        """Apply the Swin block to a 4D feature map.
+
+        Args:
+            x: Input tensor of shape [B, H, W, C].
+            use_mask: If True, generate an attention mask when shifted windows are enabled.
+
+        Returns:
+            A tensor with the same shape as the input, containing the updated features.
+        """
         b, h, w, d = x.shape
         shortcut = x
         x = self.norm1(x)
@@ -189,7 +225,7 @@ class AdaptiveSwinBlock(nn.Module):
         else:
             mask = None
 
-        # Coordonnees absolues [B * num_win, win_h, win_w, 2]
+        # Absolute coordinates with shape [B * num_win, win_h, win_w, 2].
         coords = self._build_coords(h, w, win_h, win_w, shift_h, shift_w, b, x.device)
 
         x_win = x.view(b, self.nw_h, win_h, self.nw_w, win_w, d)
@@ -207,6 +243,8 @@ class AdaptiveSwinBlock(nn.Module):
 
 
 class PaddedSwinBlock(nn.Module):
+    """A Swin-style block with optional padding and boundary-aware window attention."""
+
     def __init__(
         self,
         dim: int,
@@ -218,6 +256,18 @@ class PaddedSwinBlock(nn.Module):
         bc_mode: str = "circular",
         rope_max_freq: float = 8.0,
     ):
+        """Initialize the padded Swin block.
+
+        Args:
+            dim: Feature dimension of each token.
+            grid_windows: Number of windows along height and width, provided as (nw_h, nw_w).
+            num_heads: Number of attention heads in the local window attention module.
+            activation: Activation class used by the MLP subnetwork.
+            pad: If True, pad the input tensor before computing window attention.
+            mlp_factor: Expansion factor for the hidden size of the MLP.
+            bc_mode: Boundary padding mode used for the padded feature map.
+            rope_max_freq: Maximum frequency used by the positional encoding component.
+        """
         super().__init__()
         self.dim = dim
         self.nw_h, self.nw_w = grid_windows
@@ -248,25 +298,22 @@ class PaddedSwinBlock(nn.Module):
         b: int,
         device: torch.device,
     ) -> torch.Tensor:
+        """Build absolute coordinates for padded tokens in the range [-1, 1].
+
+        Returns a tensor of shape [B * current_nw_h * current_nw_w, win_h * win_w, 2].
         """
-        Coordonnees absolues en espace [-1, 1] pour les tokens paddes.
-        Les tokens hors grille originale re�oivent des coords extrapol�es �
-        coherent avec la s�mantique de bc_mode (circulaire, r�fl�chi, etc.).
-        Retourne [B * current_nw_h * current_nw_w, win_h * win_w, 2].
-        """
-        # Pas uniforme bas� sur la grille originale
+        # Uniform step based on the original grid.
         step_y = 2.0 / h
         step_x = 2.0 / w
 
-        # Coordonn�es du tenseur padd� : tokens originaux dans [-1, 1),
-        # tokens de padding extrapol�s naturellement hors de cet intervalle
+        # Coordinates of the padded tensor: original tokens lie in [-1, 1), while padded tokens lie outside that range.
         gy = (torch.arange(h_pad, device=device).float() - pad_h) * step_y - 1.0 + step_y / 2
         gx = (torch.arange(w_pad, device=device).float() - pad_w) * step_x - 1.0 + step_x / 2
 
         cy, cx = torch.meshgrid(gy, gx, indexing="ij")  # [H_pad, W_pad]
         coords_img = torch.stack([cy, cx], dim=-1)  # [H_pad, W_pad, 2]
 
-        # Partitionne comme x_win
+        # Partition the coordinates like the flattened window tokens.
         coords_win = coords_img.view(current_nw_h, win_h, current_nw_w, win_w, 2)
         coords_win = coords_win.permute(0, 2, 1, 3, 4).contiguous()  # [nW_h, nW_w, win_h, win_w, 2]
         coords_win = coords_win.view(current_nw_h * current_nw_w, win_h, win_w, 2)
@@ -274,6 +321,14 @@ class PaddedSwinBlock(nn.Module):
         return coords_win.unsqueeze(0).expand(b, -1, -1, -1).reshape(b * current_nw_h * current_nw_w, win_h, win_w, 2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the padded Swin block to a 4D feature map.
+
+        Args:
+            x: Input tensor of shape [B, H, W, C].
+
+        Returns:
+            A tensor with the same shape as the input, containing the updated features.
+        """
         b, h, w, d = x.shape
         shortcut = x
         x = self.norm1(x)
@@ -334,7 +389,7 @@ class PaddedSwinBlock(nn.Module):
 
 
 class CondTransformerBlock(nn.Module):
-    """Transformer block with adaptive normalization layers."""
+    """Transformer block with adaptive normalization layers conditioned on an external context vector."""
 
     def __init__(
         self,
@@ -345,6 +400,16 @@ class CondTransformerBlock(nn.Module):
         dropout: float = 0.1,
         rmsnorm: bool = True,
     ):
+        """Initialize the conditioned transformer block.
+
+        Args:
+            dim: Token embedding size.
+            n_heads: Number of attention heads.
+            activation: Activation class used in the MLP.
+            mlp_dim: Hidden size of the feed-forward network.
+            dropout: Dropout probability applied in the MLP.
+            rmsnorm: If True, use RMS normalization; otherwise use adaptive layer normalization.
+        """
         super().__init__()
         assert dim % n_heads == 0, "dim must be divisible by n_heads"
 
@@ -373,13 +438,18 @@ class CondTransformerBlock(nn.Module):
             self.norm2 = AdaptiveLayerNorm(dim)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        """
-        x:     [B, N, C] tokens
-        t_emb: [B, C] global conditionning tensor
+        """Apply the conditioned transformer block to a sequence of tokens.
+
+        Args:
+            x: Input token tensor of shape [B, N, C].
+            cond: Conditioning vector of shape [B, C] used by the adaptive normalization layers.
+
+        Returns:
+            The updated token tensor with the same shape as the input.
         """
         B, N, C = x.shape
 
-        # 1. Attention chunk (Pre-LN)
+        # Attention block (pre-LN).
         res = x
         x = self.norm1(x, cond)
 
@@ -393,7 +463,7 @@ class CondTransformerBlock(nn.Module):
 
         x = x + res
 
-        # 2. MLP chunk (Pre-LN)
+        # MLP block (pre-LN).
         res = x
         x = self.norm2(x, cond)
         x = self.mlp(x)
@@ -403,10 +473,7 @@ class CondTransformerBlock(nn.Module):
 
 
 class SwinEncoder(nn.Module):
-    """
-    Encoder combining Adaptive Swin Transformer blocks with a
-    Local Galerkin Cross-Attention projection to extract resolution-invariant latents.
-    """
+    """Encoder built from adaptive Swin blocks and a local cross-attention projection to extract compact latents."""
 
     def __init__(
         self,
@@ -422,6 +489,21 @@ class SwinEncoder(nn.Module):
         cross_attention: str = "vanilla",
         ndim: int = 2,
     ):
+        """Initialize the encoder.
+
+        Args:
+            m: Side length of the target latent grid, producing $m \times m$ latent tokens.
+            in_channels: Number of input channels in the physical field.
+            latent_dim: Hidden dimension of the latent features.
+            num_blocks: Number of Swin blocks stacked in the encoder.
+            num_heads: Number of attention heads used in each block.
+            mlp_factor: Expansion factor used in the MLP subnetwork.
+            activation: Activation class used by the block MLPs.
+            block_type: Type of Swin block to use: "swin" or "padded".
+            bc_mode: Boundary padding mode for padded blocks.
+            cross_attention: Type of cross-attention used for latent extraction.
+            ndim: Number of extra spatial coordinates concatenated to the input features.
+        """
         super().__init__()
 
         assert latent_dim % num_heads == 0, "Model dimension must be divisible by num_heads"
@@ -437,13 +519,11 @@ class SwinEncoder(nn.Module):
         self.m = m  # Target grid size (M x M)
         self.latent_dim = latent_dim  # Global depth (D)
 
-        # 1. Input Lifting: Map physical channels to latent space depth
+        # Lift physical channels into the latent space.
         self.lifting = nn.Linear(in_channels + ndim, latent_dim)
         # self.pe = MultiScaleFourierEmbedding(2, latent_dim, [10, 20])
 
-        # 2. Stack of Swin Blocks (Alternating between Standard and Shifted)
-        # Note: According to your constraint, we ensure the last block is NOT shifted
-        # so that the Local Galerkin Extractor receives a clean M x M topology.
+        # Stack Swin blocks, ensuring the last one is not shifted so the latent extractor sees a clean grid.
         blocks = []
         for i in range(num_blocks):
             # Alternate shift if num_blocks is even, start with shifted windows
@@ -478,7 +558,7 @@ class SwinEncoder(nn.Module):
 
         self.swin_layers = nn.Sequential(*blocks)
 
-        # 3. Final Latent Extraction via Local Cross-Attention
+        # Extract compact latent tokens with local cross-attention.
         self.latent_extractor = WindowCrossAttention(in_ch=latent_dim, dim=latent_dim, num_heads=num_heads)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -499,21 +579,19 @@ class SwinEncoder(nn.Module):
 
         x = x.permute(0, 2, 3, 1)
 
-        # pe = self.pe(global_coords.permute(0, 2, 3, 1).view(b, h * w, 2)).view(b, h, w, -1)
-        # x = torch.cat([x, pe], dim=-1)
-
         x = self.lifting(x)
 
         # Process through Swin Blocks
         x = self.swin_layers(x)
 
-        # Extract the compact M*M latent tokens using Local Cross-Attention
+        # Extract the compact latent tokens using local cross-attention.
         latent = self.latent_extractor(x)
 
         return latent
 
 
 class SwinNO(nn.Module):
+    """A Swin-based neural operator that maps input fields to output fields while preserving spatial structure."""
 
     def __init__(
         self,
@@ -529,6 +607,21 @@ class SwinNO(nn.Module):
         bc_mode: str = "circular",
         ndim: int = 2,
     ):
+        """Initialize the neural operator.
+
+        Args:
+            winsize: Window size used by the Swin blocks.
+            in_channels: Number of input channels in the physical field.
+            out_channels: Number of output channels in the predicted field.
+            latent_dim: Hidden dimension of the latent representation.
+            num_blocks: Number of Swin blocks in the encoder stack.
+            num_heads: Number of attention heads in each block.
+            mlp_factor: Expansion factor for the MLP hidden size.
+            activation: Activation class used by the MLP layers.
+            block_type: Type of Swin block to use: "swin" or "padded".
+            bc_mode: Boundary padding mode for padded blocks.
+            ndim: Number of spatial coordinates used as positional features.
+        """
         super().__init__()
 
         assert latent_dim % num_heads == 0, "Model dimension must be divisible by num_heads"
@@ -540,7 +633,7 @@ class SwinNO(nn.Module):
         self.winsize = winsize  # Window size
         self.latent_dim = latent_dim  # Global depth (D)
 
-        # Input Lifting
+        # Lift the input features to the latent dimension.
         self.lifting = nn.Linear(in_channels, latent_dim)
         self.pos_encoder = nn.Linear(ndim, latent_dim)
         self.pre_norm = nn.RMSNorm(latent_dim)
@@ -610,21 +703,35 @@ class SwinNO(nn.Module):
 
 
 class TimeEmbedding(nn.Module):
-    """Maps a scalar time t to a continuous vector embedding using Fourier features."""
+    """Maps a scalar time value to a continuous vector embedding using Fourier features."""
 
     def __init__(self, dim: int, scale: float = 10.0):
+        """Initialize the embedding layer.
+
+        Args:
+            dim: Output embedding dimension.
+            scale: Standard deviation used to sample the Fourier frequencies.
+        """
         super().__init__()
         self.dim = dim
         self.register_buffer("frequencies", torch.randn(dim // 2) * scale)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """Embed one or more scalar time values.
+
+        Args:
+            t: Input time tensor of shape [B, 1].
+
+        Returns:
+            A Fourier feature embedding of shape [B, dim].
+        """
         # t shape: [B, 1]
         phases = t @ self.frequencies.unsqueeze(0)  # [B, dim // 2]
         return torch.cat([torch.sin(phases), torch.cos(phases)], dim=-1)
 
 
 class ContinuousTimePropagator(nn.Module):
-    """Propagates the latent initial state g_0 to g(t) using time modulation."""
+    """Propagates an initial latent state to a target time using time-conditioned transformer layers."""
 
     def __init__(
         self,
@@ -635,6 +742,16 @@ class ContinuousTimePropagator(nn.Module):
         mlp_factor: int = 4,
         rmsnorm: bool = True,
     ):
+        """Initialize the propagator.
+
+        Args:
+            latent_dim: Dimension of each latent token.
+            num_layers: Number of conditioned transformer blocks.
+            num_heads: Number of attention heads in each block.
+            activation: Activation class used by the time embedding network.
+            mlp_factor: Expansion factor used in the transformer MLPs.
+            rmsnorm: If True, use RMS normalization in the conditioned blocks.
+        """
         super().__init__()
         self.time_embedding = nn.Sequential(
             TimeEmbedding(latent_dim),
@@ -658,18 +775,22 @@ class ContinuousTimePropagator(nn.Module):
         )
 
     def forward(self, z_0: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Propagate latent states from an initial time to a target time.
+
+        Args:
+            z_0: Initial latent tokens of shape [B, M*M, latent_dim].
+            t: Target time values of shape [B, 1].
+
+        Returns:
+            The propagated latent tokens with the same shape as the input.
         """
-        g_0: [B, M*M, latent_dim] (Latent at t=0)
-        t:   [B, 1] (Target time, continuous)
-        """
-        # 1. Compute global time embedding context
+        # Compute the global time embedding context.
         t_emb = self.time_embedding(t)  # [B, latent_dim]
 
-        # 2. Propagate latent through the modulated transformer layers
+        # Propagate the latent state through the conditioned transformer layers.
         z_t = z_0
         for layer in self.layers:
-            # En pratique, vous passez t_emb à vos blocs pour moduler les AdaNorm :
-            # g_t = layer(g_t, t_emb)
+            # The conditioning vector is passed to the adaptive normalization layers.
             z_t = layer(z_t, t_emb)  # Version standard simplifiée pour le script
 
         return z_t  # [B, M*M, latent_dim]
@@ -688,6 +809,14 @@ class LocalTextureEstimatorDecoder(nn.Module):
         grid_size: int,
         hidden_dim: int = 256,
     ):
+        """Initialize the local texture estimator decoder.
+
+        Args:
+            latent_dim: Dimension of each latent token.
+            out_channels: Number of output channels predicted for each query location.
+            grid_size: Side length of the latent grid used to reshape the latent sequence.
+            hidden_dim: Hidden dimension used by the frequency and amplitude estimators.
+        """
         super().__init__()
         self.grid_size = grid_size
         self.latent_dim = latent_dim
@@ -708,22 +837,23 @@ class LocalTextureEstimatorDecoder(nn.Module):
         )
 
     def forward(self, z: torch.Tensor, out_coords: torch.Tensor) -> torch.Tensor:
-        """
+        """Decode a latent grid at arbitrary 2D query coordinates.
+
         Args:
-            z: [B, M*M, latent_dim] Latent grid tokens.
-            out_coords: [1, H_out, W_out, 2] Target evaluation coordinates in [-1, 1].
+            z: Latent tokens of shape [B, M*M, latent_dim].
+            out_coords: Query coordinates of shape [1, H_out, W_out, 2] or [B, H_out, W_out, 2], scaled to [-1, 1].
+
         Returns:
-            [B, out_channels, H_out, W_out] Continuous field prediction.
+            A continuous field tensor of shape [B, out_channels, H_out, W_out].
         """
         b, _, d = z.shape
         _, h, w, _ = out_coords.shape
         out_coords = out_coords.expand(b, -1, -1, -1)
 
-        # 1. Reshape sequence to spatial grid for neighborhood sampling
+        # Reshape the latent sequence into a spatial grid for neighborhood sampling.
         z_grid = z.view(b, self.grid_size, self.grid_size, d).permute(0, 3, 1, 2)  # [B, D, M, M]
 
-        # 2. Locate the 4 nearest cells (LIIF/LTE grid-unfolding technique)
-        # Transform coords to pixel index space [0, M]
+        # Locate the four nearest cells for local decoding.
         grid_coords = (out_coords + 1.0) * (self.grid_size / 2.0) - 0.5
         tl_coords = torch.floor(grid_coords)
 
@@ -731,45 +861,42 @@ class LocalTextureEstimatorDecoder(nn.Module):
         outputs = []
         areas = []
 
-        # 3. Predict field for each of the 4 local neighbor cells
+        # Predict the field for each of the four neighboring cells.
         for dy, dx in offsets:
-            # Absolute cell index
+            # Absolute cell index.
             n_coords = tl_coords + torch.tensor([dx, dy], device=out_coords.device)
             n_coords = torch.clamp(n_coords, 0, self.grid_size - 1)
 
-            # Center of the current neighbor cell in [-1, 1] space
+            # Center of the current neighbor cell in the normalized coordinate space.
             n_centers = (n_coords + 0.5) / (self.grid_size / 2.0) - 1.0
 
-            # Relative coordinate vector from cell center to target coordinate
+            # Relative coordinate vector from the cell center to the target coordinate.
             rel_coords = out_coords - n_centers  # [B, H, W, 2]
 
-            # Sample latent code at this neighbor cell location
+            # Sample latent features at this neighbor cell location.
             n_coords_norm = n_centers  # Coordinate used for nearest sampling
             z_sample = F.grid_sample(z_grid, n_coords_norm, mode="nearest", padding_mode="border", align_corners=False)
             z_sample = z_sample.permute(0, 2, 3, 1)  # [B, H, W, D]
 
-            # 4. LTE Core: Estimate dynamic frequencies and amplitudes from z
-            # Frequencies split into X and Y components: [B, H, W, hidden_dim]
+            # Estimate local frequencies and amplitudes from the sampled latent features.
             freqs = self.freq_estimator(z_sample).view(b, h, w, self.hidden_dim, 2)
             amps = self.amp_estimator(z_sample)  # [B, H, W, hidden_dim]
 
-            # Mathematical formulation: Amp * cos(pi * (Freq_x * rel_x + Freq_y * rel_y))
-            # rel_coords project onto estimated local coordinate frequency grid
+            # Compute the local Fourier features from the relative coordinates.
             rel_projected = (rel_coords.unsqueeze(-2) * freqs).sum(dim=-1)  # [B, H, W, hidden_dim]
 
             # Dynamic Fourier feature expansion
             lte_features = amps * torch.cos(math.pi * rel_projected)
 
-            # Pass through localized MLP projection
+            # Pass the features through the local MLP projection.
             cell_pred = self.im_net(lte_features)
             outputs.append(cell_pred)
 
-            # 5. Compute bilinear area weight for late fusion (barycentric vote)
-            # Area is inversely proportional to distance to the opposite corner
+            # Compute the area weight used in the late fusion step.
             area = torch.prod(1.0 - torch.abs(grid_coords - n_coords), dim=-1, keepdim=True)
             areas.append(area + 1e-6)
 
-        # 6. Complementary area weighted ensemble (Ensemble vote from 4 neighbors)
+        # Combine the four neighboring predictions with the computed weights.
         total_weight = sum(areas)
         final_output = sum(out * (weight / total_weight) for out, weight in zip(outputs, areas))
 
@@ -788,6 +915,16 @@ class ImplicitDecoder(nn.Module):
         ndim: int = 2,
         rmsnorm: bool = True,
     ):
+        """Initialize the implicit decoder.
+
+        Args:
+            latent_dim: Dimension of each latent token.
+            out_channels: Number of output channels produced by the decoder.
+            grid_size: Side length of the latent grid used to reshape the latent sequence.
+            activation: Activation class used in the MLP head.
+            ndim: Number of spatial coordinates passed to the decoder input.
+            rmsnorm: If True, use RMS normalization on the sampled features; otherwise use LayerNorm.
+        """
         super().__init__()
         self.grid_size = grid_size
         self.latent_dim = latent_dim
@@ -806,18 +943,20 @@ class ImplicitDecoder(nn.Module):
         )
 
     def forward(self, z_t: torch.Tensor, out_coords: torch.Tensor) -> torch.Tensor:
-        """
+        """Decode a latent sequence at arbitrary output coordinates.
+
         Args:
-            z_t: [B, M*M, D] Latent grid sequence.
-            out_coords: [1, H_out, W_out, 2] Target coordinates scaled in [-1, 1].
+            z_t: Latent tokens of shape [B, M*M, latent_dim].
+            out_coords: Query coordinates of shape [1, H_out, W_out, 2] or [B, H_out, W_out, 2], scaled to [-1, 1].
+
         Returns:
-            [B, out_channels, H_out, W_out] Reconstructed image.
+            A reconstructed field of shape [B, out_channels, H_out, W_out].
         """
         b, _, d = z_t.shape
         out_coords = out_coords.expand(b, -1, -1, -1)
         _, h_out, w_out, _ = out_coords.shape
 
-        # 1. Feature extraction via bilinear sampling
+        # Extract local features by bilinear sampling.
         z_grid = z_t.view(b, self.grid_size, self.grid_size, self.latent_dim).permute(0, 3, 1, 2)
 
         # out_coords expected in [-1, 1] for grid_sample
@@ -825,7 +964,7 @@ class ImplicitDecoder(nn.Module):
         local_features = local_features.permute(0, 2, 3, 1)
         local_features = self.norm(local_features)
 
-        # 2. Compute relative coordinates to the nearest latent cell center
+        # Compute relative coordinates to the nearest latent cell center.
         # Scale coords from [-1, 1] to [0, M] to easily find cell centers
         grid_coords = (out_coords + 1.0) * (self.grid_size / 2.0)
 
@@ -836,12 +975,12 @@ class ImplicitDecoder(nn.Module):
         rel_coords = (grid_coords - nearest_centers) * 2.0
         rel_coords = rel_coords.view(b, h_out, w_out, -1)
 
-        # 3. Apply Positional Encoding on local relative coordinates
+        # Apply positional encoding to the local relative coordinates.
         # cell_size = torch.tensor([2.0 / h_out, 2.0 / w_out], device=z_t.device)
         # cell_size = cell_size.view(1, 1, 2).view(1, 1, 2)
         # global_pe = self.pe(out_coords.view(b, -1, 2), cell_size).view(b, h_out, w_out, d)
 
-        # 4. Forward MLP
+        # Pass the concatenated features through the MLP.
         inr_input = torch.cat([local_features, rel_coords, out_coords], dim=-1)
         output = self.im_net(inr_input)
 
@@ -859,6 +998,15 @@ class LIIFDecoder(nn.Module):
         activation=nn.GELU,
         rmsnorm: bool = True,
     ):
+        """Initialize the LIIF-style decoder.
+
+        Args:
+            latent_dim: Dimension of each latent token.
+            out_channels: Number of output channels produced by the decoder.
+            grid_size: Side length of the latent grid used to reshape the latent sequence.
+            activation: Activation class used in the MLP head.
+            rmsnorm: If True, use RMS normalization on the sampled features; otherwise use LayerNorm.
+        """
         super().__init__()
         self.grid_size = grid_size  # Latent grid size M (e.g., 16)
         self.latent_dim = latent_dim
@@ -881,18 +1029,22 @@ class LIIFDecoder(nn.Module):
         )
 
     def forward(self, z_t: torch.Tensor, out_coords: torch.Tensor) -> torch.Tensor:
-        """
-        z_t:          [B, M*M, latent_dim] (Latent grid sequence)
-        out_coords:   [B1 H_out, W_out, 2] (Target continuous coords in [-1, 1] or [0, 1])
+        """Decode the latent grid at continuous output coordinates using a local ensemble.
+
+        Args:
+            z_t: Latent tokens of shape [B, M*M, latent_dim].
+            out_coords: Query coordinates of shape [B, H_out, W_out, 2] or [1, H_out, W_out, 2], given in [-1, 1] or [0, 1].
+
+        Returns:
+            A tensor of shape [B, out_channels, H_out, W_out].
         """
         b, h_out, w_out, _ = out_coords.shape
         M = self.grid_size
 
-        # Reshape latent to spatial grid: [B, D, M, M]
+        # Reshape the latent sequence into a spatial grid with shape [B, D, M, M].
         z_grid = z_t.view(b, M, M, self.latent_dim).permute(0, 3, 1, 2)
 
-        # 1. Generate cell centers coordinates of the MxM grid
-        # Generating coordinates in range [-1, 1] to match F.grid_sample convention
+        # Generate the center coordinates of the latent grid.
         rx = torch.linspace(-1 + 1 / M, 1 - 1 / M, M, device=out_coords.device)
         ry = torch.linspace(-1 + 1 / M, 1 - 1 / M, M, device=out_coords.device)
         grid_y, grid_x = torch.meshgrid(ry, rx, indexing="ij")
@@ -905,8 +1057,7 @@ class LIIFDecoder(nn.Module):
         else:
             coords = out_coords
 
-        # 2. Find the 4 nearest neighbors on the MxM grid for each output coordinate
-        # Scale coordinates to grid index space [0, M-1]
+        # Find the four nearest neighbors for each output coordinate.
         grid_coords = (coords + 1.0) * (M / 2.0) - 0.5
 
         # Top-left neighbor indices
@@ -919,22 +1070,19 @@ class LIIFDecoder(nn.Module):
         preds = []
         areas = []
 
-        # 3. Local Ensemble: Loop over the 4 nearest neighbors
+        # Evaluate the local ensemble over the four neighboring latent cells.
         for dx_idx, dy_idx in neighbor_offsets:
-            # Query indices for this specific neighbor
+            # Query indices for this neighbor.
             xi = x0 + dx_idx
             yi = y0 + dy_idx
 
-            # Extract corresponding latent centers: [B, H_out, W_out, 2]
-            # (Gathering from the grid centers for relative distance computation)
+            # Extract the corresponding latent centers with shape [B, H_out, W_out, 2].
             centers_i = latent_centers[yi, xi]
 
-            # Compute relative coordinate (dx, dy) scaled by grid cell size
+            # Compute the relative coordinate within the cell.
             rel_coords = (coords - centers_i) * M  # [B, H_out, W_out, 2]
 
-            # Extract latent features using grid_sample with nearest mode for the specific neighbor grid
-            # To be efficient, we prepare custom grid sampling for this specific neighbor quadrant
-            # Transform indices back to [-1, 1] coordinate space for grid_sample
+            # Sample the latent features for this specific neighbor using the local grid coordinates.
             norm_xi = (xi.float() + 0.5) / (M / 2.0) - 1.0
             norm_yi = (yi.float() + 0.5) / (M / 2.0) - 1.0
             grid_i = torch.stack([norm_xi, norm_yi], dim=-1)  # [B, H_out, W_out, 2]
@@ -944,31 +1092,38 @@ class LIIFDecoder(nn.Module):
             feat_i = feat_i.permute(0, 2, 3, 1)  # [B, H_out, W_out, D]
             feat_i = self.norm(feat_i)
 
-            # Concatenate token feature and local relative coordinate
+            # Concatenate the sampled latent feature with the local relative coordinate.
             inr_input = torch.cat([feat_i, rel_coords], dim=-1)  # [B, H_out, W_out, D + 2]
 
-            # Forward through MLP
+            # Pass the features through the MLP.
             pred_i = self.im_net(inr_input.view(-1, self.latent_dim + 2))
             preds.append(pred_i.view(b, h_out, w_out, -1))
 
-            # Compute areas for bilinear interpolation weight (distance to the opposite neighbor)
+            # Compute the bilinear interpolation weight for this neighbor.
             area_i = torch.abs(grid_coords[..., 0] - xi.float()) * torch.abs(grid_coords[..., 1] - yi.float())
             areas.append(area_i)
 
-        # 4. Complement areas for interpolation weights
-        # The weight is proportional to the area of the rectangle opposite to the neighbor
+        # Complement the interpolation weights for the four neighbors.
         total_area = sum(areas)
         weights = [areas[3], areas[2], areas[1], areas[0]]  # Swap corners for bilinear weight
 
-        # 5. Weighted ensemble sum
+        # Combine the predictions with the learned weights.
         output = sum(p * (w.unsqueeze(-1) / (total_area.unsqueeze(-1) + 1e-6)) for p, w in zip(preds, weights))
 
-        # [B, out_channels, H_out, W_out]
+        # Output shape: [B, out_channels, H_out, W_out].
         return output.permute(0, 3, 1, 2)
 
 
 class ResidualMLPBlock(nn.Module):
+    """A residual MLP block composed of two linear layers with a non-linearity."""
+
     def __init__(self, dim, activation=nn.GELU):
+        """Initialize the residual MLP block.
+
+        Args:
+            dim: Feature dimension of the input and output tensor.
+            activation: Activation class used between the two linear layers.
+        """
         super().__init__()
 
         self.net = nn.Sequential(
@@ -978,6 +1133,14 @@ class ResidualMLPBlock(nn.Module):
         )
 
     def forward(self, x):
+        """Apply the residual block to an input tensor.
+
+        Args:
+            x: Input tensor of shape [..., dim].
+
+        Returns:
+            The updated tensor with the same shape as the input.
+        """
         return x + self.net(x)
 
 
@@ -1027,7 +1190,7 @@ class LIIFDecoder(nn.Module):
         hidden_dim = hidden_dim if hidden_dim is not None else latent_dim
         _shortcut_dim = shortcut_dim if shortcut_dim is not None else 0
 
-        # Input layout: z_interp [D] | PE [D] | bilinear_weights [4] | shortcut [shortcut_dim]
+        # Input layout: z_interp [D] | PE [D] | bilinear_weights [4] | shortcut [shortcut_dim].
         in_dim = 2 * latent_dim + 4 + _shortcut_dim
         self.input_proj = nn.Linear(in_dim, hidden_dim)
 
@@ -1072,7 +1235,7 @@ class LIIFDecoder(nn.Module):
         # [B, M*M, D] → [B, M, M, D]  (z_grid[b, row, col] = z_grid[b, y, x])
         z_grid = z.view(B, M, M, D)
 
-        # ── 2. Map query coordinates [-1, 1] → continuous pixel indices [0, M-1] ─
+        # Map query coordinates from [-1, 1] to continuous pixel indices in [0, M-1].
         # out_coords[..., 0] = y → row index
         # out_coords[..., 1] = x → col index
         gy = (out_coords[..., 0] + 1.0) * 0.5 * (M - 1)  # [B, H, W]
@@ -1088,7 +1251,7 @@ class LIIFDecoder(nn.Module):
         dy = (gy - iy0.float()).unsqueeze(-1)  # [B, H, W, 1]  vertical
         dx = (gx - ix0.float()).unsqueeze(-1)  # [B, H, W, 1]  horizontal
 
-        # ── 3. Bilinear weights ───────────────────────────────────────────────────
+        # Compute the bilinear interpolation weights.
         # w_{row_offset, col_offset}: weight for the corner at (iy0+row_off, ix0+col_off)
         w00 = (1.0 - dy) * (1.0 - dx)  # top-left
         w01 = (1.0 - dy) * dx  # top-right
@@ -1097,7 +1260,7 @@ class LIIFDecoder(nn.Module):
         # [B, H, W, 4] — order matches z gather below
         weights = torch.cat([w00, w01, w10, w11], dim=-1)
 
-        # ── 4. Gather the 4 neighbouring latent tokens ────────────────────────────
+        # Gather the four neighboring latent tokens.
         # z_grid is indexed [B, row, col] = [B, y, x]
         batch_idx = torch.arange(B, device=z.device).view(B, 1, 1)
         z00 = z_grid[batch_idx, iy0, ix0]  # [B, H, W, D]  top-left
@@ -1108,18 +1271,16 @@ class LIIFDecoder(nn.Module):
         # Bilinear interpolation of latent codes
         z_interp = w00 * z00 + w01 * z01 + w10 * z10 + w11 * z11  # [B, H, W, D]
 
-        # ── 5. Integrated Positional Encoding of sub-cell displacement ────────────
+        # Apply integrated positional encoding to the sub-cell displacement.
         # Displacement is centred: 0.0 at cell centre, ±0.5 at cell edges.
         # Convention mirrors out_coords: local_coords[..., 0] = dy, [..., 1] = dx
         local_coords = torch.cat([dy - 0.5, dx - 0.5], dim=-1)  # [B, H, W, 2]
 
-        # Taille du pixel de sortie mesurée en unités de cellule latente
-        # Si H = M, cell_size = 1.0 (le pixel occupe toute la cellule)
-        # Si H = 2M, cell_size = 0.5 (le pixel occupe la moitié de la cellule)
+        # The output pixel size is expressed in latent-cell units.
         cell_size_y = M / H
         cell_size_x = M / W
 
-        # Tensor de forme [B, H, W, 2] ou [1, 1, 1, 2] pour le broadcasting
+        # Shape [B, H, W, 2] or [1, 1, 1, 2] for broadcasting.
         cell_size = torch.tensor([cell_size_y, cell_size_x], device=z.device, dtype=z.dtype).view(1, 1, 1, 2)
 
         # With Adaptive PE:
@@ -1166,18 +1327,17 @@ class LightLIIFDecoder(nn.Module):
         """
         B, H_in, W_in, D = shortcut.shape
         _, H_low, W_low, _ = latent.shape
-        # 1. Reshape low-res context to spatial grid for grid_sample: [B, D, H_low, W_low]
+        # Reshape the low-resolution context to a spatial grid with shape [B, D, H_low, W_low].
         low_res_grid = latent.permute(0, 3, 1, 2).contiguous()
 
-        # 2. Upsample the low-res context features to target resolution via bilinear interpolation
-        # This acts as a fast, geometric shortcut replacing cross-attention
+        # Upsample the low-resolution context to the target resolution with bilinear interpolation.
         context_upsampled = F.interpolate(low_res_grid, size=(H_in, W_in), mode="bilinear", align_corners=False)
         context_upsampled = context_upsampled.permute(0, 2, 3, 1).contiguous().view(B, H_in, W_in, D)
 
-        # 3. Concatenate high-res shortcut (fine details) and upsampled context (global semantics)
+        # Concatenate the high-resolution shortcut with the upsampled context.
         x = torch.cat([shortcut, context_upsampled], dim=-1)
 
-        # 4. Pixel-wise projection
+        # Apply the pixel-wise projection.
         return self.fusion_mlp(x)
 
 
@@ -1228,7 +1388,7 @@ class CrossAttentionUpsampler(nn.Module):
         h = self.num_heads
         d_head = D // h
 
-        # normalization
+        # Normalize the shortcut features.
         shortcut = self.q_norm(shortcut).reshape
         z_grid = self.latent_norm(z_grid)
 
@@ -1304,7 +1464,7 @@ class BlockCrossAttentionUpsampler(nn.Module):
         rh, rw = H // M1, W // M2
         n_queries = rh * rw  # Number of high-res pixels per latent token
 
-        # normalization
+        # Normalize the shortcut features.
         shortcut = self.q_norm(shortcut)
         z_grid = self.latent_norm(z_grid)
 
@@ -1359,13 +1519,13 @@ class BidirectionalUpsampler(nn.Module):
         super().__init__()
         self.num_heads = num_heads
 
-        # 1. Cross-attention: High-Res Queries attend to Low-Res Latent
+        # High-resolution queries attend to the low-resolution latent grid.
         self.q_proj = nn.Linear(shortcut_dim, latent_dim)
         self.kv_proj = nn.Linear(latent_dim, latent_dim * 2)
         self.out_proj_hr = nn.Linear(latent_dim, shortcut_dim)
         self.norm_hr = nn.LayerNorm(shortcut_dim)
 
-        # 2. Inverse Cross-attention: Low-Res Latent attends to High-Res Queries
+        # The low-resolution latent grid attends back to the high-resolution queries.
         self.latent_q_proj = nn.Linear(latent_dim, latent_dim)
         self.shortcut_kv_proj = nn.Linear(shortcut_dim, latent_dim * 2)
         self.out_proj_lr = nn.Linear(latent_dim, latent_dim)
@@ -1394,7 +1554,7 @@ class BidirectionalUpsampler(nn.Module):
             shortcut.view(B, M1, rh, M2, rw, C).permute(0, 1, 3, 2, 4, 5).contiguous().view(B, M1, M2, n_queries, C)
         )
 
-        # --- STEP 1: HIGH-RES ATTENDS TO LOW-RES (Standard local cross-attention) ---
+        # High-resolution features attend to the low-resolution latent grid.
         q = self.q_proj(q_local).view(B, M1, M2, n_queries, h, d_head).permute(0, 1, 2, 4, 3, 5)
         k, v = self.kv_proj(z_grid).view(B, M1, M2, 1, 2, h, d_head).unbind(dim=4)
         k, v = k.permute(0, 1, 2, 4, 3, 5), v.permute(0, 1, 2, 4, 3, 5)
@@ -1416,7 +1576,7 @@ class BidirectionalUpsampler(nn.Module):
             shortcut.view(B, M1, rh, M2, rw, C).permute(0, 1, 3, 2, 4, 5).contiguous().view(B, M1, M2, n_queries, C)
         )
 
-        # --- STEP 2: LOW-RES ATTENDS TO HIGH-RES (Inverse cross-attention) ---
+        # The low-resolution latent grid attends back to the high-resolution features.
         # Latent acts as Query: [B, M1, M2, h, 1, d_head]
         q_lr = self.latent_q_proj(z_grid).view(B, M1, M2, 1, h, d_head).permute(0, 1, 2, 4, 3, 5)
 
@@ -1478,7 +1638,7 @@ class MultiscaleCAEncoder(nn.Module):
         else:
             self.model_dim = model_dim
 
-        # Placeholder for PEBlock
+        # Positional encoding block placeholder.
         self.pos_encoder = PEBlock(in_features=2, out_features=self.model_dim[0], method=pe)
         self.mixer = nn.Linear(2 * self.model_dim[0], self.model_dim[0])
         self.input_proj = nn.Linear(in_channels, self.model_dim[0])
@@ -1545,6 +1705,14 @@ class MultiscaleCAEncoder(nn.Module):
         return coords, cell_size
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Encode an input field through the multiscale encoder and return latent shortcuts.
+
+        Args:
+            x: Input tensor of shape [B, C, H_in, W_in].
+
+        Returns:
+            A tuple containing the final latent tensor of shape [B, H_last * W_last, out_channels] and the list of stage shortcuts.
+        """
         B, C, H_in, W_in = x.shape
         device = x.device
 
@@ -1570,7 +1738,7 @@ class MultiscaleCAEncoder(nn.Module):
             # Compute window downsampling sizes
             win_h, win_w = H_curr // H_tgt, W_curr // W_tgt
             assert H_curr % H_tgt == 0 and W_curr % W_tgt == 0, "Resolution mismatch"
-            # Reshape context and coordinates to window batches
+            # Reshape the context and coordinates into window batches.
             kv_context = kv_context.view(B, H_tgt, win_h, W_tgt, win_w, D_curr)
             kv_context = kv_context.permute(0, 1, 3, 2, 4, 5).contiguous()
             kv_context = kv_context.view(B * H_tgt * W_tgt, win_h * win_w, D_curr)
@@ -1579,14 +1747,14 @@ class MultiscaleCAEncoder(nn.Module):
             coords_win = coords_win.permute(0, 1, 3, 2, 4, 5).contiguous()
             coords_win = coords_win.view(B * H_tgt * W_tgt, win_h * win_w, 2)
 
-            # Cross attention: compresses win_h*win_w to m*m tokens (m=1 here)
+            # Compress the window tokens into a compact latent representation.
             x_latent = stage["cross_attn"](kv_context, coords_win)  # [B * H_tgt * W_tgt, 1, D_next]
             x_latent = stage["cross_norm"](x_latent)
 
-            # Reconstruct the target spatial grid [B, H_tgt, W_tgt, D_next]
+            # Reconstruct the target spatial grid with shape [B, H_tgt, W_tgt, D_next].
             x_latent = x_latent.view(B, H_tgt, W_tgt, D_next)
 
-            # Self-Attention processing step
+            # Apply the self-attention refinement step.
             if self.windows[i] is not None:
                 # Swin expects [B, H, W, D]
                 x_latent = stage["self_attn"][0](x_latent)
@@ -1603,7 +1771,7 @@ class MultiscaleCAEncoder(nn.Module):
             H_curr, W_curr = H_tgt, W_tgt
             coords_win, _ = self._get_coords(H_curr, W_curr, device)
 
-        # Output format alignment
+        # Prepare the output tensor for the final projection.
         out = self.output_proj(kv_context)  # [B, H_last * W_last, out_channels]
         return out, shortcuts
 
@@ -1714,10 +1882,10 @@ class MultiscaleCADecoder(nn.Module):
             B, H, W, _ = shortcut.shape
             windows = self.grid_windows[stage_idx]
 
-            # 1. Upsample low-res z using the high-res shortcut spatial framework
+            # Upsample the low-resolution latent grid using the high-resolution shortcut.
             z = self.stages[stage_idx]["upscaler"](z, shortcut)  # Output: [B, H, W, D_next]
 
-            # 2. Refinement via Self-Attention
+            # Refine the upsampled features with self-attention.
             if windows is not None:
                 # Swin blocks process [B, H, W, D] directly
                 z = self.stages[stage_idx]["self_attn"][0](z)
@@ -1730,14 +1898,14 @@ class MultiscaleCADecoder(nn.Module):
                 # Reshape back to 2D spatial grid for the next upsampling stage
                 z = z.view(B, H, W, D_current)
 
-        # 3. Final projection to output channels
+        # Project the final features to the output channels.
         out = self.head(z)  # [B, H_highest, W_highest, out_channels]
         return out.permute(0, 3, 1, 2).contiguous()
 
 
 class MultiscaleSWINNO(nn.Module):
     """
-    Complete Multiscale SWIN Neura Operator
+    Multiscale SWIN Neural Operator
     """
 
     def __init__(
@@ -1768,13 +1936,13 @@ class MultiscaleSWINNO(nn.Module):
         """
         super().__init__()
 
-        # Process model dimensions
+        # Set up the encoder and decoder dimensions.
         if isinstance(model_dim, int):
             self.enc_dims = [model_dim] * (len(grid_resolutions) + 1)
         else:
             self.enc_dims = model_dim
 
-        # Decoder mirrors the encoder dimensions in reverse order
+        # Mirror the encoder dimensions in reverse order for the decoder.
         self.dec_dims = list(reversed(self.enc_dims))
 
         # Instantiate sub-modules
@@ -1840,10 +2008,10 @@ class MultiscaleSWINNO(nn.Module):
         Returns:
             Output reconstruction [B, out_channels, H, W].
         """
-        # 1. Compress via progressive cross-attentions
+        # Compress the input with progressive cross-attentions.
         z, shortcuts = self.encode(x)
 
-        # 2. Decompress via block-grouped cross-attentions
+        # Decompress the latent representation with block-grouped cross-attentions.
         out = self.decode(z, shortcuts[:-1])
 
         return out
