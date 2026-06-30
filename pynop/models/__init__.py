@@ -9,3 +9,4 @@ from .ITNet import *
 from .LNO import *
 from .transolver import *
 from .Galerkin import *
+from .SWIN import *
