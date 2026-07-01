@@ -6,7 +6,7 @@ import h5py
 from matplotlib.animation import FuncAnimation
 
 
-def get_simulation_by_id(h5_path, sim_id):
+def get_simulation_by_id(h5_path, sim_id, add_fields=None):
     """
     Load a specific simulation 'id' from a HDF5 file.
     Returns: torch.Tensor [Nt, C, H, W]
@@ -18,8 +18,12 @@ def get_simulation_by_id(h5_path, sim_id):
         if sid not in f:
             raise KeyError(f"Simulation ID {sid} not found in {h5_path}")
 
-        # Access the data: [Nt, C, H, W]
+        # Access the data: [Nt, H, W, C]
         data = f[sid]["data"][:]
+
+        if add_fields is not None:
+            for field in add_fields:
+                data = np.concatenate([data, f[sid][field][:]], axis=-1)
 
         # Convert to torch tensor
         data_tensor = torch.from_numpy(data).float().permute(0, 3, 1, 2)
@@ -39,6 +43,7 @@ def plot_interactive(pred_list, gt_list, channel_idx=0, vmin=None, vmax=None):
     # Precompute RMSE per step: sqrt(mean((g-p)^2))
     # Shape: (max_steps,)
     rmse_per_step = torch.sqrt(torch.mean((g - p) ** 2, dim=[-2, -1])).cpu().numpy()
+    mae_per_step = torch.mean(error, dim=[-2, -1]).cpu().numpy()
 
     # Stack [Time, Type, H, W]
     combined = torch.stack([g, p, error], dim=1).cpu().numpy()
@@ -57,7 +62,7 @@ def plot_interactive(pred_list, gt_list, channel_idx=0, vmin=None, vmax=None):
     )
 
     # Update facet labels
-    labels = ["Ground Truth", "Prediction", "Abs Error / std"]
+    labels = ["Ground Truth", "Prediction", "Abs Error"]
     for i, label in enumerate(labels):
         if i < len(fig.layout.annotations):
             fig.layout.annotations[i].text = label
@@ -65,15 +70,20 @@ def plot_interactive(pred_list, gt_list, channel_idx=0, vmin=None, vmax=None):
     # Update title dynamically for each frame to show precomputed RMSE
     for i, frame in enumerate(fig.frames):
         current_rmse = rmse_per_step[i]
+        current_mae = mae_per_step[i]
         frame.layout.title = {
-            "text": f"Step {i} | RMSE: {current_rmse:.5f} | Channel {channel_idx}",
+            "text": f"Step {i} | RMSE: {current_rmse:.5f} | MAE: {current_mae:.5f} | Channel {channel_idx}",
             "x": 0.5,
             "xanchor": "center",
         }
 
     # Initial layout setup
     fig.update_layout(
-        title={"text": f"Step 0 | RMSE: {rmse_per_step[0]:.5f} | Channel {channel_idx}", "x": 0.5, "xanchor": "center"},
+        title={
+            "text": f"Step 0 | RMSE: {rmse_per_step[0]:.5f} | MAE: {current_mae:.5f} | Channel {channel_idx}",
+            "x": 0.5,
+            "xanchor": "center",
+        },
         height=550,
     )
 
@@ -86,7 +96,7 @@ def animate_results_mpl(pred_list, gt_list, channel_idx=0, vmin=None, vmax=None,
     p_all = pred_list[:max_steps, channel_idx].detach().cpu().numpy()
     g_all = gt_list[:max_steps, channel_idx].detach().cpu().numpy()
 
-    std_g = np.std(g_all) + 1e-8
+    # std_g = np.std(g_all) + 1e-8
     error_all = np.abs(g_all - p_all) / std_g
 
     # RMSE
@@ -107,7 +117,8 @@ def animate_results_mpl(pred_list, gt_list, channel_idx=0, vmin=None, vmax=None,
     fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
 
     im3 = ax3.imshow(error_all[0], cmap="Reds", vmin=0, vmax=np.max(error_all))
-    ax3.set_title("Abs Error / std")
+    ax3.set_title("Abs Error")
+    ax3.set_yscale("log")
     fig.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
 
     def update(frame):
@@ -118,8 +129,7 @@ def animate_results_mpl(pred_list, gt_list, channel_idx=0, vmin=None, vmax=None,
         return im1, im2, im3
 
     ani = FuncAnimation(fig, update, frames=len(g_all), interval=1000 / fps, blit=True)
-
-    plt.show()
+    plt.close()
     # Pour sauvegarder :
     # ani.save('resultats.mp4', writer='ffmpeg')
     return ani
