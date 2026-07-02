@@ -1,6 +1,6 @@
 import math
 from warnings import warn
-from typing import Union
+from typing import Union, Optional
 
 import numpy as np
 import torch
@@ -277,8 +277,8 @@ class LinearLayer(nn.Module):
 
         self.dropout = nn.Dropout(dropout) if dropout > 0 else None
         self.linear = nn.Linear(in_features, out_features, use_bias)
-        self.norm = norm(out_features)
-        self.act = activation()
+        self.norm = norm(out_features) if norm is not None else None
+        self.act = activation() if activation is not None else None
 
     def _try_squeeze(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() > 2:
@@ -661,7 +661,7 @@ class GalerkinAttention(nn.Module):
 
         nn.init.trunc_normal_(self.out_proj.weight, std=std_ini)
 
-    def forward(self, x: torch.Tensor, context: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Forward pass for Galerkin Attention.
 
         Args:
@@ -803,7 +803,7 @@ class LinearAttention(nn.Module):
 
 
 class Attention(nn.Module):
-    """Multi-Head Attention with standardized normal initialization and SDPA optimization."""
+    """Multi-Head Attention"""
 
     def __init__(
         self,
@@ -817,7 +817,7 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = out_ch // num_heads
 
-        # Combined QKV projection can be faster, but keeping separated for RoPE clarity
+        # Combined QKV projection can be faster, but keeping separated for clarity
         self.wq = nn.Linear(in_ch, out_ch)
         self.wk = nn.Linear(in_ch, out_ch)
         self.wv = nn.Linear(in_ch, out_ch)
@@ -843,9 +843,9 @@ class Attention(nn.Module):
         Q: torch.Tensor,
         K: torch.Tensor,
         V: torch.Tensor,
-        mask: torch.Tensor = None,
-        rope: nn.Module = None,
-        coords: torch.Tensor = None,
+        mask: Optional[torch.Tensor] = None,
+        rope: Optional[nn.Module] = None,
+        coords: Optional[torch.Tensor] = None,
         causal_attn: bool = False,
     ) -> torch.Tensor:
         # Project and split heads -> [B, n_h, N, head_dim]

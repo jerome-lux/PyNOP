@@ -3,7 +3,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Union, Sequence, Callable
+from typing import Union, Sequence, Callable, Optional
 from pynop.core.blocks import MLPBlock, TransolverBlock, LinearNOBlock, TransformerBlock, TransolverBlockv3
 from pynop.core.norm import AdaptiveLayerNorm, AdaRMSNorm
 from pynop.core.activations import Sine, TaylorSoftmax, gumbel_softmax
@@ -24,7 +24,7 @@ class Transolver(nn.Module):
         mode: str = "linear",
         mlp_ratio: int = 1,
         dim: int = 2,
-        cond_dim: int = None,
+        cond_dim: Optional[int] = None,
     ):
         super(Transolver, self).__init__()
         assert n_hidden % n_head == 0, "Hidden dim must be divisible by the number o fheads"

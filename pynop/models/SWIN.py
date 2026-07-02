@@ -1554,7 +1554,6 @@ class MultiscaleCAEncoder(nn.Module):
         else:
             self.model_dim = model_dim
 
-        # Positional encoding block placeholder.
         self.pos_encoder = PEBlock(in_features=2, out_features=self.model_dim[0], method=pe)
         self.mixer = nn.Linear(2 * self.model_dim[0], self.model_dim[0])
         self.input_proj = nn.Linear(in_channels, self.model_dim[0])

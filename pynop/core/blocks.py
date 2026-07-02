@@ -1120,8 +1120,8 @@ class MLPBlock(nn.Module):
         out_ch: int,
         hidden_dim: int = 64,
         num_layers: int = 2,
-        activation: nn.Module = nn.GELU,
-        norm: nn.Module = None,
+        activation: Optional[Callable] = nn.GELU,
+        norm: Optional[nn.Module] = None,
         dropout: float = 0.0,
     ):
         """
@@ -2572,7 +2572,16 @@ class LinearNOBlock(nn.Module):
     Ref: "Transolver Is a Linear Transformer: Revisiting Physics-Attention..." (2026)
     """
 
-    def __init__(self, dim, n_tokens=64, n_heads=8, dropout=0.0, mlp_ratio=2, activation=nn.GELU, rmsnorm=True):
+    def __init__(
+        self,
+        dim,
+        n_tokens=64,
+        n_heads=8,
+        dropout=0.0,
+        mlp_ratio=2,
+        activation: Optional[Callable] = nn.GELU,
+        rmsnorm=True,
+    ):
         super().__init__()
         self.n_heads = n_heads
         self.n_tokens = n_tokens  # This is 'M' (number of slices/latent tokens)
@@ -2637,11 +2646,6 @@ class LinearNOBlock(nn.Module):
         # MLP block
         out = x + self.mlp(self.norm2(x))
         return out
-
-
-import math
-import torch
-import torch.nn as nn
 
 
 class PEBlock(nn.Module):

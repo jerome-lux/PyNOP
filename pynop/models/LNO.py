@@ -315,8 +315,6 @@ class LatentGalerkin(nn.Module):
         num_blocks: int = 4,
         hidden_channels: int = 256,
         num_heads: int = 4,
-        mlp_layers: int = 2,
-        mlp_dim: int = 128,
         activation: Callable = nn.GELU,
         mlp_act=nn.GELU,
         mlp_factor: int = 4,
