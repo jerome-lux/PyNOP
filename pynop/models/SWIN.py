@@ -1,6 +1,6 @@
 import math
-from typing import Callable, Type, Union, Tuple, List
-from git import Optional
+from typing import Callable, Type, Union, Tuple, List, Optional
+# from git import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
