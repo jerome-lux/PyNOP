@@ -161,10 +161,11 @@ class MultiStepNOModel(pl.LightningModule):
         self.train_loss_avg.reset()
 
     def training_step(self, batch, batch_idx):
-        inputs, time_idx = batch
+
+        inputs, time_idx, cond_field = batch
+
         B, T_unroll, C, H, W = inputs.shape
         n = self.train_config.n_slices
-        t_norm = self.train_config.time_normalization
 
         epoch = self.current_epoch
         max_AR_steps = int(min(T_unroll - n - 1, self.train_config.max_autoregressive_steps))
@@ -222,7 +223,7 @@ class MultiStepNOModel(pl.LightningModule):
             # Forward pass
             model_input = current_input.reshape(B, -1, H, W)
 
-            derivative = self.model(model_input)
+            derivative = self.model(model_input, cond=cond_field)
 
             # compute the function at t+dt
             preds = current_input[:, -1, ...] + self.dt * derivative
@@ -284,7 +285,7 @@ class MultiStepNOModel(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        inputs, time_idx = batch
+        inputs, time_idx, cond_field = batch
         B, T_unroll, C, H, W = inputs.shape
         n = self.train_config.n_slices
         t_norm = self.train_config.time_normalization
@@ -303,7 +304,7 @@ class MultiStepNOModel(pl.LightningModule):
                 current_input = torch.cat([current_input[:, 1:, ...], preds.unsqueeze(1)], dim=1)
 
             # 2. Forward pass.
-            preds = self.model(current_input.view(B, -1, H, W)) * self.dt + current_input[:, -1, ...]
+            preds = self.model(current_input.view(B, -1, H, W), cond=cond_field) * self.dt + current_input[:, -1, ...]
 
             targets_t = inputs[:, t + 1, ...]
             for i, loss_fn in enumerate(self.loss_fn):
