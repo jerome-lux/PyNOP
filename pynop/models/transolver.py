@@ -28,7 +28,8 @@ class Transolver(nn.Module):
     ):
         super(Transolver, self).__init__()
         assert n_hidden % n_head == 0, "Hidden dim must be divisible by the number o fheads"
-        self.lifting = nn.Linear(in_ch, n_hidden)
+        input_channels = in_ch if cond_dim is None else cond_dim + in_ch
+        self.lifting = nn.Linear(input_channels, n_hidden)
         self.pe = MLPBlock(dim, n_hidden, hidden_dim=n_hidden // 2, num_layers=1, activation=activation)
         self.pre_norm = nn.RMSNorm((n_hidden))
         self.mixer = nn.Linear(2 * n_hidden, n_hidden)
@@ -104,7 +105,11 @@ class Transolver(nn.Module):
 
     def forward(self, x, cond=None, **kwargs):
 
-        # cond MUST be [B, H*W, cond_dim] (field) or [B, cond_dim] (scalar)
+        # cond MUST be [B, cond_dim, H, W]
+
+        B = x.shape[0]
+        if cond is not None:
+            x = torch.cat([x, cond], dim=1)
 
         B, C, H, W = x.shape
 
@@ -116,12 +121,6 @@ class Transolver(nn.Module):
         coords = torch.stack([grid_h, grid_w], dim=-1)  # [H, W, 2]
         coords = coords.unsqueeze(0)  # [B, H, W, 2] - VRAM: 0
         pe = self.pe(coords).view(1, H * W, -1).expand(B, -1, -1)
-
-        if cond is not None:
-            cond = self.embedding(cond)
-            if len(cond.shape) == 2:
-                cond = cond[:, None, :]
-            x = x + cond
 
         x = self.lifting(x)
         x = self.pre_norm(x)
