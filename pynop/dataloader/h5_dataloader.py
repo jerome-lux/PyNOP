@@ -6,6 +6,268 @@ from tqdm import tqdm
 from pathlib import Path
 
 
+class npyPDEDataset(Dataset):
+    """Loads simulation data from a single .npy file (4D/5D) directly in RAM"""
+
+    def __init__(
+        self,
+        npy_path: str,
+        T_unroll: int = 10,
+        step: int = None,
+        time_binning: int = 1,
+        indexes: list = None,
+        min_id: int = 0,
+        max_id: int = None,
+        shift: float = 0.0,
+        scale: float = 1.0,
+    ):
+        """
+        Parameters
+        ----------
+        npy_path : str
+            Path to the .npy file. Supports (Nsample, Nt, Nx, Ny) or (Nsample, Nt, Nx, Ny, C).
+        T_unroll : int
+            Length of the time window returned to the model.
+        step : int
+            Stride between window starts, applied AFTER time binning. Defaults to T_unroll.
+        time_binning : int
+            Take 1 frame every 'time_binning' frames. Applied directly at loading. Default is 1.
+        indexes : list
+            List of sample IDs to include in this split.
+        min_id : int
+            Start frame index (applied on the BINNED time axis).
+        max_id : int
+            End frame index (applied on the BINNED time axis).
+        shift : float
+            Value added to the data for normalization.
+        scale : float
+            Value multiplied to the data for normalization.
+        """
+        if T_unroll < 1:
+            T_unroll = 1
+        if time_binning < 1:
+            time_binning = 1
+
+        self.T_unroll = T_unroll
+        self.step = T_unroll if step is None else step
+
+        # 1. Load completely into RAM and apply time binning immediately
+        raw_data = np.load(npy_path)
+        self.ndims = raw_data.ndim
+
+        if self.ndims == 4:
+            # Shape: [Nsample, Nt_binned, Nx, Ny]
+            self.data = raw_data[:, ::time_binning, :, :]
+        elif self.ndims == 5:
+            # Shape: [Nsample, Nt_binned, Nx, Ny, C]
+            self.data = raw_data[:, ::time_binning, :, :, :]
+        else:
+            raise ValueError(f"Unsupported array shape {raw_data.shape}. Expected 4D or 5D array.")
+
+        self.sample_ids = indexes if indexes is not None else list(range(self.data.shape[0]))
+
+        self.windows = []
+        self.shift = self._prepare_transform(shift)
+        self.scale = self._prepare_transform(scale)
+
+        # 2. Build windows on the binned timeline
+        for sid in self.sample_ids:
+            T_binned = self.data.shape[1]
+            current_max_id = min(max_id if max_id is not None else T_binned, T_binned)
+
+            if (current_max_id - min_id) < T_unroll:
+                continue
+
+            limit_t0 = current_max_id - T_unroll
+            for t0 in range(min_id, limit_t0 + 1, self.step):
+                self.windows.append((sid, t0))
+
+        print(f"Dataset initialized with {len(self.sample_ids)} simulations (RAM Mode - Binning: 1/{time_binning}).")
+        print(f"Total unrolled windows: {len(self.windows)}")
+
+    def _prepare_transform(self, val):
+        if isinstance(val, (list, np.ndarray, torch.Tensor)):
+            tensor_val = torch.as_tensor(val).float()
+            if tensor_val.ndim == 1:
+                return tensor_val.view(1, -1, 1, 1)
+            return tensor_val
+        return val
+
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, idx):
+        sid, t0 = self.windows[idx]
+
+        # Extract the sequence from the already binned tensor (O(1) memory view)
+        seq = self.data[sid, t0 : t0 + self.T_unroll]
+        fields = torch.from_numpy(seq).float()
+
+        if self.ndims == 4:
+            # [T_unroll, Nx, Ny] -> [T_unroll, 1, Nx, Ny]
+            fields = fields.unsqueeze(1)
+        else:
+            # [T_unroll, Nx, Ny, C] -> [T_unroll, C, Nx, Ny]
+            fields = fields.permute(0, 3, 1, 2)
+
+        return (fields + self.shift) * self.scale, torch.tensor([t0], dtype=torch.float32)
+
+
+class NSH5Dataset(Dataset):
+    """
+    H5 dataset tailored to match PDEBenchDataSet behavior with 'u' and 'a' fields.
+
+    HDF5 structure:
+        [split]/u : (N, T, H, W)
+        [split]/a : (N, H, W) ou (N, cond_dim, H, W) -> Static conditioning field
+
+    Returns:
+        u        : [T_unroll, 1, H, W]
+        time_idx : [1] (t0 as torch.float32)
+        a        : [cond_dim, H, W] (static conditioning field)
+    """
+
+    def __init__(
+        self,
+        h5_path,
+        split="train",
+        T_unroll=10,
+        step=None,
+        load_in_ram=False,
+        indexes=None,
+        min_id=0,
+        max_id=None,
+        shift=0.0,
+        scale=1.0,
+    ):
+        """
+        Initializes the dataset, synchronizes temporal filtering, and prepares transforms.
+
+        Parameters
+        ----------
+        h5_path : str
+            Path to the HDF5 file.
+        split : str
+            Dataset split, either 'train' or 'valid'.
+        T_unroll : int
+            Number of time steps to unroll.
+        step : int, optional
+            Stride between time windows.
+        load_in_ram : bool
+            Whether to pre-load selected samples into memory.
+        indexes : list of int, optional
+            List of requested global sample indices (will be sorted).
+        min_id : int
+            Minimum time index allowed for windows.
+        max_id : int, optional
+            Maximum time index allowed for windows.
+        shift : float or list or np.ndarray or torch.Tensor
+            Value added to the tensors for normalization.
+        scale : float or list or np.ndarray or torch.Tensor
+            Value multiplied to the tensors for normalization.
+        """
+        if T_unroll < 1:
+            print("Warning: T_unroll must be at least 1. Setting to 1.")
+            T_unroll = 1
+
+        self.h5_path = h5_path
+        self.split = split
+        self.T_unroll = T_unroll
+        self.step = T_unroll if step is None else step
+        self.load_in_ram = load_in_ram
+
+        self.h5file = None
+        self.windows = []
+
+        self.shift = shift
+        self.scale = scale
+
+        with h5py.File(h5_path, "r") as f:
+            u = f[split]["u"]
+            a = f[split]["a"]
+
+            global_N, self.T, self.H, self.W = u.shape
+
+            # D�termination de la structure de a (statique)
+            # Si len(shape) == 3 -> (N, H, W), il faut ajouter l'axe cond_dim=1
+            # Si len(shape) == 4 -> (N, cond_dim, H, W), cond_dim est d�j� pr�sent
+            self.a_has_channel = len(a.shape) == 4
+
+            # Alignement du filtrage temporel
+            current_max_id = max_id if max_id is not None else self.T
+            current_max_id = min(current_max_id, self.T)
+
+            if indexes is not None:
+                self.sample_ids = sorted([int(i) for i in indexes if i < global_N])
+                self.N = len(self.sample_ids)
+            else:
+                self.sample_ids = list(range(global_N))
+                self.N = global_N
+
+            if load_in_ram:
+                raw_u = torch.from_numpy(u[self.sample_ids]).float()  # [N, T, H, W]
+                raw_a = torch.from_numpy(a[self.sample_ids]).float()  # [N, H, W] ou [N, cond_dim, H, W]
+
+                self.u_dict = raw_u.unsqueeze(2)  # [N, T, 1, H, W]
+
+                if self.a_has_channel:
+                    self.a_dict = raw_a  # [N, cond_dim, H, W]
+                else:
+                    self.a_dict = raw_a.unsqueeze(1)  # [N, 1, H, W]
+            else:
+                self.u_dict = None
+                self.a_dict = None
+
+            # G�n�ration des fen�tres temporelles
+            limit_t0 = current_max_id - T_unroll
+            for local_id, global_id in enumerate(self.sample_ids):
+                for t0 in range(min_id, limit_t0 + 1, self.step):
+                    sample_idx_to_store = local_id if load_in_ram else global_id
+                    self.windows.append((sample_idx_to_store, t0))
+
+        print(f"NSH5Dataset [{split}] initialized with {self.N} simulations.")
+        print(f"Total unrolled windows: {len(self.windows)}")
+        print(f"Status: {'RAM' if load_in_ram else 'Disk'} mode.")
+
+    def __len__(self):
+        return len(self.windows)
+
+    def _init_h5(self):
+        """Initializes the HDF5 file object for thread-safe disk reading."""
+        if self.h5file is None and not self.load_in_ram:
+            self.h5file = h5py.File(self.h5_path, "r", swmr=True)
+
+    def __getitem__(self, idx):
+        """
+        Retrieves a window and returns u, time_idx, and a.
+        """
+        sample_id, t0 = self.windows[idx]
+
+        if self.load_in_ram:
+            fields_u = self.u_dict[sample_id, t0 : t0 + self.T_unroll]  # [T_unroll, 1, H, W]
+            fields_a = self.a_dict[sample_id]  # [cond_dim, H, W]
+        else:
+            self._init_h5()
+
+            # Lecture de la fen�tre u
+            raw_u = self.h5file[self.split]["u"][sample_id, t0 : t0 + self.T_unroll]
+            fields_u = torch.from_numpy(raw_u).float().unsqueeze(1)  # [T_unroll, 1, H, W]
+
+            # Lecture du champ statique a
+            raw_a = self.h5file[self.split]["a"][sample_id]
+            fields_a = torch.from_numpy(raw_a).float()
+
+            if not self.a_has_channel:
+                fields_a = fields_a.unsqueeze(0)  # [1, H, W] si pas de canal natif
+
+        # Normalisations
+        u_out = (fields_u + self.shift) * self.scale
+        a_out = (fields_a + self.shift) * self.scale
+        time_idx = torch.tensor([t0], dtype=torch.float32)
+
+        return u_out, time_idx, a_out
+
+
 class PDEBenchDataSet(Dataset):
     """
     Loads simulation data from an HDF5 file and generates time-unrolled windows.
@@ -110,7 +372,7 @@ class PDEBenchDataSet(Dataset):
             fields = self.h5file[sid]["data"][t0 : t0 + self.T_unroll]
             fields = torch.from_numpy(np.moveaxis(fields, -1, 1)).float()
 
-        return (fields + self.shift) * self.scale, torch.Tensor([t0])
+        return (fields + self.shift) * self.scale, torch.Tensor([t0]), None
 
 
 class RDDataSet(Dataset):
@@ -215,7 +477,7 @@ class RDDataSet(Dataset):
                 p = p.permute(0, 3, 1, 2)
             fields = torch.cat([fields, p], dim=1)
 
-        return (fields + self.shift) * self.scale, torch.Tensor([t0])
+        return (fields + self.shift) * self.scale, torch.Tensor([t0]), None
 
 
 def inspect_PDEBenchDataset(h5_path, DT=1.0):
