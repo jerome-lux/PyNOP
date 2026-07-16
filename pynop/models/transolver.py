@@ -40,9 +40,6 @@ class Transolver(nn.Module):
         self.out_ch = out_ch
         self.dim_head = n_hidden // n_head
 
-        if cond_dim is not None:
-            self.embedding = nn.Linear(cond_dim, n_hidden)
-
         if mode == "linear":
             self.blocks = nn.ModuleList(
                 [
