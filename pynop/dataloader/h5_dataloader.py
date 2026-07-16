@@ -372,7 +372,7 @@ class PDEBenchDataSet(Dataset):
             fields = self.h5file[sid]["data"][t0 : t0 + self.T_unroll]
             fields = torch.from_numpy(np.moveaxis(fields, -1, 1)).float()
 
-        return (fields + self.shift) * self.scale, torch.Tensor([t0]), None
+        return (fields + self.shift) * self.scale, torch.Tensor([t0])
 
 
 class RDDataSet(Dataset):
@@ -477,7 +477,7 @@ class RDDataSet(Dataset):
                 p = p.permute(0, 3, 1, 2)
             fields = torch.cat([fields, p], dim=1)
 
-        return (fields + self.shift) * self.scale, torch.Tensor([t0]), None
+        return (fields + self.shift) * self.scale, torch.Tensor([t0])
 
 
 def inspect_PDEBenchDataset(h5_path, DT=1.0):
