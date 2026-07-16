@@ -162,7 +162,12 @@ class MultiStepNOModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
 
-        inputs, time_idx, cond_field = batch
+        all_inputs = batch
+        if len(all_inputs) == 3:
+            inputs, time_idx, cond_field = batch
+        else:
+            inputs, time_idx = batch
+            cond_field = None
 
         B, T_unroll, C, H, W = inputs.shape
         n = self.train_config.n_slices
@@ -285,7 +290,13 @@ class MultiStepNOModel(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        inputs, time_idx, cond_field = batch
+        all_inputs = batch
+        if len(all_inputs) == 3:
+            inputs, time_idx, cond_field = batch
+        else:
+            inputs, time_idx = batch
+            cond_field = None
+
         B, T_unroll, C, H, W = inputs.shape
         n = self.train_config.n_slices
         t_norm = self.train_config.time_normalization
