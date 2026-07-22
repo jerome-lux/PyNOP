@@ -1,4 +1,4 @@
-from typing import Sequence, Union
+from typing import Sequence, Union, Optional
 import numpy as np
 import collections.abc as abc
 import torch
@@ -61,6 +61,7 @@ class FNO(nn.Module):
         trainable_pos_encoding_dims=8,
         block_kwargs: dict = {},
         dt: float = 1.0,
+        cond_dim: Optional[int] = None,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -93,6 +94,9 @@ class FNO(nn.Module):
             )
 
             in_channels += trainable_pos_encoding_dims
+
+        if cond_dim is not None:
+            in_channels = in_channels + cond_dim
 
         self.lifting = nn.Conv2d(in_channels, hidden_channels[0], 1, bias=True)
 
@@ -133,7 +137,7 @@ class FNO(nn.Module):
 
         self.projection = nn.Conv2d(hidden_channels[-1], out_channels, 1, bias=True)
 
-    def forward(self, x):
+    def forward(self, x, cond: Optional[torch.Tensor]):
 
         if self.fixed_pos_encoding:
             x = self.grid_encoding(x)
@@ -143,6 +147,9 @@ class FNO(nn.Module):
             repeat_shape = [1 for _ in x.shape]
             repeat_shape[0] = x.shape[0]  # repeat along the batch size to match input
             x = torch.cat([x, pos_embeddings.repeat(*repeat_shape)], dim=1)  # cat along the channel axis
+
+        if cond is not None:
+            x = torch.cat([x, cond], dim=1)
 
         x = self.lifting(x)
 

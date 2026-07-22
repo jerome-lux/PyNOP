@@ -41,7 +41,7 @@ class WindowAttention(nn.Module):
 
         Args:
             x: Input tokens with shape [B*nW, N, dim].
-            coords: Absolutecoordinates (of original grid) reshaped as [num_windows, win_h*win_w, win_h*win_w, 2]
+            coords: Absolute coordinates (of original grid) reshaped as [num_windows, win_h*win_w, win_h*win_w, 2]
             mask: Optional attention mask with shape [num_windows, win_h*win_w, win_h*win_w].
 
         Returns:
@@ -50,9 +50,9 @@ class WindowAttention(nn.Module):
 
         b_win, n, c = x.shape
         h = self.num_heads
-
+        # [3, b*nwin, heads, n, d_head] where n is the number of token in a window
         qkv = self.qkv(x).reshape(b_win, n, 3, h, self.d_head).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # [B*nW, H, N, d_head]
+        q, k, v = qkv[0], qkv[1], qkv[2]  # [B*nW, Heads, N, d_head]
 
         # Apply RoPE to queries and keys only.
         q = self.rope.rotate(q, coords)
@@ -1523,81 +1523,111 @@ class MultiscaleCAEncoder(nn.Module):
         grid_resolutions: List[Tuple[int, int]] = [(32, 32), (16, 16)],
         num_heads: int = 4,
         mlp_factor: int = 4,
+        repeats: Union[int, List[int]] = 1,
         rmsnorm: bool = True,
         activation: Callable = nn.GELU,
         ndim: int = 2,
-        pe: str = "adaptive",
-        pe_param: int = 128,
     ):
         """
-        Args:
-            in_channels: Input feature dimension.
-            out_channels: Output feature dimension.
-            windows: Window sizes for Swin stages.
-            model_dim: Hidden dimensions per stage.
-            grid_resolutions: Target resolutions per stage.
-            num_heads: Number of attention heads.
-            mlp_factor: MLP dimension multiplier.
-            rmsnorm: Use RMSNorm if True, else LayerNorm.
-            activation: Activation function class.
-            ndim: Spatial dimensions.
-            pe: Positional encoding type.
-            pe_param: Hyperparameter for PE.
+        Parameters
+        ----------
+        in_channels : int
+            Input feature dimension.
+        out_channels : int
+            Output feature dimension.
+        windows : List[Tuple[int, int]]
+            Window sizes for Swin stages.
+        model_dim : Union[int, List[int]]
+            Hidden dimensions per stage.
+        grid_resolutions : List[Tuple[int, int]]
+            Target resolutions per stage.
+        num_heads : int
+            Number of attention heads.
+        mlp_factor : int
+            MLP dimension multiplier.
+        repeats : Union[int, List[int]]
+            Number of repetitions for self-attention blocks per stage.
+            Can be a single int or a list matching len(grid_resolutions).
+        rmsnorm : bool
+            Use RMSNorm if True, else LayerNorm.
+        activation : Callable
+            Activation function class.
+        ndim : int
+            Spatial dimensions.
         """
         super().__init__()
         self.grid_resolutions = grid_resolutions
         self.windows = windows
         norm_layer = nn.RMSNorm if rmsnorm else nn.LayerNorm
+        num_stages = len(grid_resolutions)
 
         if isinstance(model_dim, int):
-            self.model_dim = [model_dim] * (len(grid_resolutions) + 1)
+            self.model_dim = [model_dim] * (num_stages + 1)
         else:
             self.model_dim = model_dim
 
-        self.pos_encoder = PEBlock(in_features=2, out_features=self.model_dim[0], method=pe)
+        # Adapt repeats to be a list with one value per stage
+        if isinstance(repeats, int):
+            self.repeats = [repeats] * num_stages
+        else:
+            if len(repeats) != num_stages:
+                raise ValueError(f"Length of repeats ({len(repeats)}) must match num_stages ({num_stages})")
+            self.repeats = repeats
+
+        self.pos_encoder = PEBlock(in_features=2, out_features=self.model_dim[0], method="adaptive")
         self.mixer = nn.Linear(2 * self.model_dim[0], self.model_dim[0])
         self.input_proj = nn.Linear(in_channels, self.model_dim[0])
         self.input_norm = norm_layer(self.model_dim[0])
 
         self.stages = nn.ModuleList()
-        num_stages = len(grid_resolutions)
 
         for i, (res, win) in enumerate(zip(grid_resolutions, windows)):
-            is_last_stage = i == num_stages - 1
             current_dim = self.model_dim[i]
             next_dim = self.model_dim[i + 1]
+            stage_repeats = self.repeats[i]
+
             print(f"building encoder block {i+1} using {win} windows. Target resolution {res}")
-            print(f"Current model dim: {current_dim}, next :level {next_dim}")
+            print(f"Current model dim: {current_dim}, next level {next_dim} | Repeats: {stage_repeats}")
 
             cross_attn = WindowCrossAttention(in_ch=current_dim, dim=next_dim, num_heads=num_heads, m=1)
             cross_norm = norm_layer(next_dim)
 
+            self_attn_blocks = nn.ModuleList()
             if win is not None:
-                self_attn_1 = AdaptiveSwinBlock(
-                    dim=next_dim,
-                    grid_windows=win,
-                    num_heads=num_heads,
-                    activation=activation,
-                    mlp_factor=mlp_factor,
-                    shift=False,
-                )
-                self_attn_2 = AdaptiveSwinBlock(
-                    dim=next_dim,
-                    grid_windows=win,
-                    num_heads=num_heads,
-                    activation=activation,
-                    mlp_factor=mlp_factor,
-                    shift=True,
-                )
-                self_attn_blocks = nn.ModuleList([self_attn_1, self_attn_2])
+                # 1 repeat = 1 pair of Swin blocks (unshifted + shifted)
+                for _ in range(stage_repeats):
+                    self_attn_blocks.append(
+                        AdaptiveSwinBlock(
+                            dim=next_dim,
+                            grid_windows=win,
+                            num_heads=num_heads,
+                            activation=activation,
+                            mlp_factor=mlp_factor,
+                            shift=False,
+                        )
+                    )
+                    self_attn_blocks.append(
+                        AdaptiveSwinBlock(
+                            dim=next_dim,
+                            grid_windows=win,
+                            num_heads=num_heads,
+                            activation=activation,
+                            mlp_factor=mlp_factor,
+                            shift=True,
+                        )
+                    )
             else:
-                self_attn_blocks = TransformerBlock(
-                    dim=next_dim,
-                    n_heads=num_heads,
-                    activation=activation,
-                    rmsnorm=rmsnorm,
-                    mlp_dim=mlp_factor * next_dim,
-                )
+                # 1 repeat = 1 standard Transformer block
+                for _ in range(stage_repeats):
+                    self_attn_blocks.append(
+                        TransformerBlock(
+                            dim=next_dim,
+                            n_heads=num_heads,
+                            activation=activation,
+                            rmsnorm=rmsnorm,
+                            mlp_dim=mlp_factor * next_dim,
+                        )
+                    )
 
             self.stages.append(
                 nn.ModuleDict(
@@ -1626,7 +1656,7 @@ class MultiscaleCAEncoder(nn.Module):
             x: Input tensor of shape [B, C, H_in, W_in].
 
         Returns:
-            A tuple containing the final latent tensor of shape [B, H_last * W_last, out_channels] and the list of stage shortcuts.
+            A tuple containing the final latent tensor and the list of stage shortcuts.
         """
         B, C, H_in, W_in = x.shape
         device = x.device
@@ -1645,15 +1675,13 @@ class MultiscaleCAEncoder(nn.Module):
         H_curr, W_curr = H_in, W_in
 
         for i, stage in enumerate(self.stages):
-            is_last_stage = i == len(self.stages) - 1
             H_tgt, W_tgt = self.grid_resolutions[i]
             D_curr = self.model_dim[i]
             D_next = self.model_dim[i + 1]
 
-            # Compute window downsampling sizes
             win_h, win_w = H_curr // H_tgt, W_curr // W_tgt
             assert H_curr % H_tgt == 0 and W_curr % W_tgt == 0, "Resolution mismatch"
-            # Reshape the context and coordinates into window batches.
+
             kv_context = kv_context.view(B, H_tgt, win_h, W_tgt, win_w, D_curr)
             kv_context = kv_context.permute(0, 1, 3, 2, 4, 5).contiguous()
             kv_context = kv_context.view(B * H_tgt * W_tgt, win_h * win_w, D_curr)
@@ -1662,33 +1690,207 @@ class MultiscaleCAEncoder(nn.Module):
             coords_win = coords_win.permute(0, 1, 3, 2, 4, 5).contiguous()
             coords_win = coords_win.view(B * H_tgt * W_tgt, win_h * win_w, 2)
 
-            # Compress the window tokens into a compact latent representation.
-            x_latent = stage["cross_attn"](kv_context, coords_win)  # [B * H_tgt * W_tgt, 1, D_next]
+            x_latent = stage["cross_attn"](kv_context, coords_win)
             x_latent = stage["cross_norm"](x_latent)
 
-            # Reconstruct the target spatial grid with shape [B, H_tgt, W_tgt, D_next].
             x_latent = x_latent.view(B, H_tgt, W_tgt, D_next)
 
-            # Apply the self-attention refinement step.
             if self.windows[i] is not None:
-                # Swin expects [B, H, W, D]
-                x_latent = stage["self_attn"][0](x_latent)
-                x_latent = stage["self_attn"][1](x_latent)
+                for swin_block in stage["self_attn"]:
+                    x_latent = swin_block(x_latent)
                 kv_context = x_latent
             else:
-                # Global transformer expects sequential format [B, N, D]
                 x_latent = x_latent.view(B, H_tgt * W_tgt, D_next)
-                x_latent = stage["self_attn"](x_latent)
+                for trans_block in stage["self_attn"]:
+                    x_latent = trans_block(x_latent)
                 kv_context = x_latent.view(B, H_tgt, W_tgt, D_next)
 
             shortcuts.append(kv_context)
-            # Update dimensions for the next stage
             H_curr, W_curr = H_tgt, W_tgt
             coords_win, _ = self._get_coords(H_curr, W_curr, device)
 
-        # Prepare the output tensor for the final projection.
-        out = self.output_proj(kv_context)  # [B, H_last * W_last, out_channels]
+        out = self.output_proj(kv_context)
         return out, shortcuts
+
+
+# class MultiscaleCAEncoder(nn.Module):
+#     """
+#     Multiscale Encoder combining Window Cross-Attention and Swin/Global Self-Attention.
+#     """
+
+#     def __init__(
+#         self,
+#         in_channels: int,
+#         out_channels: int,
+#         windows: List[Tuple[int, int]],
+#         model_dim: Union[int, List[int]] = 128,
+#         grid_resolutions: List[Tuple[int, int]] = [(32, 32), (16, 16)],
+#         num_heads: int = 4,
+#         mlp_factor: int = 4,
+#         rmsnorm: bool = True,
+#         activation: Callable = nn.GELU,
+#         ndim: int = 2,
+#     ):
+#         """
+#         Args:
+#             in_channels: Input feature dimension.
+#             out_channels: Output feature dimension.
+#             windows: Window sizes for Swin stages.
+#             model_dim: Hidden dimensions per stage.
+#             grid_resolutions: Target resolutions per stage.
+#             num_heads: Number of attention heads.
+#             mlp_factor: MLP dimension multiplier.
+#             rmsnorm: Use RMSNorm if True, else LayerNorm.
+#             activation: Activation function class.
+#             ndim: Spatial dimensions.
+#             pe: Positional encoding type.
+#             pe_param: Hyperparameter for PE.
+#         """
+#         super().__init__()
+#         self.grid_resolutions = grid_resolutions
+#         self.windows = windows
+#         norm_layer = nn.RMSNorm if rmsnorm else nn.LayerNorm
+
+#         if isinstance(model_dim, int):
+#             self.model_dim = [model_dim] * (len(grid_resolutions) + 1)
+#         else:
+#             self.model_dim = model_dim
+
+#         self.pos_encoder = PEBlock(in_features=2, out_features=self.model_dim[0], method="adaptive")
+#         self.mixer = nn.Linear(2 * self.model_dim[0], self.model_dim[0])
+#         self.input_proj = nn.Linear(in_channels, self.model_dim[0])
+#         self.input_norm = norm_layer(self.model_dim[0])
+
+#         self.stages = nn.ModuleList()
+#         num_stages = len(grid_resolutions)
+
+#         for i, (res, win) in enumerate(zip(grid_resolutions, windows)):
+#             is_last_stage = i == num_stages - 1
+#             current_dim = self.model_dim[i]
+#             next_dim = self.model_dim[i + 1]
+#             print(f"building encoder block {i+1} using {win} windows. Target resolution {res}")
+#             print(f"Current model dim: {current_dim}, next :level {next_dim}")
+
+#             cross_attn = WindowCrossAttention(in_ch=current_dim, dim=next_dim, num_heads=num_heads, m=1)
+#             cross_norm = norm_layer(next_dim)
+
+#             if win is not None:
+#                 self_attn_1 = AdaptiveSwinBlock(
+#                     dim=next_dim,
+#                     grid_windows=win,
+#                     num_heads=num_heads,
+#                     activation=activation,
+#                     mlp_factor=mlp_factor,
+#                     shift=False,
+#                 )
+#                 self_attn_2 = AdaptiveSwinBlock(
+#                     dim=next_dim,
+#                     grid_windows=win,
+#                     num_heads=num_heads,
+#                     activation=activation,
+#                     mlp_factor=mlp_factor,
+#                     shift=True,
+#                 )
+#                 self_attn_blocks = nn.ModuleList([self_attn_1, self_attn_2])
+#             else:
+#                 self_attn_blocks = TransformerBlock(
+#                     dim=next_dim,
+#                     n_heads=num_heads,
+#                     activation=activation,
+#                     rmsnorm=rmsnorm,
+#                     mlp_dim=mlp_factor * next_dim,
+#                 )
+
+#             self.stages.append(
+#                 nn.ModuleDict(
+#                     {
+#                         "cross_attn": cross_attn,
+#                         "cross_norm": cross_norm,
+#                         "self_attn": self_attn_blocks,
+#                     }
+#                 )
+#             )
+
+#         self.output_proj = nn.Linear(self.model_dim[-1], out_channels)
+
+#     def _get_coords(self, H: int, W: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+#         y = torch.linspace(-1, 1, H, device=device)
+#         x = torch.linspace(-1, 1, W, device=device)
+#         grid_y, grid_x = torch.meshgrid(y, x, indexing="ij")
+#         coords = torch.stack([grid_y, grid_x], dim=-1).view(1, H, W, 2)
+#         cell_size = torch.tensor([2.0 / H, 2.0 / W], device=device).view(1, 1, 1, 2)
+#         return coords, cell_size
+
+#     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+#         """Encode an input field through the multiscale encoder and return latent shortcuts.
+
+#         Args:
+#             x: Input tensor of shape [B, C, H_in, W_in].
+
+#         Returns:
+#             A tuple containing the final latent tensor of shape [B, H_last * W_last, out_channels] and the list of stage shortcuts.
+#         """
+#         B, C, H_in, W_in = x.shape
+#         device = x.device
+
+#         in_coords, _ = self._get_coords(H_in, W_in, device)
+#         x = x.permute(0, 2, 3, 1).contiguous()
+#         x = self.input_proj(x)
+#         x = self.input_norm(x)
+
+#         pe = self.pos_encoder(in_coords).expand(B, -1, -1, -1)
+#         x = self.mixer(torch.cat([x, pe], dim=-1))
+
+#         shortcuts = [x.view(B, H_in, W_in, -1)]
+#         kv_context = x  # [B, H*W, D]
+#         coords_win = in_coords
+#         H_curr, W_curr = H_in, W_in
+
+#         for i, stage in enumerate(self.stages):
+#             is_last_stage = i == len(self.stages) - 1
+#             H_tgt, W_tgt = self.grid_resolutions[i]
+#             D_curr = self.model_dim[i]
+#             D_next = self.model_dim[i + 1]
+
+#             # Compute window downsampling sizes
+#             win_h, win_w = H_curr // H_tgt, W_curr // W_tgt
+#             assert H_curr % H_tgt == 0 and W_curr % W_tgt == 0, "Resolution mismatch"
+#             # Reshape the context and coordinates into window batches.
+#             kv_context = kv_context.view(B, H_tgt, win_h, W_tgt, win_w, D_curr)
+#             kv_context = kv_context.permute(0, 1, 3, 2, 4, 5).contiguous()
+#             kv_context = kv_context.view(B * H_tgt * W_tgt, win_h * win_w, D_curr)
+
+#             coords_win = coords_win.view(1, H_tgt, win_h, W_tgt, win_w, 2).expand(B, -1, -1, -1, -1, -1).contiguous()
+#             coords_win = coords_win.permute(0, 1, 3, 2, 4, 5).contiguous()
+#             coords_win = coords_win.view(B * H_tgt * W_tgt, win_h * win_w, 2)
+
+#             # Compress the window tokens into a compact latent representation.
+#             x_latent = stage["cross_attn"](kv_context, coords_win)  # [B * H_tgt * W_tgt, 1, D_next]
+#             x_latent = stage["cross_norm"](x_latent)
+
+#             # Reconstruct the target spatial grid with shape [B, H_tgt, W_tgt, D_next].
+#             x_latent = x_latent.view(B, H_tgt, W_tgt, D_next)
+
+#             # Apply the self-attention refinement step.
+#             if self.windows[i] is not None:
+#                 # Swin expects [B, H, W, D]
+#                 x_latent = stage["self_attn"][0](x_latent)
+#                 x_latent = stage["self_attn"][1](x_latent)
+#                 kv_context = x_latent
+#             else:
+#                 # Global transformer expects sequential format [B, N, D]
+#                 x_latent = x_latent.view(B, H_tgt * W_tgt, D_next)
+#                 x_latent = stage["self_attn"](x_latent)
+#                 kv_context = x_latent.view(B, H_tgt, W_tgt, D_next)
+
+#             shortcuts.append(kv_context)
+#             # Update dimensions for the next stage
+#             H_curr, W_curr = H_tgt, W_tgt
+#             coords_win, _ = self._get_coords(H_curr, W_curr, device)
+
+#         # Prepare the output tensor for the final projection.
+#         out = self.output_proj(kv_context)  # [B, H_last * W_last, out_channels]
+#         return out, shortcuts
 
 
 class MultiscaleCADecoder(nn.Module):
@@ -1704,6 +1906,7 @@ class MultiscaleCADecoder(nn.Module):
         n_heads: int = 4,
         mlp_ratio: int = 4,
         rmsnorm: bool = True,
+        repeats: Union[List[int], int] = 1,
         activation: Callable = nn.GELU,
     ):
         """
@@ -1719,6 +1922,14 @@ class MultiscaleCADecoder(nn.Module):
         super().__init__()
         self.latent_dim = latent_dim
         self.grid_windows = grid_windows
+        num_stages = len(grid_windows)
+
+        if isinstance(repeats, int):
+            self.repeats = [repeats] * num_stages
+        else:
+            if len(repeats) != num_stages:
+                raise ValueError(f"Length of repeats ({len(repeats)}) must match num_stages ({num_stages})")
+            self.repeats = repeats
 
         self.stages = nn.ModuleList()
 
@@ -1727,6 +1938,7 @@ class MultiscaleCADecoder(nn.Module):
             print(f"Current model dim: {self.latent_dim[i]}, next :level {self.latent_dim[i + 1]}")
             current_dim = self.latent_dim[i]
             next_dim = self.latent_dim[i + 1]
+            stage_repeats = self.repeats[i]
 
             upscaler = BlockCrossAttentionUpsampler(
                 latent_dim=current_dim,
@@ -1735,10 +1947,10 @@ class MultiscaleCADecoder(nn.Module):
                 activation=activation,
                 mlp_factor=mlp_ratio,
             )
-
+            self_attn_blocks = nn.ModuleList()
             if windows is not None:
-                self_attn_blocks = nn.ModuleList(
-                    [
+                for _ in range(stage_repeats):
+                    self_attn_blocks.append(
                         AdaptiveSwinBlock(
                             dim=next_dim,
                             grid_windows=windows,
@@ -1746,7 +1958,10 @@ class MultiscaleCADecoder(nn.Module):
                             activation=activation,
                             mlp_factor=mlp_ratio,
                             shift=False,
-                        ),
+                        )
+                    )
+
+                    self_attn_blocks.append(
                         AdaptiveSwinBlock(
                             dim=next_dim,
                             grid_windows=windows,
@@ -1754,17 +1969,20 @@ class MultiscaleCADecoder(nn.Module):
                             activation=activation,
                             mlp_factor=mlp_ratio,
                             shift=True,
-                        ),
-                    ]
-                )
+                        )
+                    )
+
             else:
-                self_attn_blocks = TransformerBlock(
-                    dim=next_dim,
-                    n_heads=n_heads,
-                    activation=activation,
-                    rmsnorm=rmsnorm,
-                    mlp_dim=mlp_ratio * next_dim,
-                )
+                for _ in range(stage_repeats):
+                    self_attn_blocks.append(
+                        TransformerBlock(
+                            dim=next_dim,
+                            n_heads=n_heads,
+                            activation=activation,
+                            rmsnorm=rmsnorm,
+                            mlp_dim=mlp_ratio * next_dim,
+                        )
+                    )
 
             self.stages.append(
                 nn.ModuleDict(
@@ -1831,10 +2049,13 @@ class MultiscaleSWINNO(nn.Module):
         dec_windows: List[Union[Tuple[int, int], None]],
         model_dim: Union[int, List[int]] = 128,
         grid_resolutions: List[Tuple[int, int]] = [(32, 32), (16, 16)],
+        enc_repeats: Union[List[int], int] = 1,
+        dec_repeats: Union[List[int], int] = 1,
         num_heads: int = 4,
         mlp_factor: int = 4,
         rmsnorm: bool = True,
         activation: Callable = nn.GELU,
+        cond_dim: Optional[int] = None,
     ):
         """
         Args:
@@ -1860,9 +2081,11 @@ class MultiscaleSWINNO(nn.Module):
         # Mirror the encoder dimensions in reverse order for the decoder.
         self.dec_dims = list(reversed(self.enc_dims))
 
+        in_ch = in_channels if cond_dim is None else in_channels + cond_dim
+
         # Instantiate sub-modules
         self.encoder = MultiscaleCAEncoder(
-            in_channels=in_channels,
+            in_channels=in_ch,
             out_channels=self.enc_dims[-1],
             windows=enc_windows,
             model_dim=self.enc_dims,
@@ -1871,6 +2094,7 @@ class MultiscaleSWINNO(nn.Module):
             mlp_factor=mlp_factor,
             rmsnorm=rmsnorm,
             activation=activation,
+            repeats=enc_repeats,
         )
 
         self.decoder = MultiscaleCADecoder(
@@ -1881,6 +2105,7 @@ class MultiscaleSWINNO(nn.Module):
             mlp_ratio=mlp_factor,
             rmsnorm=rmsnorm,
             activation=activation,
+            repeats=dec_repeats,
         )
 
     def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
@@ -1914,15 +2139,20 @@ class MultiscaleSWINNO(nn.Module):
 
         return self.decoder(z, shortcuts)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor]) -> torch.Tensor:
         """
         Forward pass through the full multi-scale cross-attention autoencoder.
 
         Args:
             x: Input tensor [B, in_channels, H, W].
+            cond: constant tensor field concatenated to the input
         Returns:
             Output reconstruction [B, out_channels, H, W].
         """
+
+        if cond is not None:
+            x = torch.cat([x, cond], dim=1)
+
         # Compress the input with progressive cross-attentions.
         z, shortcuts = self.encode(x)
 
