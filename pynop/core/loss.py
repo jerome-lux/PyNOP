@@ -462,19 +462,24 @@ def preprocess_to_sigreg(latent):
     return latent_norm.permute(1, 0, 2)
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
 class SIGReg(nn.Module):
-    """
-    Sketched Isotropic Gaussian Regularization.
+    """Sketched Isotropic Gaussian Regularization.
 
     Accepts latents of shape (B, N, D) with two modes:
-      - 'flat'     : reshape to (B*N, D) — recommanded for homogeneous spatial tokens
-      - 'per_pos'  : SIGREG per position over (B, D), averaged over N — more rigorous
-                     but requires a large B to estimate covariance reliably
+      - 'flat'    : reshape to (B*N, D) — recommended for homogeneous spatial
+      tokens
+      - 'per_pos' : SIGREG per position over (B, D), averaged over N (fully
+      vectorized)
 
     Args:
-        n_sketches  : number of random projection directions (default: 256)
-        knots       : number of quadrature points for the integral (default: 17)
-        mode        : 'flat' or 'per_pos' (default: 'flat')
+        n_sketches : number of random projection directions (default: 256)
+        knots      : number of quadrature points for the integral (default: 17)
+        mode       : 'flat' or 'per_pos' (default: 'flat')
     """
 
     def __init__(
@@ -482,7 +487,7 @@ class SIGReg(nn.Module):
         n_sketches: int = 256,
         knots: int = 17,
         mode: str = "flat",
-    ):
+    ) -> None:
         super().__init__()
 
         if mode not in ("flat", "per_pos"):
@@ -503,65 +508,68 @@ class SIGReg(nn.Module):
         self.register_buffer("phi", window)  # (knots,)
         self.register_buffer("weights", weights * window)  # (knots,)
 
-    def _sigreg_2d(self, z: torch.Tensor) -> torch.Tensor:
+    def _sigreg_batched(self, z: torch.Tensor) -> torch.Tensor:
+        """Computes SIGREG over input z of shape (..., S, D) in a fully vectorized manner.
+
+        Args:
+            z: Tensor of shape (S, D) or (N, B, D)
+
+        Returns:
+            Scalar loss tensor.
         """
-        Core SIGREG on a 2D tensor of shape (S, D).
-        S is the number of i.i.d. samples (either B*N or B for one position).
+        S = z.shape[-2]
+        D = z.shape[-1]
 
-        The statistic estimates:
-            ∫ [ |E[cos(t·<z,a>)] - exp(-t²/2)|² + |E[sin(t·<z,a>)]|² ] φ(t) dt
-        averaged over random unit directions a ~ Uniform(S^{D-1}).
+        # Match buffers dtype to input dtype for Mixed Precision (AMP / bf16 / fp16)
+        t = self.t.to(dtype=z.dtype)
+        phi = self.phi.to(dtype=z.dtype)
+        weights = self.weights.to(dtype=z.dtype)
 
-        This is zero iff z ~ N(0, I).
-        """
-        S, D = z.shape
-
-        # Random sketch matrix — unit-norm columns : (D, n_sketches)
+        # Random sketch matrix — unit-norm columns: (D, n_sketches)
         A = torch.randn(D, self.n_sketches, device=z.device, dtype=z.dtype)
-        A = A / A.norm(p=2, dim=0, keepdim=True)
+        A = F.normalize(A, p=2, dim=0, eps=1e-8)
 
-        # Projections : (S, n_sketches)
+        # Projections: (..., S, D) @ (D, n_sketches) -> (..., S, n_sketches)
         proj = z @ A
 
-        # Characteristic function evaluations : (S, n_sketches, knots)
-        x_t = proj.unsqueeze(-1) * self.t  # broadcast over knots
+        # Characteristic function evaluations: (..., S, n_sketches, knots)
+        x_t = proj.unsqueeze(-1) * t  # broadcast over knots
 
         # Empirical characteristic function, averaged over S samples
-        # E[cos], E[sin] : (n_sketches, knots)
-        cf_cos = x_t.cos().mean(dim=0)
-        cf_sin = x_t.sin().mean(dim=0)
+        # E[cos], E[sin]: (..., n_sketches, knots)
+        cf_cos = x_t.cos().mean(dim=-3)
+        cf_sin = x_t.sin().mean(dim=-3)
 
-        # Target characteristic function of N(0,1): φ(t) = exp(-t²/2)
-        # Error : (n_sketches, knots)
-        err = (cf_cos - self.phi).square() + cf_sin.square()
+        # Target characteristic function of N(0,1): exp(-t²/2)
+        # Error: (..., n_sketches, knots)
+        err = (cf_cos - phi).square() + cf_sin.square()
 
-        # Quadrature integral + scale by S (makes the statistic sample-size-independent)
-        # (n_sketches,)
-        statistic = (err @ self.weights) * S
+        # Quadrature integral + scale by S
+        # err @ weights over the 'knots' dimension (last dim)
+        statistic = torch.matmul(err, weights) * S  # (..., n_sketches)
 
         return statistic.mean()
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """
+        """Compute the SIGREG regularization loss.
+
         Args:
-            z : tensor of shape (B, N, D)
+            z: Tensor of shape (B, N, D).
 
         Returns:
-            scalar loss
+            Scalar tensor loss.
         """
         if z.ndim != 3:
             raise ValueError(f"Expected tensor of shape (B, N, D), got {tuple(z.shape)}")
         B, N, D = z.shape
 
         if self.mode == "flat":
-            # Treat all B*N tokens as i.i.d. samples
-            # Valid when tokens are spatially homogeneous (regular grid, symmetric slots…)
-            z_flat = z.reshape(B * N, D)  # (B*N, D)
-            return self._sigreg_2d(z_flat)
+            # Treat all B*N tokens as i.i.d. samples: (B*N, D)
+            z_flat = z.reshape(B * N, D)
+            return self._sigreg_batched(z_flat)
 
         else:  # per_pos
-            # Estimate the distribution independently at each of the N positions.
-            # Requires B large enough for a reliable covariance estimate.
-            # z.permute(1, 0, 2) : (N, B, D)
-            loss = torch.stack([self._sigreg_2d(z[:, n, :]) for n in range(N)]).mean()
-            return loss
+            # Estimate distribution per position N in parallel over B samples
+            # z.permute(1, 0, 2) shape: (N, B, D)
+            z_pos = z.permute(1, 0, 2)
+            return self._sigreg_batched(z_pos)

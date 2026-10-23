@@ -1,8 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pynop.core.encoding import CartesianEmbedding
-from typing import Callable, Union
+from typing import Callable, Union, Literal
 
 
 class DeepONet(nn.Module):
@@ -15,9 +14,9 @@ class DeepONet(nn.Module):
         decoder: Union[None, Callable] = None,
         activation: Union[None, Callable] = None,
         normalization: Union[None, Callable] = None,
-        scale: Union[None, float, int] = None,
+        scale: Union[None, float, int, Literal["auto"]] = None,
     ):
-        """
+        r"""
         Implement a general deeponet architecture (DON, Latent-DON, Fourier-MIONET, etc.).
 
         Arguments:
@@ -27,7 +26,9 @@ class DeepONet(nn.Module):
         - decoder: None or an existing model. It decodes the ouput of the DON
         - activation: a valid activation function
         - normalization: a valid normalization layer or None (default DON has no normalization)
-        - scale: the scaling factor applied to the output (can be 1/n or $1/ \sqrt(n) $ where n is the dimension of the output)
+        - scale: the scaling factor applied to the output (can be 1/n or $1/ \sqrt(n) $ where n is the
+          dimension of the output). If a number, it is used as a fixed factor; if 'auto', it becomes a
+          learnable parameter (initialized to 1.0); if None, it is fixed to 1.
 
         Notes:
         The dimension of the input of the trunk net is the dimensionality N of the coordinates: [Bt, N]./ Bt is the number of query points.
@@ -42,39 +43,36 @@ class DeepONet(nn.Module):
 
         super(DeepONet, self).__init__()
 
-        self.scale = 1 if scale is None else nn.Parameter(torch.tensor(scale))
-
-        use_bias = True if normalization is None else False
-
-        if not callable(branchnet):
-            # If not given, the branchnet is just a MLP
-            self.branchlist = nn.ModuleList()
-            for i, n in enumerate(branchnet[1:]):
-                self.branchlist.append(nn.Linear(branchnet[i], n, bias=use_bias))
-                if normalization is not None:
-                    self.branchlist.append(normalization(n))
-                if activation is not None:
-                    self.branchlist.append(activation())
-            # Last layer without activation
-            self.branchlist.append(nn.Linear(branchnet[i + 1], branchnet[i + 2]))
+        # scale: a number -> fixed factor, 'auto' -> learnable parameter (init 1.0), None -> fixed to 1
+        if scale is None:
+            self.scale = 1.0
+        elif scale == "auto":
+            self.scale = nn.Parameter(torch.tensor(1.0))
         else:
-            self.branchnet = branchnet
+            self.scale = float(scale)
 
-        self.trunknet = nn.ModuleList()
-        if not callable(trunknet):
-            # If not given, the branchnet is just a MLP
-            self.trunknet = nn.ModuleList()
-            for i, n in enumerate(trunknet[1:]):
-                self.trunknet.append(nn.Linear(trunknet[i], n, bias=use_bias))
-                if normalization is not None:
-                    self.trunknet.append(normalization(n))
-                if activation is not None:
-                    self.trunknet.append(activation())
-            # Last layer without activation
-            self.trunknet.append(nn.Linear(trunknet[i + 1], trunknet[i + 2]))
+        use_bias = normalization is None
 
-        else:
-            self.trunknet = trunknet
+        def _build_mlp(dims):
+            """Build a callable MLP (nn.Sequential) from a list of layer widths, or return
+            ``dims`` unchanged if it is already a callable module (e.g. CNN, FNO).
+
+            No activation / normalization is applied after the last linear layer.
+            """
+            if callable(dims):
+                return dims
+            layers = []
+            for i in range(len(dims) - 1):
+                layers.append(nn.Linear(dims[i], dims[i + 1], bias=use_bias))
+                if i < len(dims) - 2:  # skip norm/activation on the final layer
+                    if normalization is not None:
+                        layers.append(normalization(dims[i + 1]))
+                    if activation is not None:
+                        layers.append(activation())
+            return nn.Sequential(*layers)
+
+        self.branchnet = _build_mlp(branchnet)
+        self.trunknet = _build_mlp(trunknet)
 
         self.encoder = encoder
         self.decoder = decoder

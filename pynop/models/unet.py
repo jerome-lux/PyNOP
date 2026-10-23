@@ -85,7 +85,7 @@ class unet(nn.Module):
                         stride=1,
                     )
                 )
-                # Downsample the last block of each stage, ecept for the last stage, which is the bottleneck
+                # Downsample the last block of each stage, except for the last stage, which is the bottleneck
                 if i < len(repeats) - 1 and j == n - 1:
                     self.downblocks.append(downblock(in_channels=filters[i], out_channels=filters[i]))
         # Decoder

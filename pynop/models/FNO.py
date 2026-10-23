@@ -137,7 +137,7 @@ class FNO(nn.Module):
 
         self.projection = nn.Conv2d(hidden_channels[-1], out_channels, 1, bias=True)
 
-    def forward(self, x, cond: Optional[torch.Tensor]):
+    def forward(self, x, cond: Optional[torch.Tensor] = None):
 
         if self.fixed_pos_encoding:
             x = self.grid_encoding(x)
