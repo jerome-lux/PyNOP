@@ -171,9 +171,8 @@ class ITLNO(nn.Module):
         # Learnable normalisation factor for the inverse integral transform.
         # Unlike classical attention (which normalises with a softmax), an
         # integral transform has no fixed normalisation: we let the network
-        # determine the scale. Initialised to 1/(m1*m2) to preserve the
-        # previous fixed behaviour.
-        self.it_scale_inverse = nn.Parameter(torch.full((1,), 1.0 / (self.m1 * self.m2)))
+        # determine the scale. Initialised to 1.0; the model learns the optimal value.
+        self.it_scale_inverse = nn.Parameter(torch.ones(1))
 
         # Forward transform normalization strategy:
         #   "mode" — divide by per-mode L2 norm (unit-norm modes, current behavior)
