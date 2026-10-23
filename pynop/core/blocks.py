@@ -17,6 +17,7 @@ from .norm import AdaptiveLayerNorm, LayerNorm2d, AdaptiveLayerNorm, AdaRMSNorm,
 from .activations import Sine, gumbel_softmax
 from .encoding import (
     RoPE,
+    AdaptiveRoPE2D,
     IntegratedPositionalEncoding,
     GaussianFourierEmbedding,
     GaussianIntegratedPositionalEncoding,
@@ -3248,3 +3249,477 @@ class IAETBlock(nn.Module):
         output = self.activation(output + self.shortcut(x))
 
         return output
+
+
+class WindowAttention(nn.Module):
+    """Window-based self-attention layer with rotary positional encoding."""
+
+    def __init__(self, dim: int, num_heads: int):
+        """Initialize the attention layer.
+
+        Args:
+            dim: Size of each token embedding.
+            num_heads: Number of attention heads. The embedding size must be divisible by this value.
+        """
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.d_head = dim // num_heads
+        self.scale = self.d_head**-0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.proj = nn.Linear(dim, dim)
+        self.rope = AdaptiveRoPE2D(self.d_head)
+
+    def forward(
+        self,
+        x: torch.Tensor,  # [B*nW, N, dim]
+        coords: torch.Tensor,  # [B*nW, win_h, win_w, 2]  absolute coordinates(y,x) in [-1, 1]
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply window attention to a batch of local tokens.
+
+        Args:
+            x: Input tokens with shape [B*nW, N, dim].
+            coords: Absolute coordinates (of original grid) reshaped as [num_windows, win_h*win_w, win_h*win_w, 2]
+            mask: Optional attention mask with shape [num_windows, win_h*win_w, win_h*win_w].
+
+        Returns:
+            A tensor of shape [B*nW, N, dim] containing the attended features.
+        """
+
+        b_win, n, c = x.shape
+        h = self.num_heads
+        # [3, b*nwin, heads, n, d_head] where n is the number of token in a window
+        qkv = self.qkv(x).reshape(b_win, n, 3, h, self.d_head).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # [B*nW, Heads, N, d_head]
+
+        # Apply RoPE to queries and keys only.
+        q = self.rope.rotate(q, coords)
+        k = self.rope.rotate(k, coords)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+
+        if mask is not None:
+            nw = mask.shape[0]
+            attn = attn.view(b_win // nw, nw, h, n, n) + mask.unsqueeze(1)
+            attn = attn.view(b_win, h, n, n)
+
+        attn = F.softmax(attn, dim=-1)
+        x = (attn @ v).transpose(1, 2).reshape(b_win, n, c)
+        return self.proj(x)
+
+
+class WindowCrossAttention(nn.Module):
+    """Local cross-attention module that compresses tokens into a small learnable query grid."""
+
+    def __init__(self, in_ch: int, dim: int, num_heads: int, m: int = 1):
+        """Initialize the cross-attention module.
+
+        Args:
+            in_ch: Input feature dimension for the keys and values.
+            dim: Hidden dimension used for the queries, keys, values, and output projection.
+            num_heads: Number of attention heads. The dimension must be divisible by this value.
+            m: Side length of the learnable query grid, yielding $m^2$ queries per window.
+        """
+        super().__init__()
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        self.dim = dim
+        self.num_heads = num_heads
+        self.d_head = dim // num_heads
+        self.m = m
+        self.scale = self.d_head**-0.5
+
+        # Learnable queries defined in the target latent space.
+        self.latent_queries = nn.Parameter(torch.randn(1, m * m, dim) * 0.02)
+
+        self.q_proj = nn.Linear(dim, dim, bias=True)
+        self.k_proj = nn.Linear(in_ch, dim, bias=True)
+        self.v_proj = nn.Linear(in_ch, dim, bias=True)
+        self.out_proj = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        """Compress a set of local tokens into a learned query grid.
+
+        Args:
+            x: Input tokens with shape [B_win, N_in, in_ch].
+            coords: Absolute coordinates for the input tokens with shape [B_win, N_in, 2].
+
+        Returns:
+            Aggregated tokens with shape [B_win, m*m, dim].
+        """
+        b_win, n, _ = x.shape
+        h = self.num_heads
+
+        # Project queries
+        q = self.latent_queries.expand(b_win, -1, -1)
+        q = self.q_proj(q).reshape(b_win, self.m * self.m, h, self.d_head).transpose(1, 2)
+
+        # Project keys and values
+        k = self.k_proj(x).reshape(b_win, n, h, self.d_head).transpose(1, 2)
+        v = self.v_proj(x).reshape(b_win, n, h, self.d_head).transpose(1, 2)
+
+        # Position encoding on keys can be added here if needed.
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+
+        out = (attn @ v).transpose(1, 2).reshape(b_win, self.m * self.m, self.dim)
+        return self.out_proj(out)
+
+
+class AdaptiveSwinBlock(nn.Module):
+    """A Swin-style transformer block with local window attention and optional shifted windows."""
+
+    def __init__(
+        self,
+        dim: int,
+        grid_windows: tuple[int, int],
+        num_heads: int,
+        activation: Callable = nn.GELU,
+        mlp_factor: int = 4,
+        shift: bool = False,
+    ):
+        """Initialize the Swin block.
+
+        Args:
+            dim: Feature dimension of each token.
+            grid_windows: Number of windows along the height and width axes, provided as (nw_h, nw_w).
+            num_heads: Number of attention heads in the local window attention module.
+            activation: Activation class used by the MLP subnetwork.
+            mlp_factor: Expansion factor for the hidden size of the MLP.
+            shift: If True, use shifted windows in the attention operation.
+        """
+        super().__init__()
+        self.dim = dim
+        self.nw_h, self.nw_w = grid_windows
+        self.num_heads = num_heads
+        self.shift = shift
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = WindowAttention(dim, num_heads)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_factor * dim),
+            activation(),
+            nn.Linear(mlp_factor * dim, dim),
+        )
+
+    def _create_mask(self, h, w, win_h, win_w, shift_h, shift_w, device):
+        img_mask = torch.zeros((1, h, w, 1), device=device)
+        h_slices = (slice(0, -win_h), slice(-win_h, -shift_h), slice(-shift_h, None))
+        w_slices = (slice(0, -win_w), slice(-win_w, -shift_w), slice(-shift_w, None))
+        cnt = 0
+        for h_sl in h_slices:
+            for w_sl in w_slices:
+                img_mask[:, h_sl, w_sl, :] = cnt
+                cnt += 1
+        mask_windows = img_mask.view(1, self.nw_h, win_h, self.nw_w, win_w, 1)
+        mask_windows = mask_windows.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, win_h * win_w)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        return attn_mask.masked_fill(attn_mask != 0, -100.0).masked_fill(attn_mask == 0, 0.0)
+
+    def _build_coords(self, h, w, win_h, win_w, shift_h, shift_w, b, device):
+        """Build absolute coordinates for tokens after window partitioning.
+
+        Returns a tensor of shape [B*nW, win_h*win_w, 2] in the range [-1, 1].
+        """
+        # Global grid before shifting.
+        gy = (torch.arange(h, device=device).float() / h) * 2 - 1  # [-1, 1)
+        gx = (torch.arange(w, device=device).float() / w) * 2 - 1
+        cy, cx = torch.meshgrid(gy, gx, indexing="ij")  # [H, W]
+        coords_img = torch.stack([cy, cx], dim=-1)  # [H, W, 2]
+
+        # Apply the same shift to the coordinates as to the feature map.
+        if shift_h > 0 or shift_w > 0:
+            coords_img = torch.roll(coords_img, shifts=(-shift_h, -shift_w), dims=(0, 1))
+
+        # Partition the coordinates exactly like the feature tokens.
+        coords_win = coords_img.view(self.nw_h, win_h, self.nw_w, win_w, 2)
+        coords_win = coords_win.permute(0, 2, 1, 3, 4).contiguous()  # [nW_h, nW_w, win_h, win_w, 2]
+        coords_win = coords_win.view(self.nw_h * self.nw_w, win_h, win_w, 2)
+
+        # Repeat over the batch dimension.
+        coords_win = coords_win.unsqueeze(0).expand(b, -1, -1, -1, -1)  # [B, nW, win_h, win_w, 2]
+        return coords_win.reshape(b * self.nw_h * self.nw_w, win_h, win_w, 2)
+
+    def forward(self, x: torch.Tensor, use_mask: bool = True) -> torch.Tensor:
+        """Apply the Swin block to a 4D feature map.
+
+        Args:
+            x: Input tensor of shape [B, H, W, C].
+            use_mask: If True, generate an attention mask when shifted windows are enabled.
+
+        Returns:
+            A tensor with the same shape as the input, containing the updated features.
+        """
+        b, h, w, d = x.shape
+        if h % self.nw_h != 0 or w % self.nw_w != 0:
+            raise ValueError(
+                f"AdaptiveSwinBlock: input spatial size ({h}x{w}) must be divisible by "
+                f"grid_windows ({self.nw_h}x{self.nw_w}); got remainder ({h % self.nw_h}, {w % self.nw_w})."
+            )
+        shortcut = x
+        x = self.norm1(x)
+
+        win_h, win_w = h // self.nw_h, w // self.nw_w
+        shift_h, shift_w = (win_h // 2, win_w // 2) if self.shift else (0, 0)
+
+        if self.shift and use_mask:
+            x = torch.roll(x, shifts=(-shift_h, -shift_w), dims=(1, 2))
+            mask = self._create_mask(h, w, win_h, win_w, shift_h, shift_w, x.device)
+        else:
+            mask = None
+
+        # Absolute coordinates with shape [B * num_win, win_h, win_w, 2].
+        coords = self._build_coords(h, w, win_h, win_w, shift_h, shift_w, b, x.device)
+
+        x_win = x.view(b, self.nw_h, win_h, self.nw_w, win_w, d)
+        x_win = x_win.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, win_h * win_w, d)
+
+        attn_win = self.attn(x_win, coords=coords, mask=mask)
+
+        x = attn_win.view(b, self.nw_h, self.nw_w, win_h, win_w, d)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(b, h, w, d)
+
+        if self.shift:
+            x = torch.roll(x, shifts=(shift_h, shift_w), dims=(1, 2))
+
+        return shortcut + x + self.mlp(self.norm2(x))
+
+
+class PaddedSwinBlock(nn.Module):
+    """A Swin-style block with optional padding and boundary-aware window attention."""
+
+    def __init__(
+        self,
+        dim: int,
+        grid_windows: tuple[int, int],
+        num_heads: int,
+        activation: Callable = nn.GELU,
+        pad: bool = False,
+        mlp_factor: int = 4,
+        bc_mode: str = "circular",
+        rope_max_freq: float = 8.0,
+    ):
+        """Initialize the padded Swin block.
+
+        Args:
+            dim: Feature dimension of each token.
+            grid_windows: Number of windows along height and width, provided as (nw_h, nw_w).
+            num_heads: Number of attention heads in the local window attention module.
+            activation: Activation class used by the MLP subnetwork.
+            pad: If True, pad the input tensor before computing window attention.
+            mlp_factor: Expansion factor for the hidden size of the MLP.
+            bc_mode: Boundary padding mode used for the padded feature map.
+            rope_max_freq: Maximum frequency used by the positional encoding component.
+        """
+        super().__init__()
+        self.dim = dim
+        self.nw_h, self.nw_w = grid_windows
+        self.num_heads = num_heads
+        self.pad = pad
+        self.bc_mode = bc_mode
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = WindowAttention(dim, num_heads)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_factor * dim),
+            activation(),
+            nn.Linear(mlp_factor * dim, dim),  # corrig� : �tait 4*dim
+        )
+
+    def _build_coords(
+        self,
+        h: int,
+        w: int,
+        h_pad: int,
+        w_pad: int,
+        pad_h: int,
+        pad_w: int,
+        win_h: int,
+        win_w: int,
+        current_nw_h: int,
+        current_nw_w: int,
+        b: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Build absolute coordinates for padded tokens in the range [-1, 1].
+
+        Returns a tensor of shape [B * current_nw_h * current_nw_w, win_h * win_w, 2].
+        """
+        # Uniform step based on the original grid.
+        step_y = 2.0 / h
+        step_x = 2.0 / w
+
+        # Coordinates of the padded tensor: original tokens lie in [-1, 1), while padded tokens lie outside that range.
+        gy = (torch.arange(h_pad, device=device).float() - pad_h) * step_y - 1.0 + step_y / 2
+        gx = (torch.arange(w_pad, device=device).float() - pad_w) * step_x - 1.0 + step_x / 2
+
+        cy, cx = torch.meshgrid(gy, gx, indexing="ij")  # [H_pad, W_pad]
+        coords_img = torch.stack([cy, cx], dim=-1)  # [H_pad, W_pad, 2]
+
+        # Partition the coordinates like the flattened window tokens.
+        coords_win = coords_img.view(current_nw_h, win_h, current_nw_w, win_w, 2)
+        coords_win = coords_win.permute(0, 2, 1, 3, 4).contiguous()  # [nW_h, nW_w, win_h, win_w, 2]
+        coords_win = coords_win.view(current_nw_h * current_nw_w, win_h, win_w, 2)
+
+        return coords_win.unsqueeze(0).expand(b, -1, -1, -1, -1).reshape(b * current_nw_h * current_nw_w, win_h, win_w, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the padded Swin block to a 4D feature map.
+
+        Args:
+            x: Input tensor of shape [B, H, W, C].
+
+        Returns:
+            A tensor with the same shape as the input, containing the updated features.
+        """
+        b, h, w, d = x.shape
+        if h % self.nw_h != 0 or w % self.nw_w != 0:
+            raise ValueError(
+                f"PaddedSwinBlock: input spatial size ({h}x{w}) must be divisible by "
+                f"grid_windows ({self.nw_h}x{self.nw_w}); got remainder ({h % self.nw_h}, {w % self.nw_w})."
+            )
+        shortcut = x
+        x = self.norm1(x)
+
+        win_h, win_w = h // self.nw_h, w // self.nw_w
+
+        if self.pad:
+            pad_h, pad_w = win_h // 2, win_w // 2
+
+            x_padded = F.pad(
+                x.permute(0, 3, 1, 2),
+                (pad_w, pad_w, pad_h, pad_h),
+                mode=self.bc_mode,
+            ).permute(
+                0, 2, 3, 1
+            )  # [B, H_pad, W_pad, D]
+
+            h_pad, w_pad = x_padded.shape[1], x_padded.shape[2]
+            current_nw_h = h_pad // win_h
+            current_nw_w = w_pad // win_w
+
+            coords = self._build_coords(
+                h,
+                w,
+                h_pad,
+                w_pad,
+                pad_h,
+                pad_w,
+                win_h,
+                win_w,
+                current_nw_h,
+                current_nw_w,
+                b,
+                x.device,
+            )
+
+            x_win = x_padded.view(b, current_nw_h, win_h, current_nw_w, win_w, d)
+            x_win = x_win.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, win_h * win_w, d)
+
+            attn_win = self.attn(x_win, coords=coords)
+
+            x_merged = attn_win.view(b, current_nw_h, current_nw_w, win_h, win_w, d)
+            x_merged = x_merged.permute(0, 1, 3, 2, 4, 5).contiguous().view(b, h_pad, w_pad, d)
+            x = x_merged[:, pad_h:-pad_h, pad_w:-pad_w, :]
+
+        else:
+            coords = self._build_coords(h, w, h, w, 0, 0, win_h, win_w, self.nw_h, self.nw_w, b, x.device)
+
+            x_win = x.view(b, self.nw_h, win_h, self.nw_w, win_w, d)
+            x_win = x_win.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, win_h * win_w, d)
+
+            attn_win = self.attn(x_win, coords=coords)
+
+            x = attn_win.view(b, self.nw_h, self.nw_w, win_h, win_w, d)
+            x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(b, h, w, d)
+
+        return shortcut + x + self.mlp(self.norm2(x))
+
+
+class BlockCrossAttentionUpsampler(nn.Module):
+    """Upsampler doing local cross-attention by grouping high-res queries into blocks."""
+
+    def __init__(
+        self,
+        latent_dim: int,
+        shortcut_dim: int,
+        num_heads: int = 4,
+        activation: Callable = nn.GELU,
+        mlp_factor: int = 4,
+    ):
+        """
+        Args:
+            latent_dim:   Dimension of the latent grid features (D).
+            shortcut_dim: Dimension of the high-res shortcut features (C).
+            num_heads:    Number of attention heads.
+        """
+        super().__init__()
+        self.num_heads = num_heads
+        self.scale = (latent_dim // num_heads) ** -0.5
+
+        self.q_proj = nn.Linear(shortcut_dim, latent_dim)
+        self.kv_proj = nn.Linear(latent_dim, latent_dim * 2)
+        self.out_proj = nn.Linear(latent_dim, shortcut_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(shortcut_dim, mlp_factor * shortcut_dim),
+            activation(),
+            nn.Linear(mlp_factor * shortcut_dim, shortcut_dim),
+        )
+        self.q_norm = nn.RMSNorm(shortcut_dim)
+        self.latent_norm = nn.RMSNorm(latent_dim)
+        self.out_norm = nn.RMSNorm(shortcut_dim)
+
+    def forward(self, z_grid: torch.Tensor, shortcut: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            z_grid:   [B, M1, M2, latent_dim]   Low-res latent grid.
+            shortcut: [B, H, W, shortcut_dim]   High-res encoder features.
+
+        Returns:
+            [B, H, W, shortcut_dim]             Upsampled features.
+        """
+        B, M1, M2, D = z_grid.shape
+        _, H, W, C = shortcut.shape
+        h = self.num_heads
+        d_head = D // h
+
+        # Compute upsampling ratios per axis
+        rh, rw = H // M1, W // M2
+        n_queries = rh * rw  # Number of high-res pixels per latent token
+
+        # Normalize the shortcut features.
+        shortcut = self.q_norm(shortcut)
+        z_grid = self.latent_norm(z_grid)
+
+        # Reshape and permute shortcut into local blocks
+        # [B, H, W, C] -> [B, M1, rh, M2, rw, C] -> [B, M1, M2, rh*rw, C]
+        q_local = (
+            shortcut.view(B, M1, rh, M2, rw, C).permute(0, 1, 3, 2, 4, 5).contiguous().view(B, M1, M2, n_queries, C)
+        )
+
+        # Project Queries, Keys, and Values
+        # Q: [B, M1, M2, h, n_queries, d_head]
+        q = self.q_proj(q_local).view(B, M1, M2, n_queries, h, d_head).permute(0, 1, 2, 4, 3, 5)
+
+        # KV: [B, M1, M2, 1, 2*D] -> K, V: [B, M1, M2, h, 1, d_head]
+        k, v = self.kv_proj(z_grid).view(B, M1, M2, 1, 2, h, d_head).unbind(dim=4)
+        k = k.permute(0, 1, 2, 4, 3, 5)
+        v = v.permute(0, 1, 2, 4, 3, 5)
+
+        # Compute Attention over the block: [B, M1, M2, h, n_queries, 1]
+        # Each of the n_queries attends to the single local latent token
+        attn = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+
+        # Context aggregation and output projection
+        # out_local: [B, M1, M2, n_queries, shortcut_dim]
+        out_local = torch.matmul(attn, v).permute(0, 1, 2, 4, 3, 5).reshape(B, M1, M2, n_queries, D)
+        out_local = self.out_proj(out_local)
+
+        # Reconstruct original high-res grid layout [B, H, W, shortcut_dim]
+        out = out_local.view(B, M1, M2, rh, rw, C).permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, C)
+
+        out = out + shortcut
+
+        return out + self.mlp(self.out_norm(out))
