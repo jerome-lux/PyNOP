@@ -1,25 +1,19 @@
-from calendar import c
 import math
 from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Union, Sequence, Callable
-import collections.abc as abc
 from pynop.core.blocks import (
     MLPBlock,
-    SirenBlock,
     TransformerBlock,
-    SpatioTemporalTransformer,
     GalerkinTransformerBlock,
     SlicingBlock,
     DeslicingBlock,
     PEBlock,
 )
 from pynop.core.ops import GalerkinAttention
-from pynop.core.norm import AdaptiveLayerNorm, AdaRMSNorm
-from pynop.core.utils import ChebyshevBasis, print_stats, add_noise
-from pynop.core.loss import MMDLoss
+from pynop.core.utils import ChebyshevBasis, print_stats
 
 
 class ITLNO(nn.Module):
@@ -120,10 +114,14 @@ class ITLNO(nn.Module):
             mlp_act=mlp_act,
         )
 
+        # Basis-generator input: a learned positional encoding (hidden_channels)
+        # when `pe` is a method, or the raw coordinates (ndim) when `pe is None`.
+        basis_in_ch = ndim if pe is None else hidden_channels
+
         if cat_coords:
             self.mixer = MLPBlock(
                 out_ch=hidden_channels,
-                in_ch=2 * hidden_channels,
+                in_ch=hidden_channels + basis_in_ch,
                 hidden_dim=hidden_channels,
                 num_layers=1,
                 activation=mlp_act,
@@ -133,7 +131,7 @@ class ITLNO(nn.Module):
         self.norm1 = norm_layer(hidden_channels)
         self.kernel_norm = norm_layer(self.m1 * self.m2)
 
-        in_ch = hidden_channels
+        in_ch = basis_in_ch
 
         if self.basis_mode == "cheb":
             self.trunk_generator = ChebyshevBasis(self.m1, self.m2)
@@ -166,7 +164,15 @@ class ITLNO(nn.Module):
         if orthogonal_init:
             self.ortho_init_weights(self.trunk_generator)
             self.ortho_init_weights(self.branch_generator, gain=nn.init.calculate_gain("relu"))
-            self.ortho_init_weights(self.kernel_mixing, gain=nn.init.calculate_gain("relu"))
+            if not linear_kernel:
+                self.ortho_init_weights(self.kernel_mixing, gain=nn.init.calculate_gain("relu"))
+
+        # Learnable normalisation factor for the inverse integral transform.
+        # Unlike classical attention (which normalises with a softmax), an
+        # integral transform has no fixed normalisation: we let the network
+        # determine the scale. Initialised to 1/(m1*m2) to preserve the
+        # previous fixed behaviour.
+        self.it_scale_inverse = nn.Parameter(torch.full((1,), 1.0 / (self.m1 * self.m2)))
 
         self.latent_pe = MLPBlock(2, hidden_channels, num_layers=1, activation=activation)
 
@@ -218,7 +224,10 @@ class ITLNO(nn.Module):
         coords = torch.stack([grid_h, grid_w], dim=-1).unsqueeze(0)
         pe = self.pelayer(coords)
 
-        kernel = self.trunk_generator(pe).view(1, H * W, self.m1 * self.m2).expand(B, -1, -1)  # B, H*W, M
+        # A Chebyshev basis is a fixed function of the raw coordinates; a learned
+        # basis consumes the positional encoding.
+        trunk_input = coords if self.basis_mode == "cheb" else pe
+        kernel = self.trunk_generator(trunk_input).view(1, H * W, self.m1 * self.m2).expand(B, -1, -1)  # B, H*W, M
         kernel = self.kernel_norm(kernel)
 
         if self.cat_coords:
@@ -246,11 +255,21 @@ class ITLNO(nn.Module):
         if self.verbose:
             print_stats(kernel, -1, "kernel:")
 
-        # Forward integral transform
+        # Forward integral transform: project x onto each (unit-norm) basis mode.
         # print(x.shape, kernel.shape, d.shape)
         xhat = torch.einsum("bnc,bnm->bmc", x, kernel)
-        xhat = xhat / d.permute(0, 2, 1)
+        xhat = xhat / (d.permute(0, 2, 1) + 1e-8)
         xhat = self.latent_projection(xhat)
+
+        # Latent positional encoding: gives the m1*m2 latent modes an explicit
+        # order so the self-attention in the transformed domain is not
+        # permutation-invariant (restored from the reference implementation).
+        m1_coords = torch.linspace(-1, 1, steps=self.m1, device=xhat.device)
+        m2_coords = torch.linspace(-1, 1, steps=self.m2, device=xhat.device)
+        grid_m1, grid_m2 = torch.meshgrid(m1_coords, m2_coords, indexing="ij")
+        m_coords = torch.stack([grid_m1, grid_m2], dim=-1).view(self.m1 * self.m2, 2)
+        pe_latent = self.latent_pe(m_coords.unsqueeze(0).expand(B, -1, -1))  # [B, M, hidden]
+        xhat = xhat + pe_latent
 
         if self.verbose:
             print_stats(xhat, -1, "after IT:")
@@ -262,7 +281,7 @@ class ITLNO(nn.Module):
                 print_stats(xhat, -1, f"after ATT: module {i}")
 
         # Go back to spatial domain
-        x_rec = torch.einsum("bmc,bnm->bnc", xhat, kernel) / (self.m1 * self.m2)  # ** F.relu(self.IT_scale_inverse)
+        x_rec = torch.einsum("bmc,bnm->bnc", xhat, kernel) * self.it_scale_inverse
 
         if self.verbose:
             print_stats(x_rec, -1, "after REC:")
@@ -325,7 +344,7 @@ class LatentGalerkin(nn.Module):
         verbose: bool = False,
         galerkin_norm=False,
         rmsnorm: bool = True,
-        pe="random_ipe",
+        pe="adaptive",
         pe_param=10,
         std_init=1e-2,
     ):

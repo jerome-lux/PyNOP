@@ -6,21 +6,30 @@ from typing import Optional
 
 class AdaptiveRoPE2D(nn.Module):
     """
-    2D Continuous RoPE with independent coordinates for queries and keys.
-    Use rotate() independently on q and k when needed.
+    2D Continuous RoPE with resolution-adaptive frequencies.
+
+    The frequencies are log-spaced from (Nyquist / base) up to the Nyquist
+    angular frequency of the grid, ``Nyquist = pi * grid_size / 2``. This makes
+    the frequency range adapt to the input resolution so that the full band of
+    spatial frequencies (up to the grid Nyquist) can be represented, instead of
+    being capped at a fixed low value.
 
     Args:
         d_head (int): Dimension of the head (must be divisible by 4).
         domain_size (float): Total length of the domain (e.g., 2.0 for [-1, 1]).
+        base (float): Frequency range (log-spacing base). The lowest frequency is
+            ``Nyquist / base``. Larger values give a wider (lower) frequency band.
     """
 
-    def __init__(self, d_head: int, domain_size: float = 2.0):
+    def __init__(self, d_head: int, domain_size: float = 2.0, base: float = 16.0):
         super().__init__()
         assert d_head % 4 == 0, "d_head must be divisible by 4 for 2D RoPE"
         self.d_head = d_head
         self.domain_size = domain_size
+        self.base = base
 
-        exponent = torch.arange(0, d_head // 4, dtype=torch.float32) / (d_head // 4 - 1)
+        n = max(1, d_head // 4)
+        exponent = torch.arange(0, d_head // 4, dtype=torch.float32) / max(1, n - 1)
         self.register_buffer("exponent", exponent, persistent=False)
 
     def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
@@ -35,15 +44,20 @@ class AdaptiveRoPE2D(nn.Module):
     def _compute_sincos(
         self,
         coords: torch.Tensor,  # [B, N, 2]
-        h_spatial: int,
-        w_spatial: int,
+        h_grid: int,
+        w_grid: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         device, dtype = coords.device, coords.dtype
         exponent = self.exponent.to(device=device, dtype=dtype)
 
-        w_min = (2 * math.pi) / self.domain_size
-        freqs_y = w_min * float(h_spatial) ** (-exponent)  # [d_head//4]
-        freqs_x = w_min * float(w_spatial) ** (-exponent)
+        # Nyquist angular frequency of the grid: pi * grid_size / 2
+        # (cell size = domain_size / grid_size, Nyquist = pi / (cell/2))
+        nyquist_y = math.pi * float(h_grid) / 2.0
+        nyquist_x = math.pi * float(w_grid) / 2.0
+
+        # Log-spaced frequencies from nyquist/base up to nyquist
+        freqs_y = nyquist_y * (1.0 / (self.base**exponent))
+        freqs_x = nyquist_x * (1.0 / (self.base**exponent))
 
         phases_y = coords[..., 0:1] * freqs_y  # [B, N, d_head//4]
         phases_x = coords[..., 1:2] * freqs_x
@@ -59,18 +73,32 @@ class AdaptiveRoPE2D(nn.Module):
         self,
         t: torch.Tensor,  # [B, H_head, N, d_head]
         coords: torch.Tensor,  # [B, H, W, 2]  ou [B, N, 2]
+        resolution: Optional[tuple[int, int]] = None,
     ) -> torch.Tensor:
-        """Applique RoPE 2D sur un unique tenseur (q ou k)."""
-        if coords.dim() == 4:
-            h_spatial, w_spatial = coords.shape[1:3]
+        """Applique RoPE 2D sur un unique tenseur (q ou k).
+
+        Args:
+            t: Tensor to rotate, shape [B, H_head, N, d_head].
+            coords: Absolute coordinates in [-1, 1], shape [B, H, W, 2] or [B, N, 2].
+            resolution: (H_grid, W_grid) of the underlying grid. The frequency band is
+                derived from this Nyquist. If None, it is inferred from the coords shape
+                (only valid when coords is a full [B, H, W, 2] grid, not a window).
+        """
+        if resolution is not None:
+            h_grid, w_grid = resolution
+            if coords.dim() == 4:
+                coords = coords.flatten(1, 2)
+        elif coords.dim() == 4:
+            # Fallback: assume the coordinate shape IS the grid shape
+            h_grid, w_grid = coords.shape[1:3]
             coords = coords.flatten(1, 2)
         else:
             # Format [B, N, 2] : on ne peut inférer h/w que si carré
             # Préférer le format [B, H, W, 2] pour grilles non carrées
             n = coords.shape[1]
-            h_spatial = w_spatial = int(n**0.5)
+            h_grid = w_grid = int(n**0.5)
 
-        sin_y, cos_y, sin_x, cos_x = self._compute_sincos(coords, h_spatial, w_spatial)
+        sin_y, cos_y, sin_x, cos_x = self._compute_sincos(coords, h_grid, w_grid)
 
         d = t.shape[-1]
         t_y, t_x = t[..., : d // 2], t[..., d // 2 :]
@@ -563,27 +591,3 @@ class AdaptiveFourierEmbedding(nn.Module):
 
         x_proj = torch.matmul(x, b) * math.pi
         return torch.stack([torch.sin(x_proj), torch.cos(x_proj)], dim=-1).flatten(start_dim=-2)
-
-
-class LocalPositionalEncoding(nn.Module):
-    """Generates resolution-invariant 2D Fourier features for local window grids."""
-
-    def __init__(self, d_model: int, scale: float = 10.0):
-        super().__init__()
-        assert d_model % 2 == 0, "d_model must be divisible by 2"
-        self.mapping_channels = d_model // 2
-
-        # Fixed Random Fourier Features projection matrix
-        self.register_buffer("b_matrix", torch.randn(2, self.mapping_channels) * scale)
-
-    def forward(self, win_h: int, win_w: int, device: torch.device) -> torch.Tensor:
-        # Coordonnées normalisées dans [-0.5, 0.5], invariantes à la résolution
-        # align_corners=False : pas constant = 1/N quelle que soit la taille
-        grid_y = (torch.arange(win_h, device=device, dtype=torch.float32) + 0.5) / win_h - 0.5
-        grid_x = (torch.arange(win_w, device=device, dtype=torch.float32) + 0.5) / win_w - 0.5
-
-        coords_y, coords_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
-        coords = torch.stack([coords_y.flatten(), coords_x.flatten()], dim=-1)
-
-        proj = 2 * torch.pi * coords @ self.b_matrix
-        return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)

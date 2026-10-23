@@ -2072,7 +2072,7 @@ class GalerkinTransformerBlock(nn.Module):
         mlp_dim=512,
         dropout=0.1,
         delta=0.01,
-        activation=nn.GELU(),
+        activation: Callable = nn.GELU,
         std_ini: float = 1,
         kv_normalization=False,
         scaling: float = 1,
@@ -2084,9 +2084,12 @@ class GalerkinTransformerBlock(nn.Module):
         # self.scaling = nn.Parameter(torch.empty(1))
         self.scaling = scaling
 
+        # Accept either an activation class (nn.GELU) or an instance (nn.GELU())
+        act = activation() if isinstance(activation, type) else activation
+
         self.mlp = nn.Sequential(
             nn.Linear(dim, mlp_dim),
-            activation(),
+            act,
             nn.Dropout(dropout),
             nn.Linear(mlp_dim, dim),
             nn.Dropout(dropout),
@@ -2693,19 +2696,19 @@ class PEBlock(nn.Module):
 
         match method:
             case "random_fourier":
-                scale = kwargs.get("scale", 10.0)
+                scale = kwargs.get("scale", kwargs.get("max_freq_val", 10.0))
                 self.pe = GaussianFourierEmbedding(in_features, out_features, scale)
 
             case "fourier":
-                max_freq = kwargs.get("max_freq", 128.0)
+                max_freq = kwargs.get("max_freq", kwargs.get("max_freq_val", 128.0))
                 self.pe = FourierEmbedding(in_features, out_features, max_freq=max_freq)
 
             case "ipe":
-                max_freq = kwargs.get("max_freq", 128.0)
+                max_freq = kwargs.get("max_freq", kwargs.get("max_freq_val", 128.0))
                 self.pe = IntegratedPositionalEncoding(in_features, out_features, max_freq=max_freq)
 
             case "random_ipe":
-                scale = kwargs.get("scale", 10.0)
+                scale = kwargs.get("scale", kwargs.get("max_freq_val", 10.0))
                 self.pe = GaussianIntegratedPositionalEncoding(in_features, out_features, scale=scale)
 
             case "siren":
@@ -2727,7 +2730,9 @@ class PEBlock(nn.Module):
                 )
             case "adaptive":
                 self.pe = AdaptiveFourierEmbedding(
-                    in_features=in_features, out_features=out_features, base_max_freq=kwargs.get("max_freq", 128.0)
+                    in_features=in_features,
+                    out_features=out_features,
+                    base_max_freq=kwargs.get("max_freq", kwargs.get("max_freq_val", 128.0)),
                 )
             case None:
                 self.pe = nn.Identity()
@@ -3275,13 +3280,16 @@ class WindowAttention(nn.Module):
         x: torch.Tensor,  # [B*nW, N, dim]
         coords: torch.Tensor,  # [B*nW, win_h, win_w, 2]  absolute coordinates(y,x) in [-1, 1]
         mask: Optional[torch.Tensor] = None,
+        resolution: Optional[tuple[int, int]] = None,
     ) -> torch.Tensor:
         """Apply window attention to a batch of local tokens.
 
         Args:
             x: Input tokens with shape [B*nW, N, dim].
-            coords: Absolute coordinates (of original grid) reshaped as [num_windows, win_h*win_w, win_h*win_w, 2]
+            coords: Absolute coordinates (of original grid) reshaped as [B*nW, win_h, win_w, 2]
             mask: Optional attention mask with shape [num_windows, win_h*win_w, win_h*win_w].
+            resolution: (H_grid, W_grid) of the underlying grid, used to set the RoPE
+                frequency band (Nyquist). Pass the full grid size, not the window size.
 
         Returns:
             A tensor of shape [B*nW, N, dim] containing the attended features.
@@ -3294,8 +3302,8 @@ class WindowAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]  # [B*nW, Heads, N, d_head]
 
         # Apply RoPE to queries and keys only.
-        q = self.rope.rotate(q, coords)
-        k = self.rope.rotate(k, coords)
+        q = self.rope.rotate(q, coords, resolution=resolution)
+        k = self.rope.rotate(k, coords, resolution=resolution)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
 
@@ -3475,7 +3483,8 @@ class AdaptiveSwinBlock(nn.Module):
         x_win = x.view(b, self.nw_h, win_h, self.nw_w, win_w, d)
         x_win = x_win.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, win_h * win_w, d)
 
-        attn_win = self.attn(x_win, coords=coords, mask=mask)
+        # Pass the full grid resolution so the RoPE frequency band is set from the grid Nyquist
+        attn_win = self.attn(x_win, coords=coords, mask=mask, resolution=(h, w))
 
         x = attn_win.view(b, self.nw_h, self.nw_w, win_h, win_w, d)
         x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(b, h, w, d)
@@ -3617,7 +3626,7 @@ class PaddedSwinBlock(nn.Module):
             x_win = x_padded.view(b, current_nw_h, win_h, current_nw_w, win_w, d)
             x_win = x_win.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, win_h * win_w, d)
 
-            attn_win = self.attn(x_win, coords=coords)
+            attn_win = self.attn(x_win, coords=coords, resolution=(h, w))
 
             x_merged = attn_win.view(b, current_nw_h, current_nw_w, win_h, win_w, d)
             x_merged = x_merged.permute(0, 1, 3, 2, 4, 5).contiguous().view(b, h_pad, w_pad, d)
@@ -3629,7 +3638,7 @@ class PaddedSwinBlock(nn.Module):
             x_win = x.view(b, self.nw_h, win_h, self.nw_w, win_w, d)
             x_win = x_win.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, win_h * win_w, d)
 
-            attn_win = self.attn(x_win, coords=coords)
+            attn_win = self.attn(x_win, coords=coords, resolution=(h, w))
 
             x = attn_win.view(b, self.nw_h, self.nw_w, win_h, win_w, d)
             x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(b, h, w, d)
