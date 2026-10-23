@@ -75,6 +75,7 @@ class ITLNO(nn.Module):
         pe=None,
         pe_param=10,
         cat_coords: bool = True,
+        transform_normalization: str = "mode",
     ):
 
         super().__init__()
@@ -174,6 +175,16 @@ class ITLNO(nn.Module):
         # previous fixed behaviour.
         self.it_scale_inverse = nn.Parameter(torch.full((1,), 1.0 / (self.m1 * self.m2)))
 
+        # Forward transform normalization strategy:
+        #   "mode" — divide by per-mode L2 norm (unit-norm modes, current behavior)
+        #   "glob" — global scale N^e with learnable exponent e (preserves relative mode energy)
+        if transform_normalization not in ("mode", "glob"):
+            raise ValueError(f"transform_normalization must be 'mode' or 'glob', got {transform_normalization!r}")
+        self.transform_normalization = transform_normalization
+        if transform_normalization == "glob":
+            # e=-0.5 gives 1/sqrt(N) (orthonormal basis case); model learns optimal value in [-1, -0.5]
+            self.it_scale_forward_exp = nn.Parameter(torch.tensor(-0.5))
+
         self.latent_pe = MLPBlock(2, hidden_channels, num_layers=1, activation=activation)
 
         # List of attention modules
@@ -255,10 +266,17 @@ class ITLNO(nn.Module):
         if self.verbose:
             print_stats(kernel, -1, "kernel:")
 
-        # Forward integral transform: project x onto each (unit-norm) basis mode.
+        # Forward integral transform: project x onto basis modes.
         # print(x.shape, kernel.shape, d.shape)
         xhat = torch.einsum("bnc,bnm->bmc", x, kernel)
-        xhat = xhat / (d.permute(0, 2, 1) + 1e-8)
+        if self.transform_normalization == "mode":
+            # Per-mode normalization (unit-norm modes; loses relative mode energy)
+            xhat = xhat / (d.permute(0, 2, 1) + 1e-8)
+        else:
+            # Global scale N^e with learnable exponent e (preserves relative mode energy)
+            n_points = H * W
+            fwd_scale = torch.pow(torch.tensor(n_points, dtype=x.dtype, device=x.device), self.it_scale_forward_exp)
+            xhat = xhat * fwd_scale
         xhat = self.latent_projection(xhat)
 
         # Latent positional encoding: gives the m1*m2 latent modes an explicit
