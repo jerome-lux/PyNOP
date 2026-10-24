@@ -110,6 +110,29 @@ class AdaptiveRoPE2D(nn.Module):
             dim=-1,
         )
 
+    def forward(
+        self,
+        t: torch.Tensor,  # [B, H_head, N, d_head]
+        coords: torch.Tensor,  # [B, N, 2] or [B, H, W, 2]
+        resolution: Optional[tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        """Callable interface (``rope(t, coords)``) delegating to :meth:`rotate`.
+
+        This matches the injection protocol of :class:`pynop.core.ops.Attention`,
+        which applies rotary embeddings via ``rope(q, coords)``.
+
+        Args:
+            t: Tensor to rotate, shape [B, H_head, N, d_head].
+            coords: Absolute coordinates in [-1, 1], shape [B, N, 2] or
+                [B, H, W, 2] (the 4-D form disambiguates non-square grids).
+            resolution: Optional (H_grid, W_grid) of the underlying grid, used
+                for the Nyquist-adaptive frequencies.
+
+        Returns:
+            Rotated tensor of the same shape as ``t``.
+        """
+        return self.rotate(t, coords, resolution=resolution)
+
 
 class ContinuousRoPE2D(nn.Module):
     """

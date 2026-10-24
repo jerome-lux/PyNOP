@@ -3,13 +3,13 @@ import numpy as np
 import collections.abc as abc
 import torch
 import torch.nn as nn
-from pynop.core.blocks import FNOBlock, FNOBlockv2, UFNOBlock, ConvFNOBlock
+from pynop.core.blocks import FNOBlock, FNOBlockv2
 from pynop.core.encoding import CartesianEmbedding
 from pynop.core.ops import ConvLayer
 from pynop.core.norm import LayerNorm2d
 from pynop.core.utils import make_tuple
 
-REGISTERED_FNO = {"FNO": FNOBlock, "FNOv2": FNOBlockv2, "UFNO": UFNOBlock, "ConvFNO": ConvFNOBlock}
+REGISTERED_FNO = {"FNO": FNOBlock, "FNOv2": FNOBlockv2}
 
 
 class FNO(nn.Module):
@@ -25,7 +25,7 @@ class FNO(nn.Module):
     hidden_channels: Sequence[int]
         Number of hidden channels in each block. If a single integer is given, it is used for all blocks.
     blocks: Union[str, Sequence[str]]
-        Type of blocks to use in the network. If a single string is given, it is used for all blocks. Supported values are 'FNO', 'FNOv2', 'UFNO'.
+        Type of blocks to use in the network. If a single string is given, it is used for all blocks. Supported values are 'FNO', 'FNOv2'.
     spectral_compression_factor: Sequence
         Factor to compress the spectral layer. If a single integer is given, it is used for all blocks.
     activation: nn.module
@@ -56,9 +56,6 @@ class FNO(nn.Module):
         activation=nn.GELU,
         norm=LayerNorm2d,
         fixed_pos_encoding: bool = True,
-        trainable_pos_encoding: bool = False,
-        trainable_pos_encoding_modes=(16, 16),  # Only useful if pos_encoding == 'trainable'
-        trainable_pos_encoding_dims=8,
         block_kwargs: dict = {},
         dt: float = 1.0,
         cond_dim: Optional[int] = None,
@@ -67,7 +64,6 @@ class FNO(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.fixed_pos_encoding = fixed_pos_encoding
-        self.trainable_pos_encoding = trainable_pos_encoding
         self.dt = dt
 
         assert isinstance(hidden_channels, abc.Sequence), "hidden_channels must be a sequence"
@@ -82,18 +78,6 @@ class FNO(nn.Module):
         if fixed_pos_encoding:
             in_channels += 2
             self.grid_encoding = CartesianEmbedding()
-
-        if trainable_pos_encoding:
-            self.pos_embedding_weights = nn.Parameter(
-                torch.randn(
-                    1,
-                    trainable_pos_encoding_dims,
-                    *trainable_pos_encoding_modes,
-                    dtype=torch.cfloat,
-                )
-            )
-
-            in_channels += trainable_pos_encoding_dims
 
         if cond_dim is not None:
             in_channels = in_channels + cond_dim

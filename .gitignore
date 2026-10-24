@@ -1,5 +1,9 @@
 .vscode/settings.json
 
+### Local dev artifacts (debug proxy + captured request log) ###
+pynop/proxy.py
+pynop/requests.jsonl
+
 ### macOS ###
 # General
 .DS_Store

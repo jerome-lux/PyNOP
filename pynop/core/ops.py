@@ -1,6 +1,6 @@
 import math
 from warnings import warn
-from typing import Union, Optional
+from typing import Union, Optional, Callable
 
 import numpy as np
 import torch
@@ -75,26 +75,122 @@ class ConvLayer(nn.Module):
         return x
 
 
-class StridedConvDownsamplingLayer(nn.Module):
+class FiniteDifferenceLayer(nn.Module):
+    """Differential convolution layer (NeuralOperator-style, Liu-Schiaffini et al. ICML 2024).
 
-    def __init__(self, in_channels, out_channels, factor, kernel_size=1, groups=1):
+    Learns a base integral kernel K and, at forward time, converts it to a
+    differential kernel:
+
+        K_diff = (K - mean(K)) / h
+
+    where h is the grid spacing. Two key properties:
+
+    1. **Resolution invariance**: the 1/h rescaling ensures the operator
+       converges to the same continuous differential operator as the grid is
+       refined (h → 0), unlike a standard conv whose effect vanishes.
+    2. **High-pass / zero-DC**: subtracting the kernel mean removes the DC
+       component, so the operator annihilates spatially constant fields and
+       captures local variations (gradients, curvature) rather than averaging.
+
+    This complements global/low-rank operators (FNO, Transolver, Galerkin)
+    which structurally act as low-pass filters and cannot represent high
+    frequencies.
+
+    Args:
+        in_channels: Number of input channels.
+        out_channels: Number of output channels.
+        kernel_size: Spatial kernel size (odd integer, e.g. 3 or 5).
+        grid_width: Physical width of the domain (e.g. 2.0 for [-1, 1]).
+            Used to compute h = grid_width / (N - 1).
+        use_bias: Whether to include a bias term.
+        norm: Optional normalization class (e.g. nn.RMSNorm, LayerNorm2d).
+        activation: Optional activation class (e.g. nn.GELU).
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        grid_width: float = 2.0,
+        stride: int = 1,
+        padding: Union[int, str] = "same",
+        use_bias: bool = True,
+        norm: Optional[Callable] = None,
+        activation: Optional[Callable] = None,
+    ):
         super().__init__()
-        self.conv = ConvLayer(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            stride=factor,
-            groups=groups,
-            use_bias=True,
-            norm=None,
-            activation=None,
-        )
+        if kernel_size < 1 or kernel_size % 2 == 0:
+            raise ValueError(f"kernel_size must be a positive odd integer, got {kernel_size}")
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.grid_width = grid_width
+        self.stride = stride
+        # "same" padding (symmetric) for odd kernels
+        self.padding = kernel_size // 2 if padding == "same" else padding
+
+        # Base (integral) kernel — the learned coefficients before differential conversion
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, kernel_size, kernel_size))
+        if use_bias:
+            self.bias = nn.Parameter(torch.zeros(out_channels))
+        else:
+            self.register_parameter("bias", None)
+
+        # Kaiming init (standard for conv layers)
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+        self.norm = norm(out_channels) if norm is not None else None
+        self.activation = activation() if activation is not None else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
+        """Apply the differential convolution.
+
+        Args:
+            x: Input tensor of shape (B, C_in, H, W).
+
+        Returns:
+            Output tensor of shape (B, C_out, H, W).
+        """
+        _, _, H, _ = x.shape
+        # Grid spacing (assumes uniform grid over domain of width `grid_width`)
+        h = self.grid_width / max(H - 1, 1)
+
+        # Convert base kernel to differential kernel: center + 1/h rescale
+        kernel = (self.weight - self.weight.mean(dim=(-2, -1), keepdim=True)) / h
+
+        out = F.conv2d(x, kernel, self.bias, padding=self.padding, stride=self.stride, groups=1)
+
+        if self.norm is not None:
+            out = self.norm(out)
+        if self.activation is not None:
+            out = self.activation(out)
+        return out
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_channels={self.in_channels}, out_channels={self.out_channels}, "
+            f"kernel_size={self.kernel_size}, grid_width={self.grid_width}"
+        )
 
 
 class MaxPoolConv(nn.Module):
+    """Max-pooling downsampling followed by a 1x1 channel-mixing convolution.
+
+    (B, C_in, H, W) -> (B, C_in, H // factor, W // factor) -> (B, C_out, H // factor, W // factor)
+
+    The pooling uses ``stride = factor`` with ``same`` padding (so the spatial
+    size is exactly ``H // factor``, ``W // factor``). This is a simple,
+    parameter-light downsampling that is **not** pixel-shuffle based.
+
+    Args:
+        in_channels: Number of input channels.
+        out_channels: Number of output channels.
+        kernel_size: Max-pool kernel size (default odd; padding is computed for
+            ``same`` output size).
+        factor: Downsampling stride (spatial size is divided by this).
+    """
 
     def __init__(
         self,
@@ -114,150 +210,17 @@ class MaxPoolConv(nn.Module):
             activation=None,
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Pool and mix channels.
+
+        Args:
+            x: Input tensor of shape (B, C_in, H, W).
+
+        Returns:
+            Tensor of shape (B, C_out, H // factor, W // factor).
+        """
         x = self.pool(x)
         x = self.conv(x)
-        return x
-
-
-class ConvPixelUnshuffleDownSampleLayer(nn.Module):
-    """conv + pixel unshuffling to downsample a tensor
-    The first conv can be used to reduce the number of channels before the unshuffling
-    (*,Cin,H*r,W*r) -> (*,Cout/r**2,H*r,W*r) -> (*, Cout, H, W)
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        factor: int,
-    ):
-        super().__init__()
-        self.factor = factor
-        out_ratio = factor**2
-        assert out_channels % out_ratio == 0
-        self.conv = ConvLayer(
-            in_channels=in_channels,
-            out_channels=out_channels // out_ratio,
-            kernel_size=kernel_size,
-            use_bias=True,
-            norm=None,
-            activation=None,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv(x)
-        x = F.pixel_unshuffle(x, self.factor)
-        return x
-
-
-class PixelUnshuffleChannelAveragingDownSampleLayer(nn.Module):
-    """Downsampling using by averaging the results of
-    PixelUnshuffle to get a tensor with C_out channels < C_in * factor**2
-    C_in * factor**2 must be divisible by C_out_channels"""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        factor: int,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.factor = factor
-        assert in_channels * factor**2 % out_channels == 0
-        self.group_size = in_channels * factor**2 // out_channels
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.pixel_unshuffle(x, self.factor)
-        B, C, H, W = x.shape
-        x = x.view(B, self.out_channels, self.group_size, H, W)
-        x = x.mean(dim=2)
-        return x
-
-
-class ConvPixelShuffleUpSampleLayer(nn.Module):
-    """conv + pixel shuffling to upsample a tensor
-    (*, Cin, H, W) -> (*, Cout, H, W) -> (*, Cout // r**2, H*r, W*r)
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        factor: int,
-    ):
-        super().__init__()
-        self.factor = factor
-        out_ratio = factor**2
-        self.conv = ConvLayer(
-            in_channels=in_channels,
-            out_channels=out_channels * out_ratio,
-            kernel_size=kernel_size,
-            use_bias=True,
-            norm=None,
-            activation=None,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv(x)
-        x = F.pixel_shuffle(x, self.factor)
-        return x
-
-
-class InterpolateConvUpSampleLayer(nn.Module):
-    """Upsampling layer with interpolation + convolution:
-    (*, Cin, H, W) -> (*, Cin, H*r, W*r) -> (*, Cout, H*r, W*r)"""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int = 1,
-        factor: int = 2,
-        mode: str = "bilinear",
-    ) -> None:
-        super().__init__()
-        self.factor = factor
-        self.mode = mode
-        self.conv = ConvLayer(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            use_bias=True,
-            norm=None,
-            activation=None,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.nn.functional.interpolate(x, scale_factor=self.factor, mode=self.mode)
-        x = self.conv(x)
-        return x
-
-
-class ChannelDuplicatingPixelUnshuffleUpSampleLayer(nn.Module):
-    """Upsampling layer using pixel duplication followed by pixel shuffling
-    (*, Cin, H, W) -> (*, Cin, H*r, W*r) -> (*, Cout//r**2, H*r, W*r)"""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        factor: int,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.factor = factor
-        assert out_channels * factor**2 % in_channels == 0
-        self.repeats = out_channels * factor**2 // in_channels
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.repeat_interleave(self.repeats, dim=1)
-        x = F.pixel_shuffle(x, self.factor)
         return x
 
 

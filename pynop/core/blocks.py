@@ -29,35 +29,188 @@ from .utils import print_stats
 # TODO: implement FNO block with  differential kernels (i.e. conv when the kernel is rescaled by 1/h and the mean is substracted)
 # It would allows to capture the high frequencies while keeping the resolution invariance, far better and more grounded than  the U-FNO! see neuralop for an implementation
 
+
+class StridedConvDownsamplingLayer(nn.Module):
+    """Strided-convolution downsampling: reduce the spatial size by ``factor``.
+
+    (B, C_in, H, W) -> (B, C_out, H // factor, W // factor)
+
+    A single learnable convolution with ``stride = factor`` performs the
+    downsampling while (optionally) mixing the channels. It is the default
+    shortcut/downsampler of the residual blocks and is **not** pixel-shuffle
+    based, so the stride is a fixed ratio independent of the grid size.
+
+    Args:
+        in_channels: Number of input channels.
+        out_channels: Number of output channels.
+        factor: Downsampling stride; the spatial size is divided by this.
+        kernel_size: Convolution kernel size (default ``1``).
+        groups: Number of convolution groups (default ``1``).
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, factor: int, kernel_size: int = 1, groups: int = 1) -> None:
+        super().__init__()
+        self.factor = factor
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.conv = ConvLayer(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=factor,
+            groups=groups,
+            use_bias=True,
+            norm=None,
+            activation=None,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Downsample ``x`` with the strided convolution.
+
+        Args:
+            x: Input tensor of shape (B, C_in, H, W).
+
+        Returns:
+            Tensor of shape (B, C_out, H // factor, W // factor).
+        """
+        return self.conv(x)
+
+
+class InterpolateConvUpSampleLayer(nn.Module):
+    """Upsampling by grid interpolation followed by a refinement convolution.
+
+    (B, C_in, H, W) -> (B, C_in, H*factor, W*factor) -> (B, C_out, H*factor, W*factor)
+
+    ``F.interpolate`` (bilinear by default) upsamples the grid and a
+    ``ConvLayer`` then refines / mixes the channels. Bilinear interpolation
+    introduces a mild low-pass filter (unlike the pixel-shuffle upsamplers),
+    which the refinement conv partially compensates. This is the decoder
+    upsampler used by :class:`UBlock`.
+
+    Args:
+        in_channels: Number of input channels.
+        out_channels: Number of output channels.
+        kernel_size: Convolution kernel size (default ``1``).
+        factor: Upsampling factor; the spatial size is multiplied by this
+            (default ``2``).
+        mode: Interpolation mode (default ``"bilinear"``).
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 1,
+        factor: int = 2,
+        mode: str = "bilinear",
+    ) -> None:
+        super().__init__()
+        self.factor = factor
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.mode = mode
+        self.conv = ConvLayer(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            use_bias=True,
+            norm=None,
+            activation=None,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Upsample ``x`` by interpolation, then apply the refinement conv.
+
+        Args:
+            x: Input tensor of shape (B, C_in, H, W).
+
+        Returns:
+            Tensor of shape (B, C_out, H * factor, W * factor).
+        """
+        x = F.interpolate(x, scale_factor=self.factor, mode=self.mode)
+        x = self.conv(x)
+        return x
+
+
 DOWNSAMPLING_LAYERS = {
-    "convpixunshuffle": ConvPixelUnshuffleDownSampleLayer,
-    "pixunshuffleaveraging": PixelUnshuffleChannelAveragingDownSampleLayer,
     "stridedconv": StridedConvDownsamplingLayer,
     "maxpooling": MaxPoolConv,
 }
 
 UPSAMPLING_LAYERS = {
-    "convpixshuffle": ConvPixelShuffleUpSampleLayer,
-    "duplicatingpixshuffle": ChannelDuplicatingPixelUnshuffleUpSampleLayer,
     "interpolate": InterpolateConvUpSampleLayer,
 }
 
 
+def make_downsampler(
+    downsampling_method: str, in_channels: int, out_channels: int, factor: int, block_name: str
+) -> nn.Module:
+    """Instantiate a named downsampling layer from :data:`DOWNSAMPLING_LAYERS`.
+
+    Args:
+        downsampling_method: Registry key (``"stridedconv"`` or ``"maxpooling"``).
+        in_channels: Number of input channels.
+        out_channels: Number of output channels.
+        factor: Downsampling stride / factor.
+        block_name: Name of the calling block, used in the error message.
+
+    Returns:
+        An instantiated downsampling :class:`nn.Module`.
+
+    Raises:
+        ValueError: If ``downsampling_method`` is not a valid registry key.
+    """
+    if downsampling_method not in DOWNSAMPLING_LAYERS:
+        raise ValueError(
+            f"{block_name}: unknown downsampling_method {downsampling_method!r}; "
+            f"choose one of {sorted(DOWNSAMPLING_LAYERS)}."
+        )
+    return DOWNSAMPLING_LAYERS[downsampling_method](
+        in_channels=in_channels, out_channels=out_channels, kernel_size=1, factor=factor
+    )
+
+
 class ResBlock(nn.Module):
-    """Residual block with n convolutions"""
+    """Residual block made of ``nconv`` convolutions with a shortcut connection.
+
+    Pipeline::
+
+        x -> [Conv]*nconv -> out
+        x -> shortcut (1x1 conv / downsampler) -> added to ``out``
+
+    When ``stride > 1`` the first conv downsamples the spatial size by
+    ``stride`` and the shortcut is a :func:`make_downsampler` layer (one of
+    :data:`DOWNSAMPLING_LAYERS`). When ``stride == 1`` but the channel count
+    changes, the shortcut is a plain 1x1 ``ConvLayer``.
+
+    Args:
+        in_channels: Number of input channels.
+        out_channels: Number of output channels.
+        nconv: Number of stacked convolutions (default ``2``).
+        stride: Stride of the first convolution; ``> 1`` downsamples.
+        kernel_size: Convolution kernel size (default ``3``).
+        groups: Convolution groups (default ``1``).
+        norm: Normalization class (or per-layer list) applied after each conv;
+            ``None`` disables it (default :class:`LayerNorm2d`).
+        activation: Activation class (or per-layer list); ``None`` disables it
+            (default :class:`nn.GELU`).
+        use_bias: Conv bias flag (scalar or per-layer list).
+        downsampling_method: Shortcut downsampler for ``stride > 1``; one of
+            :data:`DOWNSAMPLING_LAYERS` (default ``"maxpooling"``).
+    """
 
     def __init__(
         self,
-        in_channels,
-        out_channels,
-        nconv=2,
-        stride=1,
-        kernel_size=3,
-        groups=1,
-        norm=partial(nn.GroupNorm, num_channels=32),
+        in_channels: int,
+        out_channels: int,
+        nconv: int = 2,
+        stride: int = 1,
+        kernel_size: int = 3,
+        groups: int = 1,
+        norm=LayerNorm2d,
         activation=nn.GELU,
-        use_bias=False,
-        downsampling_method="maxpooling",
+        use_bias: bool = False,
+        downsampling_method: str = "maxpooling",
     ):
 
         super().__init__()
@@ -88,15 +241,9 @@ class ResBlock(nn.Module):
             )
 
         if stride > 1:
-            if downsampling_method == "pixunshuffleaveraging":
-                self.shortconv = PixelUnshuffleChannelAveragingDownSampleLayer(
-                    in_channels=in_channels, out_channels=out_channels, factor=stride
-                )
-            else:
-
-                self.shortconv = DOWNSAMPLING_LAYERS.get(downsampling_method, StridedConvDownsamplingLayer)(
-                    in_channels=in_channels, out_channels=out_channels, kernel_size=1, factor=stride
-                )
+            self.shortconv = make_downsampler(
+                downsampling_method, in_channels, out_channels, stride, block_name="ResBlock"
+            )
         elif in_channels != out_channels:
             self.shortconv = ConvLayer(
                 in_channels,
@@ -123,20 +270,51 @@ class ResBlock(nn.Module):
 
 
 class BottleneckBlock(nn.Module):
+    """Residual bottleneck block: 1x1 -> 3x3 -> 1x1 with an optional SE gate.
+
+    Pipeline::
+
+        x -> Conv1x1 (expand to mid) -> Conv(k) -> [SE] -> Conv1x1 (out) -> out
+        x -> shortcut (1x1 conv / downsampler) -> added to ``out``
+
+    ``mid = out_channels // bottleneck_ratio``. When ``stride > 1`` the 3x3
+    conv downsamples and the shortcut is a :func:`make_downsampler` layer (one
+    of :data:`DOWNSAMPLING_LAYERS`); otherwise, if the channel count changes,
+    the shortcut is a plain 1x1 ``ConvLayer``.
+
+    Args:
+        in_channels: Number of input channels.
+        out_channels: Number of output channels.
+        bottleneck_ratio: Reduction factor of the mid channel width
+            (default ``4``).
+        stride: Stride of the 3x3 convolution; ``> 1`` downsamples.
+        kernel_size: Kernel size of the 3x3 convolution (default ``3``).
+        groups: Convolution groups (default ``1``).
+        norm: Normalization class (or per-layer list) applied after each conv
+            (default :class:`LayerNorm2d`).
+        activation: Activation class (or per-layer list) (default
+            :class:`nn.GELU`).
+        se: If True, insert a Squeeze-and-Excitation gate after the 3x3 conv.
+        se_ratio: Reduction ratio of the SE gate.
+        use_bias: Conv bias flag (scalar or per-layer list).
+        downsampling_method: Shortcut downsampler for ``stride > 1``; one of
+            :data:`DOWNSAMPLING_LAYERS` (default ``"maxpooling"``).
+    """
+
     def __init__(
         self,
-        in_channels,
-        out_channels,
-        bottleneck_ratio=4,
-        stride=1,
-        kernel_size=3,
-        groups=1,
-        norm=partial(nn.GroupNorm, num_channels=32),
+        in_channels: int,
+        out_channels: int,
+        bottleneck_ratio: int = 4,
+        stride: int = 1,
+        kernel_size: int = 3,
+        groups: int = 1,
+        norm=LayerNorm2d,
         activation=nn.GELU,
-        se=True,
-        se_ratio=4,
-        use_bias=False,
-        downsampling_method="maxpooling",
+        se: bool = True,
+        se_ratio: int = 4,
+        use_bias: bool = False,
+        downsampling_method: str = "maxpooling",
     ):
 
         super().__init__()
@@ -188,15 +366,9 @@ class BottleneckBlock(nn.Module):
         )
 
         if stride > 1:
-            if downsampling_method == "pixunshuffleaveraging":
-                self.shortconv = PixelUnshuffleChannelAveragingDownSampleLayer(
-                    in_channels=in_channels, out_channels=out_channels, factor=stride
-                )
-            else:
-
-                self.shortconv = DOWNSAMPLING_LAYERS.get(downsampling_method, StridedConvDownsamplingLayer)(
-                    in_channels=in_channels, out_channels=out_channels, kernel_size=1, factor=stride
-                )
+            self.shortconv = make_downsampler(
+                downsampling_method, in_channels, out_channels, stride, block_name="BottleneckBlock"
+            )
         elif in_channels != out_channels:
             self.shortconv = ConvLayer(
                 in_channels,
@@ -479,370 +651,131 @@ class FNOBlockv2(nn.Module):
         return x
 
 
-class ConvFNOBlock(nn.Module):
-    """
-    A single block of a Fourier Neural Operator (FNO) with a local convolutional branch using Differential Kernel [1] and a residual connection.
-    This block combines the spectral convolution with a local convolutional layer to capture both low and high frequencies in the input data.
+class PixelShuffleUpsample(nn.Module):
+    """A parameter-efficient pixel-shuffle upsampling block (sub-pixel conv).
 
-    .. [1] : Liu-Schiaffini, M., et al. (2024). "Neural Operators with
-        Localized Integral and Differential Kernels".
-        ICML 2024, https://arxiv.org/abs/2402.16845.
+    Upsamples by **rearranging channels into spatial sub-pixels** (a 1x1
+    "rearrange" conv to ``factor**2`` channels + :class:`nn.PixelShuffle`)
+    instead of bilinear interpolation, so it introduces **no low-pass** loss of
+    high-frequency detail. A **depthwise-separable** 3x3 conv (depthwise 3x3 +
+    pointwise 1x1) then mixes spatial neighbours -- giving the spatial
+    refinement a plain 1x1 merge conv lacks, at a fraction of a full 3x3 conv's
+    parameters. An optional skip connection (the U-Net decoder's encoder
+    feature at the target resolution) is concatenated before the refinement.
 
+    Pipeline (``r = factor``, e.g. ``r = 2``)::
+
+        x (B, Cin, H, W)
+        -> Conv1x1(Cin, r²·Cout)            # rearrange channels for the shuffle
+        -> PixelShuffle(r)                  # -> (B, Cout, rH, rW); no low-pass
+        -> [concat skip (B, Cskip, rH, rW)] # decoder form (skip_channels set)
+        -> Depthwise Conv3x3 (groups=C)     # cheap spatial mixing
+        -> Conv1x1(C -> Cout)               # channel mixing / merge
+        -> (B, Cout, rH, rW)
+
+    This is the standard "sub-pixel convolution" upsample (Shinya et al., 2017)
+    refined with a depthwise-separable conv (the MobileNet-style cheap 3x3). It
+    is the U-Net decoder's upsampling step, and is strictly more expressive than
+    the bilinear + 1x1-conv :class:`UpsampleBlock` (no low-pass, plus spatial
+    mixing) while using fewer parameters than a full 3x3 merge conv.
+
+    Args:
+        in_channels: Channels of the (low-resolution) input ``x``.
+        out_channels: Channels of the output (and of the post-shuffle feature).
+        factor: Upsampling factor ``r`` (default ``2``; must be ``>= 2``).
+        skip_channels: Channels of the skip connection to concatenate after the
+            shuffle (default ``None`` = no skip; in the U-Net decoder this is
+            the channels of the corresponding encoder output).
+        kernel_size: Depthwise convolution kernel size (default ``3``; must be
+            odd).
+
+    Raises:
+        ValueError: If ``factor`` or ``kernel_size`` is invalid, or ``skip`` is
+            missing at forward time when ``skip_channels`` is set.
     """
 
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
-        modes: tuple[int, int],
-        hidden_channels: Union[int, None] = None,
-        nconv=1,
+        factor: int = 2,
+        skip_channels: Optional[int] = None,
         kernel_size: int = 3,
-        activation: Callable = nn.GELU,
-        normalization: Union[Callable, None] = LayerNorm2d,
-        spectral_layer_type: str = "standard",
-        ranks: Union[tuple[int, int, int], np.ndarray, None] = None,
-        resampling: Union[str, None] = None,
-        grid_width: Union[int, float] = 1.0,
     ):
-        """
-        Args:
-            in_channels (int): Number of input channels for the block.
-            hidden_channels:Number of output channels for the SpectralConv
-            out_channels (int): Number of output channels for the block.
-            nconv (int): Number of local convolutional layers in the local branch.
-            activation (Callable): Activation function to use after the spectral convolution and local convolution.
-            normalization (Callable, optional): Normalization layer to apply after the spectral convolution.
-            resampling (Union[str, None]): either 'up' (x2), 'down' (//2) or None (no scaling is applied)
-            modes (tuple): Tuple (modes_x, modes_y) for the spectral convolution.
-            spectral_layer_type (str): Type of spectral layer ('standard' or 'tucker').
-            ranks (tuple, optional): Ranks (r1, r2, r3) for Tucker factorization, required if spectral_layer_type is 'tucker'.
-            A way to set (r1, r2, r3) is to fix a compression factor and to set
-            r1 = cin / k
-            r2 = cout / k
-            r3 = np.prod(modes) / k
-            For a k=2 the number of parameters is decreased by approx 5 times relatively to a standard SpectralConv
-            for k=4 it's 10 times, etc.
-            even with no compression, (k=1) the number of parameters is 2.5 times less
-        """
-
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        if hidden_channels is None:
-            self.hidden_channels = out_channels
-        else:
-            self.hidden_channels = hidden_channels
+        if factor < 2:
+            raise ValueError(f"PixelShuffleUpsample expects factor >= 2 (it upsamples), got {factor}.")
+        if kernel_size % 2 == 0:
+            raise ValueError("PixelShuffleUpsample expects an odd kernel_size.")
+        self.factor = factor
+        self.skip_channels = skip_channels
 
-        self.modes = modes
-        self.spectral_layer_type = spectral_layer_type
-        self.ranks = ranks
-        self.resampling = resampling
-        self.nconv = nconv
-        self.grid_width = grid_width
+        # Rearrange conv: expand to r²·out_channels so the shuffle can fold them
+        # into an r x r spatial block (this is the "1x1 conv" of the design).
+        self.rearrange = nn.Conv2d(in_channels, factor * factor * out_channels, 1)
+        self.shuffle = nn.PixelShuffle(factor)
 
-        if self.resampling is not None:
-            if self.resampling == "up":
-                self.scaling = 2
-                self.resampling_module = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
-            elif self.resampling == "down":
-                self.scaling = 0.5
-                self.resampling_module = nn.MaxPool2d(kernel_size=2)
-            else:
-                self.resampling_module = None
-                self.scaling = 1
-                raise ValueError(f"Unknown resampling method: {self.resampling}. Choose 'up', 'down' or None.")
-        else:
-            self.scaling = 1
-            self.resampling_module = None
-        # Core Spectral Convolution Layer
-        if spectral_layer_type == "standard":
-            self.spectral_conv = SpectralConv2d(in_channels, self.hidden_channels, modes, scaling=self.scaling)
-        elif spectral_layer_type == "tucker":
-            if ranks is None:
-                raise ValueError("Ranks must be provided for TuckerSpectralConv2d.")
-            self.spectral_conv = TuckerSpectralConv2d(
-                in_channels, self.hidden_channels, modes, ranks, scaling=self.scaling
-            )
-        else:
-            raise ValueError(f"Unknown spectral_layer_type: {spectral_layer_type}. Choose 'standard' or 'tucker'.")
+        # Depthwise-separable refinement: cheap spatial mixing (depthwise 3x3)
+        # + channel mixing / merge (pointwise 1x1) on the (skip-merged) feature.
+        mix_in = out_channels + skip_channels if skip_channels is not None else out_channels
+        self.depthwise = nn.Conv2d(mix_in, mix_in, kernel_size, padding=kernel_size // 2, groups=mix_in)
+        self.pointwise = nn.Conv2d(mix_in, out_channels, 1)
 
-        # Activation & normalization
-        self.activation = activation()
-        if normalization is not None:
-            self.norm = normalization(out_channels)
-        else:
-            self.norm = None
+    def forward(self, x: torch.Tensor, skip: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Upsample ``x`` (pixel shuffle), merge the optional skip, and refine.
 
-        # mix channels
-        self.linear = nn.Conv2d(self.hidden_channels, out_channels, kernel_size=1)
+        Args:
+            x: Feature map ``(B, Cin, H, W)``.
+            skip: Skip connection ``(B, Cskip, H*factor, W*factor)``; required
+                when ``skip_channels`` is set, ignored otherwise.
 
-        self.conv = nn.ModuleList()
-
-        for i in range(nconv):
-            in_ch = in_channels if i == 0 else hidden_channels
-            out_ch = out_channels if i == nconv - 1 else hidden_channels
-            self.conv.append(
-                FiniteDifferenceLayer(
-                    in_channels=in_ch,
-                    out_channels=out_ch,
-                    kernel_size=kernel_size,
-                    stride=1,
-                    padding="same",
-                    norm=normalization,
-                    activation=activation,
-                    grid_width=self.grid_width * self.scaling,
-                )
-            )
-
-        # Shortcut Branch Layer
-        # 1x1 Conv to potentially change input channels to output channels
-        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (B, C_in, H, W) - spatial domain
-
-        # Shortcut branch computation
-        x_shortcut = self.shortcut(x)  # (B, out_channels, H, W)
-        x_local = x
-        if self.scaling != 1:
-            x_shortcut = F.interpolate(x_shortcut, scale_factor=self.scaling, mode="bilinear", align_corners=False)
-
-        # Main branch computation
-        x = self.spectral_conv(x)  # (B, hidden_channels, H, W)
-        x = self.activation(x)  # (B, hidden_channels, H, W)
-        x = self.linear(x)  # (B, out_channels, H, W)
-        if self.norm is not None:
-            x = self.norm(x)
-
-        # local branch computation
-        if self.resampling_module is not None:
-            x_local = self.resampling_module(x_local)
-        for op in self.conv:
-            x_local = op(x_local)
-
-        x = x + x_shortcut + x_local  # (B, out_channels, H, W)
-
-        if self.activation is not None:
-            x = self.activation(x)
-
+        Returns:
+            Feature map ``(B, Cout, H*factor, W*factor)``.
+        """
+        x = self.rearrange(x)  # (B, r²·Cout, H, W)
+        x = self.shuffle(x)  # (B, Cout, rH, rW)
+        if self.skip_channels is not None:
+            if skip is None:
+                raise ValueError("PixelShuffleUpsample with skip_channels expects a `skip` tensor.")
+            x = torch.cat([x, skip], dim=1)
+        x = self.depthwise(x)
+        x = self.pointwise(x)
         return x
 
 
-class UFNOBlock(nn.Module):
-    """
-    A single block of a U - Fourier Neural Operator (FNO) with a residual connection and a small unet network
-    as in (https://doi.org/10.1016/j.advwatres.2022.104180).
-    It deals with the high frequencies, but we lose the resolution invariance.
+class PatchEmbed(nn.Module):
+    """ViT-style patch embedding: a strided ``Conv2d`` mapping a map to tokens.
+
+    ``(B, C_in, H, W) -> (B, (H/p)*(W/p), dim)``. This is the standard ViT patch
+    embedding (a ``p x p`` convolution with stride ``p``).
+
+    Args:
+        in_ch: Number of input channels.
+        dim: Output token dimension.
+        patch_size: Patch side length ``p``.
+        bias: If ``True``, the projection conv has a bias.
     """
 
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        modes: tuple[int, int],
-        nconv: Union[tuple, list] = (1, 2, 2),
-        activation: Callable = nn.GELU,
-        normalization: Union[Callable, None] = LayerNorm2d,
-        spectral_layer_type: str = "standard",
-        ranks: Union[tuple[int, int, int], np.ndarray, None] = None,
-    ):
-        """
-        Args:
-            in_channels (int): Number of input channels for the block.
-            out_channels (int): Number of output channels for the block.
-            modes (tuple): Tuple (modes_x, modes_y) for the spectral convolution.
-            nconv:  a list which gives the number of conv of each stage of a symetric unet
-            spectral_layer_type (str): Type of spectral layer ('standard' or 'tucker').
-            ranks (tuple, optional): Ranks (r1, r2, r3) for Tucker factorization, required if spectral_layer_type is 'tucker'.
-            A way to set (r1, r2, r3) is to fix a compression factor and to set
-            r1 = cin / k
-            r2 = cout / k
-            r3 = np.prod(modes) / k
-            For a k=2 the number of parameters is decreased by approx 5 times relatively to a standard SpectralConv
-            for k=4 it's 10 times, etc.
-            even with no compression, (k=1) the number of parameters is 2.5 times less
-            nconv: number of convolution layers
-        """
-
+    def __init__(self, in_ch: int, dim: int, patch_size: int = 4, bias: bool = True):
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.modes = modes
-        self.spectral_layer_type = spectral_layer_type
-        self.ranks = ranks
-        self.nconv = nconv
-
-        # Core Spectral Convolution Layer
-        if spectral_layer_type == "standard":
-            self.spectral_conv = SpectralConv2d(in_channels, out_channels, modes)
-        elif spectral_layer_type == "tucker":
-            if ranks is None:
-                raise ValueError("Ranks must be provided for TuckerSpectralConv2d.")
-            self.spectral_conv = TuckerSpectralConv2d(in_channels, out_channels, modes, ranks)
-        else:
-            raise ValueError(f"Unknown spectral_layer_type: {spectral_layer_type}. Choose 'standard' or 'tucker'.")
-
-        # Activation & normalization
-        if activation is not None:
-            self.activation = activation()
-        if normalization is not None:
-            self.norm = normalization(out_channels)
-
-        # mix channels
-        self.linear = nn.Conv2d(out_channels, out_channels, kernel_size=1)
-
-        filters = [in_channels] * len(nconv)
-        self.unet = UBlock(
-            in_channels,
-            out_channels,
-            nconv=nconv,
-            filters=filters,
-            normalization=normalization,
-            activation=activation,
-        )
-
-        if in_channels == out_channels:
-            self.shortcut = nn.Identity()
-        else:
-            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=True)
+        if patch_size < 1:
+            raise ValueError(f"patch_size must be >= 1, got {patch_size}.")
+        self.patch_size = patch_size
+        self.proj = nn.Conv2d(in_ch, dim, kernel_size=patch_size, stride=patch_size, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (B, C_in, H, W) - spatial domain
+        """Args:
+            x: Feature map ``(B, C_in, H, W)`` (spatial size divisible by ``p``).
 
-        # Shortcut branch computation
-        x_shortcut = self.shortcut(x)  # (B, out_channels, H, W)
-        x_spatial = x
+        Returns:
+            Token tensor ``(B, (H/p)*(W/p), dim)``.
+        """
+        x = self.proj(x)  # (B, dim, H/p, W/p)
+        return x.flatten(2).transpose(1, 2)
 
-        # spectral branch computation
-        x = self.spectral_conv(x)  # (B, hidden_channels, H, W)
-        if self.activation is not None:
-            x = self.activation(x)  # (B, hidden_channels, H, W)
-        x = self.linear(x)  # (B, out_channels, H, W)
-        if self.norm is not None:
-            x = self.norm(x)
-
-        # spatial branch
-        x_spatial = self.unet(x_spatial)
-        x = x + x_shortcut + x_spatial
-
-        if self.activation is not None:
-            x = self.activation(x)
-
-        return x
-
-
-class UBlock(nn.Module):
-    """simple implementation of a unet network to be used as a block in other blocks/network"""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        filters: Sequence,
-        nconv: Sequence,
-        normalization: Union[Callable, None] = LayerNorm2d,
-        activation: Callable = nn.GELU,
-    ):
-        super().__init__()
-
-        use_bias = True if normalization is None else False
-        assert len(nconv) == len(filters), "UBlock: filters must have the same length as nconv"
-        self.filters = filters
-        self.nconv = nconv
-        self.encoder = nn.ModuleList()
-        self.decoder = nn.ModuleList()
-        self.upblocks = nn.ModuleList()
-        self.proj = nn.ModuleList()
-        self.shortcut_filters = list(filters[: len(nconv) - 2])[::-1]
-        self.shortcut_filters.append(in_channels)
-        # Encoder
-        for i, n in enumerate(nconv):
-            in_ch = in_channels if i == 0 else filters[i - 1]
-            for j in range(n):
-                in_ch = in_ch if j == 0 else filters[i]
-                # Downsample last layer (except for the last stage, which is the bridge)
-                if i < len(nconv) - 1:
-                    strides = 2 if j == n - 1 else 1
-                else:
-                    strides = 1
-                self.encoder.append(
-                    ConvLayer(
-                        in_channels=in_ch,
-                        out_channels=filters[i],
-                        kernel_size=3,
-                        stride=strides,
-                        norm=normalization,
-                        activation=activation,
-                        use_bias=use_bias,
-                    )
-                )
-        # Decoder
-        upconvs = nconv[:-1][::-1]
-        upfilters = filters[:-1][::-1]
-
-        for i, n in enumerate(upconvs):
-            in_ch = filters[-1] if i == 0 else upfilters[i - 1]
-            self.upblocks.append(InterpolateConvUpSampleLayer(in_ch, upfilters[i]))
-            self.proj.append(
-                ConvLayer(
-                    in_channels=upfilters[i] + self.shortcut_filters[i],
-                    out_channels=upfilters[i],
-                    kernel_size=1,
-                    stride=1,
-                    use_bias=True,
-                )
-            )
-            for j in range(n):
-                if j == n - 1 and i == len(upconvs) - 1:
-                    out_ch = out_channels
-                else:
-                    out_ch = upfilters[i]
-
-                self.decoder.append(
-                    ConvLayer(
-                        in_channels=upfilters[i],
-                        out_channels=out_ch,
-                        kernel_size=3,
-                        stride=1,
-                        norm=normalization,
-                        activation=activation,
-                        use_bias=use_bias,
-                    )
-                )
-
-    def forward(self, x):
-
-        shortcuts = []
-        counter = -1
-        # print(self.shortcut_filters)
-
-        for i, n in enumerate(self.nconv):
-            if i < len(self.nconv) - 1:
-                shortcuts.append(x)
-                # print("shortcut", i, x.shape)
-            for j in range(n):
-                counter += 1
-                # print("encoder input", i, j, counter, x.shape, self.encoder[counter])
-                x = self.encoder[counter](x)
-                # print("encoder output", i, j, counter, x.shape)
-
-        upconvs = self.nconv[:-1][::-1]
-        counter = -1
-        shortcuts = shortcuts[::-1]
-
-        for i, n in enumerate(upconvs):
-            # print("upblock before", i, x.shape)
-            # print("shortcut", shortcuts[i].shape)
-            x = self.upblocks[i](x)
-            # print("upblock after", i, x.shape)
-            x = torch.concat([shortcuts[i], x], 1)
-            x = self.proj[i](x)
-            for j in range(n):
-                counter += 1
-                x = self.decoder[counter](x)
-
-        return x
+    def forward_map(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the patch feature *map* ``(B, dim, H/p, W/p)`` (no flattening)."""
+        return self.proj(x)
 
 
 class CoDABlock2D(nn.Module):
@@ -1260,7 +1193,7 @@ class SepLITBlock(nn.Module):
         mlp_hidden_dim=64,
         mlp_num_layers=1,
         activation=nn.GELU,
-        norm=AdaptiveLayerNorm,
+        norm=LayerNorm2d,
     ):
         """
         Initializes the module.
@@ -1271,12 +1204,24 @@ class SepLITBlock(nn.Module):
             m2 (int): Number of modes to keep for the width dimension (v).
             mlp_hidden_dim (int): Hidden dimension of the MLPs learning the bases.
             mlp_num_layers (int): Number of hidden layers in the MLPs learning the bases.
+            norm (callable or None): Normalization layer (channels-first, i.e. normalizes
+                over the channel dim of the ``(B, C, H, W)`` layout). Default ``LayerNorm2d``.
         """
         super().__init__()
 
         self.in_channels = in_channels
         self.m1 = m1  # Number of modes kept in height (u)
         self.m2 = m2  # Number of modes kept in width (v)
+
+        # Learnable exponent of the integral-transform normalization.
+        # The inverse transform accumulates over the spatial domain, so the raw output
+        # magnitude grows with the resolution. The legacy hard factor ``1 / (H * W)``
+        # assumed a DFT-like (unit-energy) basis; the learned basis is *not* unit-energy,
+        # so that constant over-suppressed the transform branch by ~100-400x (making it
+        # dead relative to the shortcut). We instead normalize by ``(H * W) ** sigmoid(a)``
+        # and let the model learn ``a``. Initialized so sigmoid(a) ~ 0.25, which yields an
+        # O(1) transform branch at initialization (comparable to the shortcut).
+        self.IT_scale = nn.Parameter(torch.tensor(-1.1))
 
         # The bases are MLPs that generate the basis values.
         # These MLPs are the learnable parameters.
@@ -1385,8 +1330,8 @@ class SepLITBlock(nn.Module):
         # Result: (B, Cout, H, W)
         reconstructed_spatial_hw = torch.einsum("bcmw,hm->bchw", reconstructed_spatial_w, transform_h_basis_runtime.H)
 
-        # Normalization
-        normalisation_factor = 1.0 / (H * W)
+        # Normalization: learnable exponent (see self.IT_scale) instead of a hard 1/(H*W).
+        normalisation_factor = 1.0 / ((H * W) ** torch.sigmoid(self.IT_scale))
         reconstructed_spatial_hw = reconstructed_spatial_hw.real * normalisation_factor
 
         # Mixing channels
@@ -1419,7 +1364,7 @@ class SepNLITBlock(nn.Module):
         mlp_hidden_dim=64,
         mlp_num_layers=2,
         activation=nn.GELU,
-        norm=AdaptiveLayerNorm,
+        norm=LayerNorm2d,
     ):
         """
         Initializes the module.
@@ -1430,6 +1375,8 @@ class SepNLITBlock(nn.Module):
             m2 (int): Number of modes to keep for the width dimension (v).
             mlp_hidden_dim (int): Hidden dimension of the MLPs learning the bases.
             mlp_num_layers (int): Number of hidden layers in the MLPs learning the bases.
+            norm (callable or None): Normalization layer (channels-first, i.e. normalizes
+                over the channel dim of the ``(B, C, H, W)`` layout). Default ``LayerNorm2d``.
         """
         super().__init__()
 
@@ -1437,6 +1384,12 @@ class SepNLITBlock(nn.Module):
         self.out_channels = out_channels
         self.m1 = m1  # Number of modes kept in height (u)
         self.m2 = m2  # Number of modes kept in width (v)
+
+        # Learnable exponent of the integral-transform normalization (see SepLITBlock).
+        # Replaces the legacy hard ``1 / (H * W)`` that over-suppressed the (non
+        # unit-energy) learned transform branch. Initialized so sigmoid(a) ~ 0.25 -> O(1)
+        # transform branch at initialization.
+        self.IT_scale = nn.Parameter(torch.tensor(-1.1))
 
         self.coords_dim = 1 + in_channels
 
@@ -1457,8 +1410,12 @@ class SepNLITBlock(nn.Module):
             activation=activation,
         )
 
+        # Shape (out_channels, in_channels, m1, m2) to match the einsum
+        # ``"bixy,oixy->boxy"`` (output channel ``o`` first, input channel ``i`` second),
+        # consistent with SepLITBlock. (A prior (in, out, m1, m2) shape only worked when
+        # in_channels == out_channels and mixed the wrong channels otherwise.)
         self.learned_weights_freq = nn.Parameter(
-            torch.randn(self.in_channels, out_channels, self.m1, self.m2, dtype=torch.cfloat)
+            torch.randn(out_channels, self.in_channels, self.m1, self.m2, dtype=torch.cfloat)
         )
         # Initialization of learned_weights_freq
         std = (1.0 / (in_channels + out_channels)) ** 0.5
@@ -1590,8 +1547,8 @@ class SepNLITBlock(nn.Module):
         # Permute to (B, C_out, H, W)
         reconstructed_spatial_hw = reconstructed_spatial_hw.permute(0, 2, 1, 3)
 
-        # Dynamic normalization
-        normalisation_factor = 1.0 / (H * W)
+        # Dynamic normalization: learnable exponent (see self.IT_scale) instead of a hard 1/(H*W).
+        normalisation_factor = 1.0 / ((H * W) ** torch.sigmoid(self.IT_scale))
         reconstructed_spatial_hw = reconstructed_spatial_hw.real * normalisation_factor
 
         # Mixing channels
@@ -2135,7 +2092,39 @@ class GalerkinCrossAttentionBlock(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Pre-LN Transformer block with standardized initialization."""
+    """Pre-LN Transformer block with standardized initialization and optional RoPE.
+
+    Positional information can be provided two ways:
+
+    - **additively**, by the caller (e.g. a ``PEBlock`` encoding added to the
+      tokens before the block) -- the default behavior;
+    - **rotarily**, through the optional
+      :class:`~pynop.core.encoding.AdaptiveRoPE2D` (``rope=True``): the block
+      owns a 2-D rotary embedding applied to the query/key projections, driven
+      by the absolute 2-D coordinates passed at forward time (``coords``). It
+      is a no-op when no coordinates are passed.
+
+    An explicit ``rope`` module may also be injected per call; it takes
+    precedence over the block's own. This preserves the historical
+    ``RoPETransformerBlock`` call pattern (e.g. a 1-D temporal RoPE with time
+    coordinates).
+
+    Args:
+        dim: Model dimension.
+        n_heads: Number of attention heads (``dim`` must be divisible by it).
+        activation: Activation class used in the MLP.
+        mlp_dim: MLP expansion dimension.
+        dropout: Dropout rate in the MLP.
+        rmsnorm: If True use ``nn.RMSNorm`` (default), else ``nn.LayerNorm``.
+        std_ini: Std of the truncated-normal init of the projections.
+        scaling: Depth-scaled output-projection init (Megatron-LM style).
+        rope: If True, build an internal
+            :class:`~pynop.core.encoding.AdaptiveRoPE2D` (``dim // n_heads``
+            must then be divisible by 4) and apply it to q/k whenever ``coords``
+            is passed at forward time.
+        rope_kwargs: Extra keyword arguments forwarded to ``AdaptiveRoPE2D``
+            (e.g. ``{"domain_size": 1.0, "base": 8.0}``).
+    """
 
     def __init__(
         self,
@@ -2147,10 +2136,23 @@ class TransformerBlock(nn.Module):
         rmsnorm: bool = True,
         std_ini: float = 0.02,
         scaling: Union[None, float] = None,
+        rope: bool = False,
+        rope_kwargs: Optional[dict] = None,
     ):
         super().__init__()
+        head_dim = dim // n_heads
+        if rope and head_dim % 4 != 0:
+            raise ValueError(
+                f"TransformerBlock: rope=True requires dim // n_heads == {head_dim} to be "
+                f"divisible by 4 for 2-D RoPE (dim={dim}, n_heads={n_heads})."
+            )
+
         # Attention layer assumed to handle its own input projection init
         self.attention = Attention(dim, dim, n_heads, std_ini=std_ini)
+
+        # Optional 2-D rotary positional encoding (no-op when `coords` is not
+        # passed at forward time).
+        self.rope = AdaptiveRoPE2D(head_dim, **(rope_kwargs or {})) if rope else None
 
         self.mlp = nn.Sequential(
             nn.Linear(dim, mlp_dim),
@@ -2186,327 +2188,44 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        coords: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        rope: Optional[nn.Module] = None,
         causal_attn: bool = False,
     ) -> torch.Tensor:
-        # x: [B, N, C]
-        # Clean Pre-LN residual stream
-        x = x + self.attention(Q=self.norm1(x), V=self.norm1(x), K=self.norm1(x), causal_attn=causal_attn)
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
-class LatentTemporalTransformerFullAttention(nn.Module):
-    def __init__(self, dim, n_heads, num_layers=2, mlp_factor=2, max_history=5, rmsnorm=True):
-        super().__init__()
-        self.max_history = max_history
-        self.rope = RoPE(dim // n_heads)  # RoPE on head_dim
-        if rmsnorm:
-            self.norm = nn.RMSNorm(dim)
-        else:
-            self.norm = nn.LayerNorm(dim)
-        self.layers = nn.ModuleList([RoPETransformerBlock(dim, n_heads, dim * mlp_factor) for _ in range(num_layers)])
-
-    def forward(self, z_current, z_history=None, coords_t=None, update_history=True):
-        """
-        z_current: [B, M, C]
-        z_history: [B, T_past, M, C]
-        coords_t:  [B, T_total, 1] -> Real time values
-        update_history: if False, the latent history is not updated
-        """
-        B, M, C = z_current.shape
-
-        # 1. Sequence construction [B, T, M, C]
-        if z_history is not None and update_history:
-            z_full = torch.cat([z_history, z_current.unsqueeze(1)], dim=1)
-            z_full = z_full[:, -self.max_history :]
-        else:
-            z_full = z_current.unsqueeze(1)
-
-        T = z_full.shape[1]
-
-        # 2. Prepare Time for Flattened Sequence
-        # coords_t must be [B, T, 1]. We expand it to [B, T, M, 1]
-        if coords_t is None:
-            # Fallback to frame indices if no real time provided
-            full_time = torch.arange(T, device=z_current.device).view(1, T, 1).expand(B, T, 1)
-        else:
-            if coords_t.shape[1] < T:
-                last_t = coords_t[:, -1, :]
-                offsets = torch.arange(-(T - 1), 1, device=z_current.device).view(1, T, 1)
-                full_time = last_t.unsqueeze(1) + offsets
-            else:
-                full_time = coords_t[:, -T:, :]
-
-        # Expand time to match flattened modes: [B, T*M, 1]
-        full_time = full_time.unsqueeze(2).expand(-1, -1, M, -1)  # [B, T, M, 1]
-        full_time = full_time.contiguous().view(B, T * M, 1)
-
-        # full_time = coords_t[:, :T, :].unsqueeze(2).expand(B, T, M, 1).reshape(B, T * M, 1)
-        x_seq = z_full.contiguous().view(B, T * M, C)
-        x_seq = self.norm(x_seq)
-
-        # 3. Block Causal Mask [T*M, T*M]
-        # Diagonal=1 to block future frames
-        t_mask = torch.triu(torch.ones(T, T, device=x_seq.device), diagonal=1).bool()
-        mask = t_mask.repeat_interleave(M, dim=0).repeat_interleave(M, dim=1)
-
-        # 4. Iterative pass through custom blocks
-        for layer in self.layers:
-            x_seq = layer(x_seq, coords=full_time, mask=mask, rope=self.rope)
-
-        # 5. Extract last timestep [B, M, C]
-        z_refined = x_seq.view(B, T, M, C)[:, -1]
-
-        return z_refined, z_full
-
-
-class LatentTemporalMLP(nn.Module):
-    def __init__(self, dim, max_history=3, mlp_factor=4, dropout=0.05):
-        """
-        Simple MLP for latent temporal prediction.
-        Each mode M is processed independently (Shared MLP across modes).
+        """Forward pass (clean pre-LN residual stream).
 
         Args:
-            dim (int): Dimension of each latent (D).
-            max_history (int): Number of past steps used for prediction.
-            mlp_factor (int): Expansion factor for the hidden layer.
+            x: Token sequence of shape [B, N, C].
+            coords: Optional 2-D coordinates for the block's rotary embedding,
+                shape [B, N, 2] or [B, H, W, 2] (the latter disambiguates
+                non-square grids). Ignored when no RoPE is active.
+            mask: Optional additive attention mask for ``scaled_dot_product_attention``.
+            rope: Optional explicit rotary-embedding module to inject (takes
+                precedence over the block's own ``rope``); e.g. a 1-D temporal
+                RoPE. Ignored when ``coords`` is None.
+            causal_attn: If True, use causal (autoregressive) attention.
+
+        Returns:
+            Tensor of shape [B, N, C].
         """
-        super().__init__()
-        self.max_history = max_history
-        self.dim = dim
-
-        # Input: [B, M, max_history * dim]
-        # Output: [B, M, dim] (the residual delta_z)
-        input_dim = max_history * dim
-        hidden_dim = dim * mlp_factor
-
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, dim),  # Predicts Delta Z
-        )
-        with torch.no_grad():
-            nn.init.zeros_(self.net[-1].weight)
-            nn.init.zeros_(self.net[-1].bias)
-
-    def forward(self, z_current, z_history=None):
-        """
-        z_current: [B, M, D]
-        z_history: [B, T_past, M, D]
-        """
-        B, M, D = z_current.shape
-
-        # 1. Pr�paration du contexte temporel
-        if z_history is not None:
-            # On prend les (max_history - 1) derniers pas de l'historique
-            # z_past: [B, T_selected, M, D]
-            z_past = z_history[:, -(self.max_history - 1) :]
-            # Concat avec le pr�sent: [B, T_total, M, D]
-            z_seq = torch.cat([z_past, z_current.unsqueeze(1)], dim=1)
-        else:
-            # Si pas d'historique, on r�p�te le pr�sent (fallback)
-            z_seq = z_current.unsqueeze(1).repeat(1, self.max_history, 1, 1)
-
-        # 2. Reshape pour le MLP [B, M, T_total * D]
-        # On veut que chaque mode M voit son propre historique
-        # [B, T, M, D] -> [B, M, T, D] -> [B, M, T*D]
-        x = z_seq.transpose(1, 2).reshape(B, M, -1)
-
-        # 3. Pr�diction du r�sidu
-        delta_z = self.net(x)
-
-        # 4. Int�gration d'Euler (R�siduel)
-        z_next = z_current + delta_z
-
-        return z_next
-
-
-class SpatioTemporalTransformer(nn.Module):
-    def __init__(self, dim, n_heads, num_layers=2, mlp_factor=2, max_history=10, rmsnorm=True, std_ini=0.02):
-        """
-        Spatio-temporal Transformer for latent tokens.
-        Alternates between Temporal Attention (mode-wise) and Spatial Attention (cross-mode).
-        std_ini: std used in the init of the last projection layer in the attention block
-        """
-        super().__init__()
-        self.max_history = max_history
-        self.n_heads = n_heads
-
-        # Rotary Positional Embedding for temporal dimension
-        self.rope = RoPE(dim // n_heads, max_period=max_history * 50)
-
-        # self.norm = nn.RMSNorm(dim) if rmsnorm else nn.LayerNorm(dim)
-
-        # We alternate between temporal processing and spatial mixing
-        self.layers = nn.ModuleList(
-            [
-                nn.ModuleDict(
-                    {
-                        "temporal": RoPETransformerBlock(dim, n_heads, dim * mlp_factor, std_ini=std_ini),
-                        "spatial": TransformerBlock(dim, n_heads, mlp_dim=dim * mlp_factor, std_ini=std_ini),
-                    }
-                )
-                for _ in range(num_layers)
-            ]
-        )
-
-    def forward(self, z_current, z_history=None, coords_t=None):
-        """
-        Forward pass with axial attention.
-        """
-        B, M, C = z_current.shape
-
-        # 1. Manage history buffer [B, T, M, C]
-        if z_history is not None:
-            z_full = torch.cat([z_history, z_current.unsqueeze(1)], dim=1)
-            z_full = z_full[:, -self.max_history :]
-        else:
-            z_full = z_current.unsqueeze(1)
-
-        T = z_full.shape[1]
-
-        # 2. Prepare temporal coordinates [B*M, T, 1]
-        if coords_t is None:
-            coords_t_seq = torch.arange(T, device=z_current.device).view(1, T, 1).expand(B, T, 1)
-        else:
-            coords_t_seq = coords_t[:, -T:, :]
-
-        # Replicate for each mode for the temporal RoPE
-        full_time = coords_t_seq.repeat_interleave(M, dim=0)
-
-        # 3. Interleaved Axial Attention
-        # Initial state x: [B, T, M, C]
-        x = z_full
-
-        for layer in self.layers:
-            # --- A. Temporal Attention (Independent per mode) ---
-            # Reshape to [B*M, T, C]
-            x = x.transpose(1, 2).reshape(B * M, T, C)
-            # x = self.norm(x)
-            x = layer["temporal"](x, coords=full_time, mask=None, rope=self.rope)
-
-            # Reshape back to [B, T, M, C]
-            x = x.view(B, M, T, C).transpose(1, 2)
-
-            # --- B. Spatial Attention (Mixing modes) ---
-            # Reshape to [B*T, M, C]
-            x = x.reshape(B * T, M, C)
-            # x = self.norm(x)
-            x = layer["spatial"](x)
-
-            # Reshape back to [B, T, M, C]
-            x = x.view(B, T, M, C)
-
-        # 4. Final refinement
-        # Extract last frame: [B, M, C]
-        z_refined = x[:, -1, :, :]
-
-        return z_refined, x
-
-
-class RoPETransformerBlock(nn.Module):
-    def __init__(self, dim, n_heads, mlp_dim, dropout=0.1, rmsnorm=True, std_ini=0.02):
-        super().__init__()
-
-        if rmsnorm:
-            self.norm1 = nn.RMSNorm(dim)  # AdaRMSNorm(dim, dim)
-            self.norm2 = nn.RMSNorm(dim)
-        else:
-            self.norm1 = nn.LayerNorm(dim)  # AdaptiveLayerNorm(dim, dim)
-            self.norm2 = nn.LayerNorm(dim)
-
-        self.attn = Attention(dim, dim, n_heads, std_ini=std_ini)
-        self.mlp = nn.Sequential(nn.Linear(dim, mlp_dim), nn.GELU(), nn.Linear(mlp_dim, dim), nn.Dropout(dropout))
-
-        for m in self.mlp:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, x, coords, mask=None, rope=None):
-        # x: [B, T*M, C], time: [B, T*M, 1]
+        # An explicitly injected `rope` takes precedence over the block's own
+        # (historical RoPETransformerBlock behavior, e.g. 1-D temporal RoPE).
+        # `Attention` applies the rotation only when both a rope module and
+        # `coords` are provided.
         x_norm = self.norm1(x)
-        x = x + self.attn(x_norm, x_norm, x_norm, mask=mask, rope=rope, coords=coords)
+        effective_rope = rope if rope is not None else self.rope
+        x = x + self.attention(
+            Q=x_norm,
+            K=x_norm,
+            V=x_norm,
+            mask=mask,
+            rope=effective_rope,
+            coords=coords,
+            causal_attn=causal_attn,
+        )
         x = x + self.mlp(self.norm2(x))
-
         return x
-
-
-class GalerkinTransolverBlock(nn.Module):
-    """Projection using a Galerkin Attention then attention then reconstruction using Galerkin Attention"""
-
-    def __init__(
-        self, dim, num_heads, modes, mlp_factor=2, dropout=0.1, activation=nn.GELU, kv_normalization=False, scaling=1.0
-    ):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.modes = modes  # M: Number of modes
-
-        self.encoder = GalerkinAttention(dim=dim, heads=num_heads, kv_normalization=kv_normalization, std_ini=1e-2)
-        self.decoder = GalerkinAttention(dim=dim, heads=num_heads, kv_normalization=kv_normalization, std_ini=1e-2)
-        self.queries_predictor = MLPBlock(out_ch=dim, in_ch=2, hidden_dim=dim, num_layers=1, activation=activation)
-        self.scaling = nn.Parameter(torch.empty(1))
-        self.latent_pe = MLPBlock(
-            out_ch=dim,
-            in_ch=2,
-            hidden_dim=dim,
-            num_layers=1,
-            activation=activation,
-        )
-
-        self.attention = Attention(
-            in_ch=dim,
-            out_ch=dim,
-            num_heads=num_heads,
-            std_ini=1e-2,
-        )
-
-        self.out_proj = MLPBlock(
-            out_ch=dim,
-            in_ch=dim,
-            hidden_dim=dim,
-            num_layers=1,
-            activation=activation,
-        )
-
-        self.norm1 = nn.RMSNorm(dim)
-        self.norm2 = nn.RMSNorm(dim)
-
-        with torch.no_grad():
-            nn.init.constant_(self.scaling, scaling)
-
-    def forward(self, x):
-
-        B, N, D = x.shape
-
-        # Add Positional encoding in latent representation before the self-attention modules
-
-        m_coords = torch.linspace(-1, 1, int(math.sqrt(self.modes)), device=x.device)
-        m1, m2 = torch.meshgrid(m_coords, m_coords, indexing="ij")
-        q_coords = torch.stack([m1, m2], dim=-1)
-        q_coords = q_coords.view(self.modes, 2)
-        q_coords = q_coords.unsqueeze(0).expand(B, -1, -1)
-        queries = self.queries_predictor(q_coords)
-        latent_pe = self.latent_pe(q_coords)
-
-        # Galerkin Cross Attention -> [B, M, C]
-        xhat = self.encoder(x=queries, context=self.norm1(x))
-        xhat = xhat + latent_pe
-
-        # Multi-head attention
-        xhat = self.attention(xhat)
-
-        # Go back to spatial domain do we need normalization here?
-        x_rec = self.decoder(x=x, context=xhat)
-        x_rec = self.scaling * self.out_proj(self.norm2(x)) + x
-
-        return x_rec
 
 
 class TransolverBlock(nn.Module):
@@ -3257,22 +2976,45 @@ class IAETBlock(nn.Module):
 
 
 class WindowAttention(nn.Module):
-    """Window-based self-attention layer with rotary positional encoding."""
+    """Window-based self-attention layer with rotary positional encoding.
 
-    def __init__(self, dim: int, num_heads: int):
+    The attention is computed with the fused
+    :func:`torch.nn.functional.scaled_dot_product_attention` kernel (flash /
+    memory-efficient where available, with a graceful fallback to the math backend
+    when an additive mask is used). Positional information is injected on the
+    query/key vectors with a 2-D rotary embedding (:class:`AdaptiveRoPE2D`) indexed
+    by each token's *absolute* coordinates, the frequency band being set from the
+    grid Nyquist (resolution-adaptive).
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        qkv_bias: bool = True,
+        attn_dropout: float = 0.0,
+        proj_dropout: float = 0.0,
+    ):
         """Initialize the attention layer.
 
         Args:
             dim: Size of each token embedding.
             num_heads: Number of attention heads. The embedding size must be divisible by this value.
+            qkv_bias: If True, learn a bias in the fused QKV projection.
+            attn_dropout: Dropout probability on the attention weights (training only).
+            proj_dropout: Dropout probability on the output projection.
         """
         super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads}).")
         self.dim = dim
         self.num_heads = num_heads
         self.d_head = dim // num_heads
         self.scale = self.d_head**-0.5
-        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.attn_dropout = attn_dropout
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_dropout)
         self.rope = AdaptiveRoPE2D(self.d_head)
 
     def forward(
@@ -3305,16 +3047,23 @@ class WindowAttention(nn.Module):
         q = self.rope.rotate(q, coords, resolution=resolution)
         k = self.rope.rotate(k, coords, resolution=resolution)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-
         if mask is not None:
+            # mask is (nW, N, N); expand to (b_win, 1, N, N) so it broadcasts over the
+            # window batch (dim 0) and the heads (dim 1) expected by SDPA.
             nw = mask.shape[0]
-            attn = attn.view(b_win // nw, nw, h, n, n) + mask.unsqueeze(1)
-            attn = attn.view(b_win, h, n, n)
+            b = b_win // nw
+            mask = mask.view(1, nw, 1, n, n).expand(b, nw, 1, n, n).reshape(b_win, 1, n, n)
 
-        attn = F.softmax(attn, dim=-1)
-        x = (attn @ v).transpose(1, 2).reshape(b_win, n, c)
-        return self.proj(x)
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=mask,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+            scale=self.scale,
+        )
+        out = out.transpose(1, 2).reshape(b_win, n, c)
+        return self.proj_drop(self.proj(out))
 
 
 class WindowCrossAttention(nn.Module):
@@ -3542,8 +3291,8 @@ class PaddedSwinBlock(nn.Module):
         w: int,
         h_pad: int,
         w_pad: int,
-        pad_h: int,
-        pad_w: int,
+        pad_top: int,
+        pad_left: int,
         win_h: int,
         win_w: int,
         current_nw_h: int,
@@ -3553,6 +3302,10 @@ class PaddedSwinBlock(nn.Module):
     ) -> torch.Tensor:
         """Build absolute coordinates for padded tokens in the range [-1, 1].
 
+        ``pad_top`` / ``pad_left`` are the number of padded rows/columns *before* the
+        original region (the coordinate offset). The original ``h x w`` grid spans
+        ``[-1, 1)`` (cell-centred); the padded tokens lie outside that range.
+
         Returns a tensor of shape [B * current_nw_h * current_nw_w, win_h * win_w, 2].
         """
         # Uniform step based on the original grid.
@@ -3560,8 +3313,8 @@ class PaddedSwinBlock(nn.Module):
         step_x = 2.0 / w
 
         # Coordinates of the padded tensor: original tokens lie in [-1, 1), while padded tokens lie outside that range.
-        gy = (torch.arange(h_pad, device=device).float() - pad_h) * step_y - 1.0 + step_y / 2
-        gx = (torch.arange(w_pad, device=device).float() - pad_w) * step_x - 1.0 + step_x / 2
+        gy = (torch.arange(h_pad, device=device).float() - pad_top) * step_y - 1.0 + step_y / 2
+        gx = (torch.arange(w_pad, device=device).float() - pad_left) * step_x - 1.0 + step_x / 2
 
         cy, cx = torch.meshgrid(gy, gx, indexing="ij")  # [H_pad, W_pad]
         coords_img = torch.stack([cy, cx], dim=-1)  # [H_pad, W_pad, 2]
@@ -3571,7 +3324,9 @@ class PaddedSwinBlock(nn.Module):
         coords_win = coords_win.permute(0, 2, 1, 3, 4).contiguous()  # [nW_h, nW_w, win_h, win_w, 2]
         coords_win = coords_win.view(current_nw_h * current_nw_w, win_h, win_w, 2)
 
-        return coords_win.unsqueeze(0).expand(b, -1, -1, -1, -1).reshape(b * current_nw_h * current_nw_w, win_h, win_w, 2)
+        return (
+            coords_win.unsqueeze(0).expand(b, -1, -1, -1, -1).reshape(b * current_nw_h * current_nw_w, win_h, win_w, 2)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the padded Swin block to a 4D feature map.
@@ -3594,11 +3349,17 @@ class PaddedSwinBlock(nn.Module):
         win_h, win_w = h // self.nw_h, w // self.nw_w
 
         if self.pad:
-            pad_h, pad_w = win_h // 2, win_w // 2
+            # Pad a total of exactly ``win`` per axis so the padded size stays divisible
+            # by the window size (h = nw * win). Split it as evenly as possible to keep at
+            # least ``win // 2`` rows/cols of boundary context on each side; this is
+            # symmetric (and identical to the previous behaviour) when ``win`` is even,
+            # and adds one extra padded row/col when ``win`` is odd (the fix).
+            pad_top, pad_bottom = win_h // 2, win_h - win_h // 2
+            pad_left, pad_right = win_w // 2, win_w - win_w // 2
 
             x_padded = F.pad(
                 x.permute(0, 3, 1, 2),
-                (pad_w, pad_w, pad_h, pad_h),
+                (pad_left, pad_right, pad_top, pad_bottom),
                 mode=self.bc_mode,
             ).permute(
                 0, 2, 3, 1
@@ -3613,8 +3374,8 @@ class PaddedSwinBlock(nn.Module):
                 w,
                 h_pad,
                 w_pad,
-                pad_h,
-                pad_w,
+                pad_top,
+                pad_left,
                 win_h,
                 win_w,
                 current_nw_h,
@@ -3630,7 +3391,7 @@ class PaddedSwinBlock(nn.Module):
 
             x_merged = attn_win.view(b, current_nw_h, current_nw_w, win_h, win_w, d)
             x_merged = x_merged.permute(0, 1, 3, 2, 4, 5).contiguous().view(b, h_pad, w_pad, d)
-            x = x_merged[:, pad_h:-pad_h, pad_w:-pad_w, :]
+            x = x_merged[:, pad_top : pad_top + h, pad_left : pad_left + w, :]
 
         else:
             coords = self._build_coords(h, w, h, w, 0, 0, win_h, win_w, self.nw_h, self.nw_w, b, x.device)
@@ -3644,6 +3405,194 @@ class PaddedSwinBlock(nn.Module):
             x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(b, h, w, d)
 
         return shortcut + x + self.mlp(self.norm2(x))
+
+
+class SwinBlock(nn.Module):
+    """Classical Swin Transformer block (Liu et al., 2021) built on :class:`WindowAttention`.
+
+    Unlike :class:`AdaptiveSwinBlock` (which fixes the *number* of windows and lets the
+    window size adapt to the resolution) and :class:`PaddedSwinBlock` (which fixes the
+    number of windows and pads the *boundary*), this block fixes the *window size* in
+    pixels (``window_size``, default 7). It therefore works with **any** spatial size:
+    the input is padded on the right/bottom to the next multiple of the window, the
+    window attention is run, and the result is cropped back to the original ``(H, W)``.
+    The number of windows grows with the resolution, so a window always covers the same
+    physical patch -- the standard Swin design.
+
+    It reuses the single :class:`WindowAttention` core (shared by all the Swin blocks):
+    positional information comes from ``AdaptiveRoPE2D`` applied to the *absolute*
+    coordinates of each token (frequency band set from the grid Nyquist), rather than a
+    learned relative-position bias table. When ``shift`` is enabled, the features and the
+    coordinates are both rolled by half a window and a standard Swin attention mask blocks
+    cross-window attention in the mixed windows.
+
+    Operates on a channels-last map ``(B, H, W, C)`` like the other Swin blocks.
+
+    Args:
+        dim: Feature dimension ``C`` (divisible by ``num_heads`` and, for the 2-D RoPE,
+            by ``4 * num_heads``).
+        num_heads: Number of attention heads.
+        window_size: Window side length(s) ``[Wh, Ww]`` (default 7).
+        shift: If ``True``, use shifted windows (shift of ``window_size // 2`` per axis,
+            only when that axis holds more than one window).
+        mlp_factor: MLP expansion factor (default 4).
+        activation: Activation class for the MLP (default :class:`nn.GELU`).
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        window_size: Union[int, Tuple[int, int]] = 7,
+        shift: bool = False,
+        mlp_factor: int = 4,
+        activation: Callable = nn.GELU,
+    ):
+        super().__init__()
+        if isinstance(window_size, int):
+            window_size = (window_size, window_size)
+        self.dim = dim
+        self.window_size = tuple(window_size)
+        self.num_heads = num_heads
+        self.shift = shift
+
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = WindowAttention(dim, num_heads)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_factor * dim),
+            activation(),
+            nn.Linear(mlp_factor * dim, dim),
+        )
+
+    def _create_mask(
+        self, h: int, w: int, win_h: int, win_w: int, shift_h: int, shift_w: int, device: torch.device
+    ) -> torch.Tensor:
+        """Build the shifted-window attention mask (standard Swin construction).
+
+        Args:
+            h, w: (padded) spatial size.
+            win_h, win_w: window size.
+            shift_h, shift_w: shift along height / width.
+            device: target device.
+
+        Returns:
+            Mask ``(nW, win_h*win_w, win_h*win_w)`` (0 where attention is allowed,
+            ``-100`` otherwise), with windows ordered ``(row, col)``.
+        """
+        img_mask = torch.zeros((1, h, w, 1), device=device)
+        h_slices = (slice(0, -win_h), slice(-win_h, -shift_h), slice(-shift_h, None))
+        w_slices = (slice(0, -win_w), slice(-win_w, -shift_w), slice(-shift_w, None))
+        cnt = 0
+        for h_sl in h_slices:
+            for w_sl in w_slices:
+                img_mask[:, h_sl, w_sl, :] = cnt
+                cnt += 1
+        nW_h, nW_w = h // win_h, w // win_w
+        mask_windows = img_mask.view(1, nW_h, win_h, nW_w, win_w, 1)
+        mask_windows = mask_windows.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, win_h * win_w)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        return attn_mask.masked_fill(attn_mask != 0, -100.0).masked_fill(attn_mask == 0, 0.0)
+
+    def _build_coords(
+        self,
+        h: int,
+        w: int,
+        h_pad: int,
+        w_pad: int,
+        win_h: int,
+        win_w: int,
+        nW_h: int,
+        nW_w: int,
+        shift_h: int,
+        shift_w: int,
+        b: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Build absolute coordinates for the (padded) tokens, in the range ``[-1, 1)``.
+
+        The original ``h x w`` grid spans ``[-1, 1)`` with the original cell step
+        (``2/h``, ``2/w``); the right/bottom padding extends beyond ``1``. When shifted,
+        the coordinates are rolled exactly like the feature map so that each token keeps
+        its true absolute position for the RoPE.
+
+        Returns:
+            Tensor ``[B*nW, win_h, win_w, 2]`` of ``(y, x)`` coordinates.
+        """
+        step_y = 2.0 / h
+        step_x = 2.0 / w
+        gy = torch.arange(h_pad, device=device).float() * step_y - 1.0 + step_y / 2
+        gx = torch.arange(w_pad, device=device).float() * step_x - 1.0 + step_x / 2
+        cy, cx = torch.meshgrid(gy, gx, indexing="ij")  # [h_pad, w_pad]
+        coords_img = torch.stack([cy, cx], dim=-1)  # [h_pad, w_pad, 2]
+
+        if shift_h > 0 or shift_w > 0:
+            coords_img = torch.roll(coords_img, shifts=(-shift_h, -shift_w), dims=(0, 1))
+
+        coords_win = coords_img.view(nW_h, win_h, nW_w, win_w, 2)
+        coords_win = coords_win.permute(0, 2, 1, 3, 4).contiguous()  # [nW_h, nW_w, win_h, win_w, 2]
+        coords_win = coords_win.view(nW_h * nW_w, win_h, win_w, 2)
+        coords_win = coords_win.unsqueeze(0).expand(b, -1, -1, -1, -1)
+        return coords_win.reshape(b * nW_h * nW_w, win_h, win_w, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the classical Swin block on a channels-last feature map.
+
+        Args:
+            x: Feature map ``(B, H, W, C)`` (any positive spatial size).
+
+        Returns:
+            Feature map ``(B, H, W, C)`` (same spatial size as the input).
+        """
+        b, h, w, d = x.shape
+        shortcut = x
+        x = self.norm1(x)
+
+        ws_h, ws_w = self.window_size
+        # Pad on the right/bottom to the next multiple of the window size.
+        pad_h = (-h) % ws_h
+        pad_w = (-w) % ws_w
+        if pad_h or pad_w:
+            x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))  # channels-last: (L, R, T, B)
+        hp, wp = h + pad_h, w + pad_w
+
+        nW_h, nW_w = hp // ws_h, wp // ws_w
+
+        sh = sw = 0
+        if self.shift:
+            # Shift by half a window, only when that axis holds more than one window.
+            if hp > ws_h:
+                sh = ws_h // 2
+            if wp > ws_w:
+                sw = ws_w // 2
+
+        if sh or sw:
+            x = torch.roll(x, shifts=(-sh, -sw), dims=(1, 2))
+            mask = self._create_mask(hp, wp, ws_h, ws_w, sh, sw, x.device)
+        else:
+            mask = None
+
+        coords = self._build_coords(h, w, hp, wp, ws_h, ws_w, nW_h, nW_w, sh, sw, b, x.device)
+
+        # Partition into windows: (B, hp, wp, C) -> (B*nW, ws_h*ws_w, C).
+        x_win = x.view(b, nW_h, ws_h, nW_w, ws_w, d)
+        x_win = x_win.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, ws_h * ws_w, d)
+
+        # Pass the *original* grid resolution so the RoPE band is set from the grid Nyquist.
+        attn_win = self.attn(x_win, coords=coords, mask=mask, resolution=(h, w))
+
+        # Merge windows back: (B*nW, ws_h*ws_w, C) -> (B, hp, wp, C).
+        x = attn_win.view(b, nW_h, nW_w, ws_h, ws_w, d)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(b, hp, wp, d)
+
+        if sh or sw:
+            x = torch.roll(x, shifts=(sh, sw), dims=(1, 2))
+        if pad_h or pad_w:
+            x = x[:, :h, :w, :]
+
+        x = shortcut + x
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 
 class BlockCrossAttentionUpsampler(nn.Module):

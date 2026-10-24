@@ -12,7 +12,8 @@ from pynop.core.blocks import (
     DeslicingBlock,
     PEBlock,
 )
-from pynop.core.ops import GalerkinAttention
+from pynop.core.ops import GalerkinAttention, FiniteDifferenceLayer
+from pynop.core.norm import LayerNorm2d
 from pynop.core.utils import ChebyshevBasis, print_stats
 
 
@@ -76,6 +77,10 @@ class ITLNO(nn.Module):
         pe_param=10,
         cat_coords: bool = True,
         transform_normalization: str = "mode",
+        n_local_conv: int = 0,
+        local_filters: Union[int, Sequence[int], None] = None,
+        local_kernel_size: int = 3,
+        grid_width: float = 2.0,
     ):
 
         super().__init__()
@@ -205,6 +210,48 @@ class ITLNO(nn.Module):
 
         self.projection = nn.Linear(hidden_channels, out_channels, bias=True)
 
+        # --- Local differential branch (NeuralOperator-style) ---
+        self.n_local_conv = n_local_conv
+        if n_local_conv > 0:
+            if local_filters is None:
+                filters = [hidden_channels] * n_local_conv
+            elif isinstance(local_filters, int):
+                filters = [local_filters] * n_local_conv
+            else:
+                filters = list(local_filters)
+                assert len(filters) == n_local_conv, (
+                    f"local_filters has {len(filters)} entries but n_local_conv={n_local_conv}"
+                )
+            self.local_conv = nn.ModuleList()
+            for i in range(n_local_conv):
+                in_ch = in_channels if i == 0 else filters[i - 1]
+                out_ch = out_channels if i == n_local_conv - 1 else filters[i]
+                is_last = (i == n_local_conv - 1)
+                self.local_conv.append(
+                    FiniteDifferenceLayer(
+                        in_channels=in_ch,
+                        out_channels=out_ch,
+                        kernel_size=local_kernel_size,
+                        grid_width=grid_width,
+                        use_bias=True,
+                        norm=LayerNorm2d if not is_last else None,
+                        activation=mlp_act if not is_last else None,
+                    )
+                )
+
+    def _local_branch(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the stack of differential convolutions on the raw input.
+
+        Args:
+            x: Input tensor of shape (B, C_in, H, W).
+
+        Returns:
+            Output tensor of shape (B, C_out, H, W).
+        """
+        for conv in self.local_conv:
+            x = conv(x)
+        return x
+
     def ortho_init_weights(self, module, gain=1.0):
         for m in module.modules():
             if isinstance(m, nn.Linear):
@@ -215,6 +262,7 @@ class ITLNO(nn.Module):
     def forward(self, x: torch.Tensor, cond: Union[None, torch.Tensor] = None):
 
         B, C, H, W = x.shape
+        x_in = x  # save original (B, C, H, W) for local branch
         x = x.permute(0, 2, 3, 1)
         x = self.lifting(x)
         x = self.norm1(x)
@@ -307,6 +355,10 @@ class ITLNO(nn.Module):
         x_rec = self.projection(x_rec)
         x_rec = x_rec.view(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
 
+        # Local differential branch (high-frequency spatial details)
+        if self.n_local_conv > 0:
+            x_rec = x_rec + self._local_branch(x_in)
+
         if self.verbose:
             print_stats(x_rec, 1, "Final:")
 
@@ -364,6 +416,10 @@ class LatentGalerkin(nn.Module):
         pe="adaptive",
         pe_param=10,
         std_init=1e-2,
+        n_local_conv: int = 0,
+        local_filters: Union[int, Sequence[int], None] = None,
+        local_kernel_size: int = 3,
+        grid_width: float = 2.0,
     ):
 
         super().__init__()
@@ -453,6 +509,48 @@ class LatentGalerkin(nn.Module):
 
         self.projection = nn.Linear(hidden_channels, out_channels, bias=True)
 
+        # --- Local differential branch (NeuralOperator-style) ---
+        self.n_local_conv = n_local_conv
+        if n_local_conv > 0:
+            if local_filters is None:
+                filters = [hidden_channels] * n_local_conv
+            elif isinstance(local_filters, int):
+                filters = [local_filters] * n_local_conv
+            else:
+                filters = list(local_filters)
+                assert len(filters) == n_local_conv, (
+                    f"local_filters has {len(filters)} entries but n_local_conv={n_local_conv}"
+                )
+            self.local_conv = nn.ModuleList()
+            for i in range(n_local_conv):
+                in_ch = in_channels if i == 0 else filters[i - 1]
+                out_ch = out_channels if i == n_local_conv - 1 else filters[i]
+                is_last = (i == n_local_conv - 1)
+                self.local_conv.append(
+                    FiniteDifferenceLayer(
+                        in_channels=in_ch,
+                        out_channels=out_ch,
+                        kernel_size=local_kernel_size,
+                        grid_width=grid_width,
+                        use_bias=True,
+                        norm=LayerNorm2d if not is_last else None,
+                        activation=mlp_act if not is_last else None,
+                    )
+                )
+
+    def _local_branch(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the stack of differential convolutions on the raw input.
+
+        Args:
+            x: Input tensor of shape (B, C_in, H, W).
+
+        Returns:
+            Output tensor of shape (B, C_out, H, W).
+        """
+        for conv in self.local_conv:
+            x = conv(x)
+        return x
+
     def encode(
         self,
         x: torch.Tensor,
@@ -513,12 +611,45 @@ class LatentGalerkin(nn.Module):
         B, C, H, W = x.shape
         z, q = self.encode(x, cond)
         x_rec = self.decode(z, q, (H, W))
+
+        # Local differential branch (high-frequency spatial details)
+        if self.n_local_conv > 0:
+            x_rec = x_rec + self._local_branch(x)
+
         return x_rec
 
 
 class LatentTransolver(nn.Module):
-    """Using a transolverv3 transform to projet in the latent space and going back to physical space.
-    Self-attention blocs are applied in the latent space
+    """Latent Transolver: projects to a reduced latent space via Transolver3 slicing,
+    applies self-attention blocks in the latent space, then reconstructs via deslicing.
+
+    Unlike the full Transolver3 block (which does forward + inverse transform at every
+    layer), this model performs the transform **once**, processes the latent
+    representation with multiple attention blocks, and applies the inverse transform
+    only at the end.
+
+    Args:
+        in_channels: Number of input channels.
+        out_channels: Number of output channels.
+        modes: Number of latent slices M (Transolver3 slicing dimension).
+        num_blocks: Number of transformer blocks in the latent space.
+        hidden_channels: Hidden feature dimension (C = D in Transolver3).
+        num_heads: Number of attention heads.
+        mlp_layers: Number of layers in the conditioning embedding MLP.
+        mlp_dim: Hidden dimension of the conditioning/preprocessing MLPs.
+        activation: Activation class for transformer blocks.
+        mlp_act: Activation class for auxiliary MLPs (cond embedding, preprocessing).
+        mlp_factor: Expansion factor for the transformer MLP hidden dim.
+        dropout: Dropout probability in transformer blocks.
+        rmsnorm: Use RMSNorm (True) or LayerNorm (False).
+        cond_dim: Optional conditioning dimension.
+        latent_attention: "vanilla" (standard TransformerBlock) or "galerkin".
+        std_init: Standard deviation for weight initialization in attention blocks.
+        n_local_conv: Number of differential conv layers in the local branch (0 = disabled).
+        local_filters: Number of filters per local conv layer. If int, all layers use
+            this value. If sequence, one value per layer. Default: hidden_channels.
+        local_kernel_size: Spatial kernel size for the differential conv (odd int).
+        grid_width: Physical domain width for the 1/h rescaling (e.g. 2.0 for [-1, 1]).
     """
 
     def __init__(
@@ -535,24 +666,20 @@ class LatentTransolver(nn.Module):
         mlp_act=nn.GELU,
         mlp_factor: int = 4,
         dropout: float = 0,
-        dim: int = 2,
         rmsnorm: bool = True,
         cond_dim: Union[int, None] = None,
-        latent_attention="vanilla",
-        verbose: bool = False,
-        use_gumbel_softmax: bool = False,
-        std_init=2e-2,
-        # pe="random_ipe",
-        # pe_param=10,
+        latent_attention: str = "vanilla",
+        std_init: float = 2e-2,
+        n_local_conv: int = 0,
+        local_filters: Union[int, Sequence[int], None] = None,
+        local_kernel_size: int = 3,
+        grid_width: float = 2.0,
     ):
-
         super().__init__()
 
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.modes = modes
-        self.dim = dim
-        self.verbose = verbose
         self.hidden_channels = hidden_channels
 
         self.lifting = nn.Linear(in_channels, hidden_channels, bias=True)
@@ -625,6 +752,52 @@ class LatentTransolver(nn.Module):
             norm=norm_layer,
         )
 
+        # --- Local differential branch (NeuralOperator-style) ---
+        # Captures high-frequency spatial details that the global low-rank
+        # latent path cannot represent. Rescaled by 1/h for resolution invariance.
+        self.n_local_conv = n_local_conv
+        if n_local_conv > 0:
+            # Resolve filter widths per layer
+            if local_filters is None:
+                filters = [hidden_channels] * n_local_conv
+            elif isinstance(local_filters, int):
+                filters = [local_filters] * n_local_conv
+            else:
+                filters = list(local_filters)
+                assert len(filters) == n_local_conv, (
+                    f"local_filters has {len(filters)} entries but n_local_conv={n_local_conv}"
+                )
+
+            self.local_conv = nn.ModuleList()
+            for i in range(n_local_conv):
+                in_ch = in_channels if i == 0 else filters[i - 1]
+                out_ch = out_channels if i == n_local_conv - 1 else filters[i]
+                is_last = (i == n_local_conv - 1)
+                self.local_conv.append(
+                    FiniteDifferenceLayer(
+                        in_channels=in_ch,
+                        out_channels=out_ch,
+                        kernel_size=local_kernel_size,
+                        grid_width=grid_width,
+                        use_bias=True,
+                        norm=LayerNorm2d if not is_last else None,
+                        activation=mlp_act if not is_last else None,
+                    )
+                )
+
+    def _local_branch(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the stack of differential convolutions.
+
+        Args:
+            x: Input tensor of shape (B, C_in, H, W).
+
+        Returns:
+            Output tensor of shape (B, C_out, H, W).
+        """
+        for conv in self.local_conv:
+            x = conv(x)
+        return x
+
     def encode(self, x, cond: Union[None, torch.Tensor] = None):
 
         B, C, H, W = x.shape
@@ -681,12 +854,24 @@ class LatentTransolver(nn.Module):
         x: torch.Tensor,
         cond: Union[None, torch.Tensor] = None,
     ):
+        """Forward pass: global (latent) branch + optional local (differential conv) branch.
 
-        B, C, H, W = x.shape
+        Args:
+            x: Input tensor of shape (B, C_in, H, W).
+            cond: Optional conditioning tensor.
+
+        Returns:
+            Output tensor of shape (B, C_out, H, W).
+        """
+        # Global branch: slice → latent attention → deslice
         z, w = self.encode(x, cond)
-        x = self.decode(z, w, (H, W))
+        x_out = self.decode(z, w, x.shape[2:])
 
-        return x
+        # Local branch: differential convolutions (high-frequency spatial details)
+        if self.n_local_conv > 0:
+            x_out = x_out + self._local_branch(x)
+
+        return x_out
 
 
 class LatentNO(nn.Module):
