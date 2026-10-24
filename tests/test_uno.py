@@ -7,13 +7,19 @@ from pynop.models.UNO import UNO
 
 
 def _basic_config(**overrides):
-    """Return a default UNO config dict, overridable via kwargs."""
+    """Return a default UNO config dict, overridable via kwargs.
+
+    2 stages, downsample_factor=2, constant window size:
+    - Stage 0: 64x64, windows (4,4) -> window 16x16
+    - Stage 1: 32x32, windows (2,2) -> window 16x16
+    - Bottleneck: 16x16
+    """
     cfg = dict(
         in_channels=1,
         out_channels=1,
-        grid_resolutions=[(32, 32), (16, 16)],
-        enc_num_windows=[(4, 4), (8, 8)],
-        dec_num_windows=[(8, 8), (4, 4)],
+        enc_num_windows=[(4, 4), (2, 2)],
+        dec_num_windows=[(4, 4), (2, 2)],
+        downsample_factor=2,
         model_dim=32,
         enc_repeats=1,
         dec_repeats=1,
@@ -38,9 +44,9 @@ class TestUNOConstruction:
         model = UNO(
             in_channels=1,
             out_channels=1,
-            grid_resolutions=[(64, 64), (32, 32), (16, 16)],
-            enc_num_windows=[(4, 4), (8, 8), (16, 16)],
-            dec_num_windows=[(16, 16), (8, 8), (4, 4)],
+            enc_num_windows=[(8, 8), (4, 4), (2, 2)],
+            dec_num_windows=[(8, 8), (4, 4), (2, 2)],
+            downsample_factor=2,
             model_dim=[32, 64, 128, 256],
             num_heads=4,
         )
@@ -51,9 +57,9 @@ class TestUNOConstruction:
         model = UNO(
             in_channels=1,
             out_channels=1,
-            grid_resolutions=[(16, 16)],
             enc_num_windows=[(4, 4)],
             dec_num_windows=[(4, 4)],
+            downsample_factor=2,
             model_dim=32,
             num_heads=4,
         )
@@ -68,14 +74,14 @@ class TestUNOConstruction:
         with pytest.raises(ValueError, match="divisible by num_heads"):
             UNO(**_basic_config(model_dim=30, num_heads=4))  # 30 % 4 != 0
 
-    def test_enc_windows_length_mismatch(self):
-        with pytest.raises(ValueError, match="enc_num_windows"):
+    def test_enc_dec_windows_length_mismatch(self):
+        with pytest.raises(ValueError, match="dec_num_windows"):
             UNO(
                 in_channels=1,
                 out_channels=1,
-                grid_resolutions=[(32, 32), (16, 16)],
-                enc_num_windows=[(4, 4)],  # too short
-                dec_num_windows=[(8, 8), (4, 4)],
+                enc_num_windows=[(4, 4)],  # 1 stage
+                dec_num_windows=[(4, 4), (2, 2)],  # 2 stages
+                downsample_factor=2,
                 model_dim=32,
                 num_heads=4,
             )
@@ -85,10 +91,22 @@ class TestUNOConstruction:
             UNO(
                 in_channels=1,
                 out_channels=1,
-                grid_resolutions=[(32, 32), (16, 16)],
-                enc_num_windows=[(4, 4), (8, 8)],
-                dec_num_windows=[(8, 8), (4, 4)],
+                enc_num_windows=[(4, 4), (2, 2)],
+                dec_num_windows=[(4, 4), (2, 2)],
+                downsample_factor=2,
                 model_dim=[32, 64],  # need 3 entries for 2 stages
+                num_heads=4,
+            )
+
+    def test_invalid_downsample_factor(self):
+        with pytest.raises(ValueError, match="downsample_factor"):
+            UNO(
+                in_channels=1,
+                out_channels=1,
+                enc_num_windows=[(4, 4)],
+                dec_num_windows=[(4, 4)],
+                downsample_factor=0,
+                model_dim=32,
                 num_heads=4,
             )
 
@@ -121,6 +139,12 @@ class TestUNOForward:
             out = model(x)
             assert out.shape == (1, 1, size, size)
 
+    def test_forward_nonsquare(self):
+        model = UNO(**_basic_config())
+        x = torch.randn(1, 1, 96, 64)
+        out = model(x)
+        assert out.shape == (1, 1, 96, 64)
+
     def test_forward_cond(self):
         model = UNO(**_basic_config(cond_dim=2))
         x = torch.randn(2, 1, 64, 64)
@@ -132,9 +156,9 @@ class TestUNOForward:
         model = UNO(
             in_channels=1,
             out_channels=1,
-            grid_resolutions=[(32, 32), (16, 16)],
             enc_num_windows=[(4, 4), None],
-            dec_num_windows=[None, (4, 4)],
+            dec_num_windows=[(4, 4), None],
+            downsample_factor=2,
             model_dim=32,
             num_heads=4,
         )
@@ -172,9 +196,9 @@ class TestUNOGradients:
         model = UNO(
             in_channels=1,
             out_channels=1,
-            grid_resolutions=[(32, 32), (16, 16)],
             enc_num_windows=[(4, 4), None],
-            dec_num_windows=[None, (4, 4)],
+            dec_num_windows=[(4, 4), None],
+            downsample_factor=2,
             model_dim=32,
             num_heads=4,
         )
@@ -194,13 +218,10 @@ class TestUNOSkipFusion:
         torch.manual_seed(42)
         model_concat = UNO(**_basic_config(skip_fusion="concat"))
 
-        # Copy weights from the add model to the concat model for the shared parts
-        # (they have different skip_proj layers, so just compare structure)
         x = torch.randn(1, 1, 64, 64)
         out_add = model_add(x)
         out_concat = model_concat(x)
 
-        # Both should be finite and the same shape
         assert out_add.shape == out_concat.shape
         assert torch.isfinite(out_add).all()
         assert torch.isfinite(out_concat).all()
@@ -221,7 +242,7 @@ class TestUNOValidation:
 
     def test_invalid_spatial_size(self):
         model = UNO(**_basic_config())
-        # 50 is not divisible by 32 (first grid resolution)
+        # 2 stages, factor 2 -> total factor 4. 50 % 4 != 0.
         x = torch.randn(1, 1, 50, 50)
         with pytest.raises(ValueError, match="divisible"):
             model(x)
@@ -229,7 +250,6 @@ class TestUNOValidation:
     def test_wrong_ndim(self):
         model = UNO(**_basic_config())
         x = torch.randn(1, 1, 64)  # 3D instead of 4D
-        # This will fail in permute or shape unpacking
         with pytest.raises((ValueError, RuntimeError, IndexError)):
             model(x)
 
@@ -251,9 +271,9 @@ class TestUNOArchitecture:
         model = UNO(
             in_channels=1,
             out_channels=1,
-            grid_resolutions=[(32, 32), (16, 16)],
-            enc_num_windows=[(4, 4), (8, 8)],
-            dec_num_windows=[(8, 8), (4, 4)],
+            enc_num_windows=[(4, 4), (2, 2)],
+            dec_num_windows=[(4, 4), (2, 2)],
+            downsample_factor=2,
             model_dim=[32, 64, 128],
             num_heads=4,
         )

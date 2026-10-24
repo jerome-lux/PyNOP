@@ -492,8 +492,12 @@ input (B, Cin, H, W)
 | Invariance rés. | Oui (fenêtres fixes, taille déduite) | Oui (idem) |
 
 **Paramètres clés** :
-- `grid_resolutions` : liste de tuples `(H, W)` par étape (plus grande → plus petite)
-- `enc_num_windows` / `dec_num_windows` : nombre de fenêtres par étape (`None` = global)
+- `enc_num_windows` / `dec_num_windows` : nombre de fenêtres par étape (`None` = global).
+  La longueur détermine `n_stages`. Pour garder une taille de fenêtre constante,
+  diminuer le nb de fenêtres par `downsample_factor` à chaque stage
+  (ex. `[(16,16),(8,8),(4,4)]` avec facteur 2).
+- `downsample_factor` : facteur de downsampling par stage (défaut 2).
+  Résolution au stage i = `input_res / downsample_factor**i`.
 - `model_dim` : int ou `List[int]` (dim par niveau)
 - `enc_repeats` / `dec_repeats` : paires de SwinBlocks par étape
 - `bottleneck_repeats` : nb de TransformerBlocks au bottleneck
@@ -507,11 +511,12 @@ identique pour des points d'entrée identiques), (2) position **absolue** (utile
 conditions aux limites positionnelles). Conclusion : **utile mais non strictement
 nécessaire** — garder comme défaut, envisager un flag `use_pe` pour un design « pur NO ».
 
-**Vérifié** (env. conda `pytorch`) : `pytest tests/` → **97/97 OK** (dont **28 nouveaux**
+**Vérifié** (env. conda `pytorch`) : `pytest tests/` → **99/99 OK** (dont **30 nouveaux**
 dans `tests/test_uno.py`) : construction (1/2/3 stages, fusion add/concat, fusion invalide
-rejetée), forward (carré, non-carré 96×64/192×128), backward (aucun param mort),
-invariance de résolution (64/128, 96×64/192×128), conditionnement, stages globaux
-(`None`). Smoke : `SwinNO` et consommateurs des blocs partagés → OK.
+rejetée, downsample_factor invalide rejeté), forward (carré, non-carré 96×64),
+backward (aucun param mort), invariance de résolution (32/64/128), conditionnement,
+stages globaux (`None`), validation spatial size. Smoke : `SwinNO` et consommateurs
+des blocs partagés → OK.
 
 > ⚠️ `pynop` est installé non-editable (copie obsolète) : lancer depuis PyNOP ou `pip install -e .`.
 
