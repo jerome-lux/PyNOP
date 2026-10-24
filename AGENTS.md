@@ -18,6 +18,7 @@ itérative, sur la branche `dev`.
 |---|---|---|
 | **DeepONet** | `pynop/models/deeponet.py` | ✅ Corrigé (IndexError/AttributeError/NotImplementedError via `nn.Sequential`, logique `scale` flexible, docstrings raw strings) |
 | **SwinNO / MultiscaleSWINNO** | `pynop/models/SWIN.py` | ✅ Nettoyé + validé (voir ci-dessous) |
+| **UNO** (U-Net Neural Operator) | `pynop/models/UNO.py` | ✅ Nouveau : U-Net multi-échelle avec skips first-class, fusion `"add"`/`"concat"`, bottleneck transformer global, invariance de résolution (voir §13) |
 | **LNO (`LatentNO`)** | `pynop/models/LNO.py` | ⚠️ Architecture correcte, mais **ne s'entraîne pas bien** — cause identifiée comme étant le *setup d'entraînement*, pas l'init (voir ci-dessous) |
 | **LatentGalerkin** | `pynop/models/LNO.py` | ✅ Analysé + bugs corrigés (PE, RoPE, activation) + **branche locale** ajoutée (voir §7) |
 | **ITLNO** | `pynop/models/LNO.py` | ✅ Analysé + bugs corrigés (voir §6) + **branche locale** ajoutée (voir §7) |
@@ -25,7 +26,7 @@ itérative, sur la branche `dev`.
 | **FNO** | `pynop/models/FNO.py` | ⏳ À analyser |
 | **Transolver** | `pynop/models/transolver.py` | ⏳ À analyser |
 | **ITNet** | `pynop/models/ITNet.py` | ⏳ À analyser |
-| **UNet** (classique) | `pynop/models/unet.py` | ✅ Réécrit : U-Net classique (non-NO) validé — 4 blocs acceptés, PatchEmbed option, bottleneck transformer (PE **ou** RoPE) (voir §8). `NOUnet` à faire |
+| **UNet** (classique) | `pynop/models/unet.py` | ✅ Réécrit : U-Net classique (non-NO) validé — 4 blocs acceptés, PatchEmbed option, bottleneck transformer (PE **ou** RoPE) (voir §8) |
 | **Resnet** (classique) | `pynop/models/resnet.py` | ✅ Unifiée : `block_type="basic"`/`"bottleneck"` + `bottleneck_ratio` + `se` ; `Resnetb` supprimé ; `resnet18`/`34`/`50`/`resnext50` fonctionnent (voir §11) |
 | **Blocs communs** | `pynop/core/blocks.py`, `pynop/core/ops.py` | Blocs Swin déplacés ici ; **`TransformerBlock` unifié** avec option RoPE (`AdaptiveRoPE2D`) (voir §9) |
 | **Blocs IT** | `pynop/core/blocks.py` | ✅ `SepLITBlock`/`SepNLITBlock`/`LITBlock` vérifiés — 3 bugs corrigés : norm channels-first, sur-normalisation `1/(H·W)` → échelle apprenable, shape du mixage de canaux (voir §12) |
@@ -270,7 +271,7 @@ kernel 3/5, avec/sans condition).
 
 **Contexte** : l'ancienne classe `unet` (basée sur `MaxPoolConv`/`InterpolateConvUpSampleLayer`)
 est remplacée par une **U-Net « traditionnelle »** (non opérateur neuronal), comme référence
-pour la future `NOUnet`.
+pour `UNO` (voir §13).
 
 **Nouvelle classe `UNet`** (alias backward-compat `unet = UNet`) :
 - **Downsampling** : `Conv2d(kernel=3, stride=2, padding=1)` (l'ancien défaut sans padding
@@ -461,6 +462,59 @@ dans `tests/test_lit_blocks.py`) : forward+backward + aucun param mort pour les 
 
 > ⚠️ `pynop` est installé non-editable (copie obsolète) : lancer depuis PyNOP ou `pip install -e .`.
 
+### 13. UNO — U-Net Neural Operator (`pynop/models/UNO.py`)
+
+**Contexte** : la demande initiale était « une version traditionnelle **et** une version
+NO_unet ». La version classique (`UNet`, §8) était déjà faite ; `UNO` est la version
+**opérateur neuronal** : un U-Net multi-échelle construit sur les blocs Swin
+(`AdaptiveSwinBlock`) avec **skips first-class** entre encodeur et décodeur.
+
+**Architecture** :
+```
+input (B, Cin, H, W)
+→ Stem          : PE (adaptive) + Linear → (B, H, W, D0)
+→ Enc stage i   : repeats × (SwinBlock + ShiftSwinBlock)  → skip[i]
+→ Down i        : WindowCrossAttention  → (B, H_i, W_i, D_i+1)
+→ Bottleneck    : repeats × TransformerBlock (global, plus petite résolution)
+→ Up i          : BlockCrossAttentionUpsampler (queries = skip[i], keys/values = z)
+→ Dec stage i   : [skip fusion] + repeats × (SwinBlock + ShiftSwinBlock)
+→ Head          : RMSNorm + Linear + GELU + Linear → (B, Cout, H, W)
+```
+
+**Différences vs `MultiscaleSWINNO`** :
+
+| | MultiscaleSWINNO | UNO |
+|---|---|---|
+| Skips | Residual interne de l'upsampler (additif) | **First-class** : fusion explicite après self-attention |
+| Fusion | Toujours `add` (residual) | Configurable : `"add"` ou `"concat"` (+ 1×1 proj) |
+| Bottleneck | Non explicite (output_proj) | **Explicite** : `bottleneck_repeats` × TransformerBlock global |
+| API | Encodeur/décodeur séparés | **Symétrique** : un seul objet, stages indépendamment configurables |
+| Invariance rés. | Oui (fenêtres fixes, taille déduite) | Oui (idem) |
+
+**Paramètres clés** :
+- `grid_resolutions` : liste de tuples `(H, W)` par étape (plus grande → plus petite)
+- `enc_num_windows` / `dec_num_windows` : nombre de fenêtres par étape (`None` = global)
+- `model_dim` : int ou `List[int]` (dim par niveau)
+- `enc_repeats` / `dec_repeats` : paires de SwinBlocks par étape
+- `bottleneck_repeats` : nb de TransformerBlocks au bottleneck
+- `skip_fusion` : `"add"` (défaut, ≈ MultiscaleSWINNO) ou `"concat"`
+- `cond_dim` : optionnel (conditionnement)
+
+**PE au stem** : l'analyse de la discussion révèle que le RoPE (positions relatives) dans
+l'attention couvre déjà le besoin de position pour les poids d'attention. Le PE additif au
+stem apporte en plus : (1) information positionnelle pour la **première MLP** (sinon
+identique pour des points d'entrée identiques), (2) position **absolue** (utile pour
+conditions aux limites positionnelles). Conclusion : **utile mais non strictement
+nécessaire** — garder comme défaut, envisager un flag `use_pe` pour un design « pur NO ».
+
+**Vérifié** (env. conda `pytorch`) : `pytest tests/` → **97/97 OK** (dont **28 nouveaux**
+dans `tests/test_uno.py`) : construction (1/2/3 stages, fusion add/concat, fusion invalide
+rejetée), forward (carré, non-carré 96×64/192×128), backward (aucun param mort),
+invariance de résolution (64/128, 96×64/192×128), conditionnement, stages globaux
+(`None`). Smoke : `SwinNO` et consommateurs des blocs partagés → OK.
+
+> ⚠️ `pynop` est installé non-editable (copie obsolète) : lancer depuis PyNOP ou `pip install -e .`.
+
 ---
 
 ## Prochaines étapes (session suivante)
@@ -478,9 +532,9 @@ dans `tests/test_lit_blocks.py`) : forward+backward + aucun param mort pour les 
 6. [ ] **Transolver** (`pynop/models/transolver.py`) : idem.
 7. [ ] **ITNet** (`pynop/models/ITNet.py`) : idem.
 8. [x] **UNet** (`pynop/models/unet.py`) : version classique réécrite + 4 blocs vérifiés. ✅ Fait
-9. [ ] **NOUnet** (`pynop/models/unet.py`) : version *neural operator* du U-Net (à faire
-       après la version classique — la demande initiale était « une version traditionnelle
-       **et** une version NO_unet »).
+9. [x] **UNO** (`pynop/models/UNO.py`) : version *neural operator* du U-Net — U-Net
+       multi-échelle avec skips first-class, fusion `"add"`/`"concat"`, bottleneck
+       transformer global, invariance de résolution (voir §13). ✅ Fait
  10. [ ] Vérifier les autres classes de `pynop/core/blocks.py` et `pynop/core/ops.py`.
  11. [x] **`Resnetb`** (`models/resnet.py`) : **supprimé** — `Resnet` unifiée avec
         `block_type="basic"/"bottleneck"` + `bottleneck_ratio` + `se` (voir §11). ✅ Fait
