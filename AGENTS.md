@@ -29,7 +29,7 @@ itérative, sur la branche `dev`.
 | **UNet** (classique) | `pynop/models/unet.py` | ✅ Réécrit : U-Net classique (non-NO) validé — 4 blocs acceptés, PatchEmbed option, bottleneck transformer (PE **ou** RoPE) (voir §8) |
 | **Resnet** (classique) | `pynop/models/resnet.py` | ✅ Unifiée : `block_type="basic"`/`"bottleneck"` + `bottleneck_ratio` + `se` ; `Resnetb` supprimé ; `resnet18`/`34`/`50`/`resnext50` fonctionnent (voir §11) |
 | **Blocs communs** | `pynop/core/blocks.py`, `pynop/core/ops.py` | Blocs Swin déplacés ici ; **`TransformerBlock` unifié** avec option RoPE (`AdaptiveRoPE2D`) (voir §9) |
-| **Blocs IT** | `pynop/core/blocks.py` | ✅ `SepLITBlock`/`SepNLITBlock`/`LITBlock` vérifiés — 3 bugs corrigés : norm channels-first, sur-normalisation `1/(H·W)` → échelle apprenable, shape du mixage de canaux (voir §12) |
+| **Blocs IT** | `pynop/core/blocks.py` | ✅ `SepLITBlock`/`SepNLITBlock`/`LITBlock` vérifiés — 3 bugs corrigés : norm channels-first, sur-normalisation `1/(H·W)` → échelle apprenable, shape du mixage de canaux (voir §12) ; **`IAETBlock`** (style IAE-Net) vérifié contre l'implémentation officielle — 4 bugs corrigés : crash entrée complexe, shape transposée `learned_weights_freq`, norm spectrale manquante (`ln1` officiel), échelle finale apprenable (voir §16) |
 | **Training (Lightning)** | `pynop/training/lightning_model.py` | ✅ Réécrit : `predict_derivative` (sortie dérivée **ou** absolue), derivative-loss configurable, base unique `MultiStepLightningBase` (plumbing + rollout), compat. tous les modèles du dépôt (UNet/UNO/LNO/FNO/SWIN/Transolver/DeepONet/Galerkin), `DeepONetModel` dédié ; wrappers AE/`CausalNO` supprimés (non utilisés) (voir §15) |
 
 ---
@@ -688,6 +688,77 @@ custom), curriculum AR + feedback AR + bruit, optimizer/scheduler
 
 > ✅ `pynop` est installé en mode éditable (`pip install -e .`) — les modifications source sont vues immédiatement.
 
+### 16. `IAETBlock` — vérification contre l'implémentation officielle IAE-Net + fixes (`pynop/core/blocks.py`)
+
+**Contexte** : `IAETBlock` (« Non Reversible Non Linear Integral Transform Block ») est le
+bloc de la famille IT le plus proche d'**IAE-NET** (« Integral Autoencoders for
+Discretization-Invariant Learning », Ong/Shen/Yang, arXiv:2203.05142 ; dépôt officiel
+`github.com/IAE-Net/iae_net`, `libs/layers/iae_blocks.py`) : transformée intégrale 2-D
+**non linéaire** (noyaux conditionnés sur les données) avec **transformée inverse
+indépendamment apprise** (d'où « non réversible »). Comparaison faite contre le code
+officiel (`Encoder`/`Decoder`/`TokenConv`, cas 2-D).
+
+**Logique validée comme conforme à l'officiel** :
+- Ordre des passes : encodeur W→H, décodeur H→W (ordre inverse) — identique.
+- Conditionnement des noyaux d'encodeur : valeurs au point + coordonnée (passage 1),
+  valeurs après le passage 1 + coordonnée (passage 2) — identique.
+- Conditionnement du décodeur : **compresseur** (`Linear(m→1)`) sur les coefficients
+  spectraux, en conservant l'indice de mode qui indexe la ligne utilisée dans le produit
+  scalaire et en compressant l'index sommé (vérifié terme à terme contre `compressor_x`/
+  `compressor_y`), répété le long de la dimension spatiale de sortie — identique.
+
+**Bugs corrigés** :
+1. **Crash entrée complexe** — `xc = … else x.float()` : `.float()` sur un tenseur
+   complexe64 **jette la partie imaginaire** (UserWarning) et produit un tenseur *réel* →
+   le premier matmul (réel × bases complexes de `ComplexMLPBlock`) lève
+   `RuntimeError: expected scalar type Float but found ComplexFloat`. Le bloc était donc
+   **inutilisable avec une entrée complexe**. Fix : le bloc opère sur la **partie réelle**
+   de son entrée, uniformément pour la transformée et le shortcut (`x_real = x.real if
+   x.is_complex() else x`, puis embedding complexe à partie imaginaire nulle) — l'intention
+   d'origine (`x.float()` = « rendre réel »), sans le crash. Documenté dans le docstring ;
+   sortie toujours réelle. (Le support *plein* complexe — shortcut complexe inclus — reste
+   une extension future.)
+2. **Shape transposée de `learned_weights_freq`** — construite `(in, out, m1, m2)` alors
+   que l'einsum `"bixy,oixy->boxy"` attend `(out, in, m1, m2)` → crash si `in ≠ out`,
+   **mixage de canaux erroné sinon** (même bug que `SepNLITBlock`, §12). Fix : shape
+   `(out_channels, in_channels, m1, m2)`.
+3. **Init morte + init tous-à-un** — `torch.randn(…)` immédiatement écrasée par
+   `nn.init.constant_(…, 1.0)` ; des poids 1+0j couplent chaque canal de sortie à la somme
+   de tous les canaux d'entrée (amplification O(√C_in) si `in ≠ out`). Fix : init
+   Xavier-style complexe `std = (1/(in+out))^0.5` sur parties réelle et imaginaire
+   (convention des blocs frères §12).
+4. **Norm spectrale manquante → explosion de magnitude avec la résolution** — l'officiel
+   applique un LayerNorm (`ln1`) après la 2ᵉ transformée de chaque encodeur/décodeur ; le
+   port PyNOP l'avait omis. Mesuré (in=out=8, m=(8,8), x~N(0,1)) : sortie brute de la
+   chaîne 0.18 → 0.36 → **5210** et conditionnements du décodeur 0.45 → 1.84 → **68** aux
+   résolutions 16/32/64 (les sommes de Riemann non échelonnées divergent, et les noyaux
+   inverse *conditionnés sur ces valeurs* étaient pilotés par la magnitude, pas le contenu).
+   Fix : `ln_freq = ComplexLayerNorm(-1)` (RMS complexe-safe sur la dim canaux —
+   `F.layer_norm` ne supporte pas les complexes ; bien comporté même pour C=1) appliqué à
+   la représentation spectrale après l'encodeur, avant le mixage fréquentiel. Après fix :
+   représentation spectrale O(0.92–0.93), conditionnements O(0.38–0.39), sortie brute
+   bornée (0.07–0.09) et ratio branche-IT/shortcut **0.70 constant** aux résolutions
+   16/32/64.
+5. **Échelle finale fixe `1/(h·w)`** — remplacée par l'exposant **apprenable**
+   `(H·W)**sigmoid(IT_scale)` (init `-1.1` → sigmoid≈0.25), convention de la famille §12 ;
+   le facteur constant supposait une base unit-énergie (faux pour une base apprise) et,
+   avec `norm=None`, faisait décroître la sortie en 1/N².
+
+**Notes de design (écart assumés vs l'officiel, documentés dans le docstring)** : bases
+complexes (`ComplexMLPBlock`) au lieu de réelles ; coordonnées `[-1,1]` au lieu de `[0,1]` ;
+grilles **non carrées** supportées (l'officiel 2-D suppose des grilles carrées) ; branche
+unique (le chemin Fourier parallèle et les connexions denses vivent dans le wrapper modèle
+officiel `TokenDenseBlock`, pas dans le bloc).
+
+**Vérifié** (env. conda `pytorch`) : `pytest tests/` → **219/219 OK** (dont **6 nouveaux**
+dans `tests/test_lit_blocks.py`) : forward+backward sans param mort, `in≠out` (4→12) +
+shape des poids, entrée complexe (pas de crash, pas de warning, `block(z) == block(Re z)`),
+norm spectrale O(1) et invariante en résolution (hook sur `ln_freq`, 16/32/64), ratio
+branche-IT/shortcut ∈ [0.1, 10] constant en résolution, `IT_scale` apprenable + effectif,
+grille non carrée 32×48, chemin `norm=None`.
+
+> ✅ `pynop` est installé en mode éditable (`pip install -e .`) — les modifications source sont vues immédiatement.
+
 ---
 
 ## Prochaines étapes (session suivante)
@@ -725,6 +796,12 @@ custom), curriculum AR + feedback AR + bruit, optimizer/scheduler
         configurable + vérifié, base unique `MultiStepLightningBase` (plumbing +
         rollout), wrappers AE/`CausalNO` supprimés (non utilisés), compatibilité tous
         les modèles du dépôt, `DeepONetModel` dédié. ✅ Fait (voir §15)
+14. [x] **`IAETBlock`** (`pynop/core/blocks.py`) : vérifié contre l'implémentation
+        officielle IAE-Net (arXiv:2203.05142, `github.com/IAE-Net/iae_net`) — 4 bugs
+        corrigés : crash entrée complexe (`x.float()`), shape transposée de
+        `learned_weights_freq` (crash si in≠out / mixage erroné sinon), norm spectrale
+        manquante (`ln1` officiel → explosion O(5e3) à res 64), échelle finale fixe
+        `1/(h·w)` → apprenable. ✅ Fait (voir §16)
 
 ## Conventions
 - Environnement : conda `pytorch` (Python 3.12, Linux).

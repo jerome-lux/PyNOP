@@ -13,7 +13,7 @@ from einops import rearrange
 
 from .utils import make_tuple
 from .ops import *
-from .norm import AdaptiveLayerNorm, LayerNorm2d, AdaptiveLayerNorm, AdaRMSNorm, GRN
+from .norm import AdaptiveLayerNorm, LayerNorm2d, AdaRMSNorm, ComplexLayerNorm, GRN
 from .activations import Sine, gumbel_softmax
 from .encoding import (
     RoPE,
@@ -2246,39 +2246,77 @@ class TransolverBlockv3(nn.Module):
 
 
 class IAETBlock(nn.Module):
-    """
-    Non Reversible Non Linear Integral Transform Block is a
-    PyTorch module for a learned 2D non linear integral transform that is resolution-invariant.
-    The transform bases are learned as continuous functions via MLPs.
-    In this implementation the inverse transform is also learnt.
-    The kernels are conditinioned on the transformed function.
-    Note that the conditionning is not done the same way in the forward transform and the inverse one.
-    As the kernels are learnt both in the encoder and the decoder, the transformation is not reversible
-    Strongly inspired by IAE-NET: INTEGRAL AUTOENCODERS FOR DISCRETIZATION-INVARIANT LEARNING
+    """Non-reversible non-linear integral transform block (IAE-Net style).
 
+    A learned 2-D *non-linear* integral transform that is resolution-invariant,
+    strongly inspired by IAE-NET ("Integral Autoencoders for Discretization-Invariant
+    Learning", Ong et al., arXiv:2203.05142): the encoder and decoder kernels are
+    learned as continuous functions via MLPs and are *conditioned on the data*, which
+    makes the transform non-linear in its input. The inverse transform uses its own
+    learned kernels (not the conjugate of the forward ones), so the block is **not
+    reversible** -- hence "IAET".
+
+    Architecture (channels-first ``(B, C_in, H, W)``, real or complex input):
+
+    1. **Encoder** (direct transform, data-conditioned kernels):
+       - width pass: kernel ``b_w`` = MLP(real values at the point + x-coordinate),
+         applied along W -> ``(B, C_in, H, m2)``;
+       - height pass: kernel ``b_h`` = MLP(values after the width pass + y-coordinate),
+         applied along H -> spectral representation ``(B, C_in, m1, m2)``.
+    2. **Spectral normalization**: complex-safe RMS over the channel dim of the
+       spectral representation (the official IAE-Net applies a LayerNorm ``ln1`` at
+       this point). The raw Riemann sums grow with the resolution; without it, the
+       data-conditioned decoder kernels below would be driven by magnitude instead of
+       content at high resolutions.
+    3. **Frequency mixing**: per-mode complex weights ``(C_out, C_in, m1, m2)``.
+    4. **Decoder** (inverse transform, *separately learned* data-conditioned kernels):
+       - height reconstruction: kernel MLP conditioned on the output y-coordinate and a
+         per-(channel, width-mode) compressed summary of the spectral coefficients;
+       - width reconstruction: same pattern with the remaining mode dimension.
+    5. **Learnable final scale** ``1 / (H*W)**sigmoid(IT_scale)`` (family convention, see
+       :class:`SepLITBlock`), channel mixing (1x1 conv), channels-first norm, activation,
+       and a 1x1-conv shortcut: ``out = act(act(mixer(norm(x_rec))) + shortcut(x))``.
+
+    Input handling: the block operates on the **real part** of its input -- a real
+    tensor is embedded as a complex field with zero imaginary part, a complex tensor is
+    reduced to its real part (uniformly for the transform and the shortcut). The output
+    is always real.
+
+    Differences from the official IAE-Net implementation:
+    - complex-valued kernels/bases (:class:`ComplexMLPBlock`) instead of real ones;
+    - coordinates in ``[-1, 1]`` (the official uses ``[0, 1]``);
+    - non-square grids are supported (the official 2-D code assumes square grids);
+    - single branch: no parallel Fourier-IAE path and no dense connections (those live
+      in the official model wrapper, not in the block itself).
+
+    Note: with ``norm=None`` the output magnitude is set by the learnable final scale;
+    with the default channels-first norm it is renormalized to O(1) per spatial point.
     """
 
     def __init__(
         self,
-        in_channels,
-        out_channels,
-        m1,
-        m2,
-        mlp_hidden_dim=64,
-        mlp_num_layers=2,
-        activation=nn.GELU,
-        norm=LayerNorm2d,
-    ):
-        """
-        Initializes the module.
+        in_channels: int,
+        out_channels: int,
+        m1: int,
+        m2: int,
+        mlp_hidden_dim: int = 64,
+        mlp_num_layers: int = 2,
+        activation: Callable = nn.GELU,
+        norm: Optional[Callable] = LayerNorm2d,
+    ) -> None:
+        """Initialize the module.
 
         Args:
-            in_channels (int): Number of input channels (C).
-            m1 (int): Number of modes to keep for the height dimension (u).
-            m2 (int): Number of modes to keep for the width dimension (v).
-            output_shape: (tuple(H,W)): shape of the reconstructed image
-            mlp_hidden_dim (int): Hidden dimension of the MLPs learning the bases.
-            mlp_num_layers (int): Number of hidden layers in the MLPs learning the bases.
+            in_channels: Number of input channels (C_in).
+            out_channels: Number of output channels (C_out); may differ from ``in_channels``.
+            m1: Number of modes kept for the height dimension (u).
+            m2: Number of modes kept for the width dimension (v).
+            mlp_hidden_dim: Hidden dimension of the MLPs learning the bases.
+            mlp_num_layers: Number of hidden layers in the MLPs learning the bases.
+            activation: Activation class used by the mixer and the basis MLPs.
+            norm: Channels-first normalization class applied after the channel mixer
+                (normalizes over C of the ``(B, C, H, W)`` layout), or ``None`` to disable.
+                Default ``LayerNorm2d``.
         """
         super().__init__()
 
@@ -2287,6 +2325,15 @@ class IAETBlock(nn.Module):
         self.m1 = m1  # Number of modes kept in height (u)
         self.m2 = m2  # Number of modes kept in width (v)
         self.coords_dim = 1 + in_channels
+
+        # Learnable exponent of the final integral-transform normalization.
+        # The inverse transform accumulates over the spatial domain, so the raw output
+        # magnitude grows with the resolution. The legacy hard factor ``1 / (H * W)``
+        # assumed a DFT-like (unit-energy) basis; the learned basis is *not* unit-energy,
+        # so that constant was inconsistent across resolutions. We instead normalize by
+        # ``(H * W) ** sigmoid(a)`` and let the model learn ``a``. Initialized so
+        # sigmoid(a) ~ 0.25 (same convention as SepLITBlock / SepNLITBlock).
+        self.IT_scale = nn.Parameter(torch.tensor(-1.1))
 
         # The bases are MLPs that generate the basis values.
         # These MLPs are the learnable parameters.
@@ -2324,12 +2371,25 @@ class IAETBlock(nn.Module):
         self.compressor_h_inv = nn.Linear(m1, 1)
         self.compressor_w_inv = nn.Linear(m2, 1)
 
-        # Learned parameters for multiplication in the transformed space (still per channel and mode).
+        # Spectral normalization (the official IAE-Net applies a LayerNorm "ln1" after the
+        # encoder's second transform). The raw Riemann sums grow with the resolution; without
+        # it, the data-conditioned decoder kernels below would be driven by magnitude instead
+        # of content at high resolutions. Complex-safe RMS over the channel dim (F.layer_norm
+        # does not support complex tensors); well behaved even for a single channel.
+        self.ln_freq = ComplexLayerNorm(-1)
+
+        # Learned parameters for multiplication in the transformed space (per channel and mode).
+        # Shape (out_channels, in_channels, m1, m2) to match the einsum "bixy,oixy->boxy"
+        # (output channel first, input channel second), consistent with SepLITBlock /
+        # SepNLITBlock. A prior (in, out, m1, m2) shape crashed when in != out and mixed
+        # the wrong channels otherwise.
         self.learned_weights_freq = nn.Parameter(
-            torch.randn(self.in_channels, out_channels, self.m1, self.m2, dtype=torch.cfloat)
+            torch.empty(out_channels, in_channels, self.m1, self.m2, dtype=torch.cfloat)
         )
-        # Initialization of learned_weights_freq
-        nn.init.constant_(self.learned_weights_freq, 1.0)  # Initialize to 1+0j
+        std = (1.0 / (in_channels + out_channels)) ** 0.5
+        with torch.no_grad():
+            self.learned_weights_freq.real.normal_(0, std)
+            self.learned_weights_freq.imag.normal_(0, std)
 
         self.mixer = nn.Conv2d(
             in_channels=out_channels,
@@ -2349,25 +2409,28 @@ class IAETBlock(nn.Module):
         # 1x1 Conv to potentially change input channels to output channels
         self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
-    def forward(self, x):
-        """
-        Performs the forward pass of the module
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Perform the forward pass of the module.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (B, C, H, W).
-                                H and W may vary.
+            x: Input tensor of shape ``(B, C_in, H, W)``; ``H`` and ``W`` may vary
+                (resolution invariance). Real or complex -- the block operates on the
+                real part (see the class docstring).
 
         Returns:
-            torch.Tensor: Output tensor of shape (B, C, H, W), real part.
+            Output tensor of shape ``(B, C_out, H, W)``, always real.
         """
         b, c, h, w = x.shape
-        # Convert input to complex if it is real
-        xc = torch.complex(x, torch.zeros_like(x)) if not x.is_complex() else x.float()
+        # The block operates on the real part of its input: a real tensor is embedded as a
+        # complex field with zero imaginary part; a complex tensor is reduced to its real
+        # part (the legacy ``x.float()`` discarded the imaginary part *and* crashed the first
+        # matmul against the complex bases). The shortcut uses the same real input.
+        x_real = x.real if x.is_complex() else x
+        xc = torch.complex(x_real, torch.zeros_like(x_real))
 
         # --- Encoder (Direct transform) ---
-        # 1. W (width) transformation
-        # We predict m2 kernels for each spatial coordinates
-        # Input MLP: (B, H, W, C+1)
+        # 1. W (width) transformation: m2 kernels predicted per spatial coordinate from
+        #    (real values at the point + x-coordinate). MLP input: (B, H, W, C+1)
         w_coords = torch.linspace(-1, 1, w, device=x.device).unsqueeze(-1).unsqueeze(0).unsqueeze(0).repeat(b, h, 1, 1)
         mlp_w_in = torch.concat([xc.real.permute(0, 2, 3, 1), w_coords], dim=-1)
         b_w = self.basis_w_fn(mlp_w_in)  # (B, H, W, m2)
@@ -2376,18 +2439,23 @@ class IAETBlock(nn.Module):
         x_w = torch.matmul(xc.permute(0, 2, 1, 3), b_w)
         x_w = x_w.permute(0, 2, 1, 3)  # (B, C, H, m2)
 
-        # 2. H (height) transformation
-        # Input MLP: (B, m2, H, C+1)
+        # 2. H (height) transformation: kernels conditioned on the values after the W pass.
+        #    MLP input: (B, m2, H, C+1)
         h_coords = (
             torch.linspace(-1, 1, h, device=x.device).unsqueeze(-1).unsqueeze(0).unsqueeze(0).repeat(b, self.m2, 1, 1)
         )
         mlp_h_in = torch.concat([x_w.real.permute(0, 3, 2, 1), h_coords], dim=-1)
-        # predict m1 kernels for eachcoordinates (m2, H)
+        # predict m1 kernels for each coordinate (m2, H)
         b_h = self.basis_h_fn(mlp_h_in)  # (B, m2, H, m1)
 
         # Matmul: (B, m2, C, H) @ (B, m2, H, m1) -> (B, m2, C, m1)
         x_hw = torch.matmul(x_w.permute(0, 3, 1, 2), b_h)
         x_hw = x_hw.permute(0, 2, 3, 1)  # (B, C, m1, m2)
+
+        # Spectral normalization (official IAE-Net "ln1"): keeps the spectral representation
+        # O(1) at every resolution so that the data-conditioned decoder kernels below are
+        # driven by content, not magnitude. RMS over the channel dim (complex-safe).
+        x_hw = self.ln_freq(x_hw.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)  # (B, C, m1, m2)
 
         # --- Frequency multiplication ---
         xf = torch.einsum("bixy,oixy->boxy", x_hw, self.learned_weights_freq)  # (B, C_out, m1, m2)
@@ -2447,16 +2515,18 @@ class IAETBlock(nn.Module):
         x_rec = torch.matmul(x_h_rec.permute(0, 2, 1, 3), b_w_inv.mH).real
         x_rec = x_rec.permute(0, 2, 1, 3)  # (B, C_out, h, w)
 
-        # Dynamic normalization (based on output resolution)
-        x_rec = x_rec * (1.0 / (h * w))
+        # Dynamic normalization: learnable exponent (see self.IT_scale) instead of a hard
+        # 1/(H*W), which over-suppressed the non unit-energy learned transform branch.
+        normalisation_factor = 1.0 / ((h * w) ** torch.sigmoid(self.IT_scale))
+        x_rec = x_rec * normalisation_factor
 
         # Mixing channels
         output = self.mixer(x_rec)
         output = self.norm(output) if self.norm is not None else output
         output = self.activation(output)
 
-        # Shortcut connection
-        output = self.activation(output + self.shortcut(x))
+        # Shortcut connection (real input, see above)
+        output = self.activation(output + self.shortcut(x_real))
 
         return output
 
