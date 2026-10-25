@@ -26,9 +26,6 @@ from .encoding import (
 )
 from .utils import print_stats
 
-# TODO: implement FNO block with  differential kernels (i.e. conv when the kernel is rescaled by 1/h and the mean is substracted)
-# It would allows to capture the high frequencies while keeping the resolution invariance, far better and more grounded than  the U-FNO! see neuralop for an implementation
-
 
 class StridedConvDownsamplingLayer(nn.Module):
     """Strided-convolution downsampling: reduce the spatial size by ``factor``.
@@ -433,222 +430,190 @@ class ConvNextv2Block(nn.Module):
 
 
 class FNOBlock(nn.Module):
-    """
-    A single block of a Fourier Neural Operator (FNO) with a residual connection.
+    """A single block of a Fourier Neural Operator (FNO).
 
+    The forward follows the ordering of the reference implementations
+    (neuralop, and Li et al. 2021)::
 
+        x -> [norm] -> spectral_conv -> [activation] -> pointwise (1x1) -> + shortcut
+
+    * ``spectral_conv`` -- one of the three supported spectral convolutions,
+      selected by ``spectral_layer_type``:
+
+      - ``"standard"``  -> :class:`SpectralConv2d` (full low-mode weight tensor).
+      - ``"separable"`` -> :class:`SeparableSpectralConv2d` (depthwise spectral
+        multiplication + linear channel mixing, the spectral analogue of a
+        depthwise-separable convolution).
+      - ``"tucker"``    -> :class:`TuckerSpectralConv2d` (Tucker factorization of
+        the weight tensor, requires ``ranks``).
+
+    * ``norm`` and ``activation`` are **optional** (pass ``None`` to disable).
+      The norm is applied as a pre-norm on the block input (sized for
+      ``in_channels``); the activation is applied exactly once, between the
+      spectral conv and the pointwise conv.
+    * ``shortcut`` -- a 1x1-conv residual (identity-like when
+      ``in_channels == out_channels``), added after the pointwise conv.
+
+    The spectral convolution is resolution-invariant: if the input grid is
+    smaller than the configured modes, the low-frequency subspace of the
+    learned weights is used (see :class:`SpectralConv2d`).
+
+    * ``local_conv`` -- an optional stack of :class:`FiniteDifferenceLayer`
+      (differential convolutions, NeuralOperator-style) added in parallel
+      with the shortcut. This captures local high-frequency information that
+      the global spectral branch (a structural low-pass) cannot represent,
+      while remaining resolution-invariant via the ``1/h`` rescaling.
     """
 
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
-        modes: tuple[int, int],
+        modes: Union[int, Sequence[int]],
         hidden_channels: Union[int, None] = None,
-        activation: Callable = nn.GELU,
+        activation: Union[Callable, None] = nn.GELU,
         normalization: Union[Callable, None] = LayerNorm2d,
         spectral_layer_type: str = "standard",
-        ranks: Union[tuple[int, int, int], np.ndarray, None] = None,
+        ranks: Union[Sequence[int], np.ndarray, None] = None,
         scaling: Union[int, float] = 1,
-        channel_last=False,
+        channel_last: bool = False,
+        local_conv: int = 0,
+        local_kernel_size: int = 3,
+        local_grid_width: float = 2.0,
     ):
         """
         Args:
             in_channels (int): Number of input channels for the block.
-            hidden_channels:Number of output channels for the SpectralConv
             out_channels (int): Number of output channels for the block.
-            modes (tuple): Tuple (modes_x, modes_y) for the spectral convolution.
-            spectral_layer_type (str): Type of spectral layer ('standard', 'separable' or 'tucker').
-            Separable is the equivalent of Separable Convolution (depthwise + channel mixing)
-            ranks (tuple, optional): Ranks (r1, r2, r3) for Tucker factorization, required if spectral_layer_type is 'tucker'.
-            A way to set (r1, r2, r3) is to fix a compression factor and to set
-            r1 = cin / k
-            r2 = cout / k
-            r3 = np.prod(modes) / k
-            For a k=2 the number of parameters is decreased by approx 5 times relatively to a standard SpectralConv
-            for k=4 it's 10 times, etc.
-            even with no compression, (k=1) the number of parameters is 2.5 times less
+            modes: Number of Fourier modes to retain in each dimension. An int is
+                broadcast to both dimensions; a 2-sequence is ``(modes_x, modes_y)``.
+            hidden_channels (int, optional): Width of the spectral-conv output.
+                Defaults to ``out_channels``. The pointwise conv then maps
+                ``hidden_channels -> out_channels``.
+            activation: Activation callable (e.g. ``nn.GELU``) or ``None`` to
+                disable. Applied once, between the spectral conv and the pointwise
+                conv.
+            normalization: Normalization callable (e.g. ``LayerNorm2d``) or
+                ``None`` to disable. Applied as a pre-norm on the block input.
+            spectral_layer_type (str): ``"standard"``, ``"separable"`` or
+                ``"tucker"``. See the class docstring.
+            ranks (tuple, optional): Ranks ``(r1, r2, r3)`` for the Tucker
+                factorization; **required** when ``spectral_layer_type="tucker"``.
+                A common choice with a compression factor ``k`` is
+                ``r1 = cin / k``, ``r2 = cout / k``, ``r3 = prod(modes) / k``;
+                ``k = 1`` (no compression) already uses ~2.5x fewer parameters
+                than the standard spectral conv.
+            scaling (int or float): Output spatial scaling factor (``> 1`` upsamples
+                via the inverse FFT; the shortcut is interpolated to match).
+            channel_last (bool): If True, expect/produce channels-last layout.
+            local_conv (int): Number of :class:`FiniteDifferenceLayer` layers
+                in the local high-frequency branch (``0`` = disabled, default).
+                The branch is added in parallel with the shortcut, operating on
+                the raw block input. Each layer is a differential convolution
+                (kernel centered + rescaled by ``1/h``), giving resolution
+                invariance and a high-pass character that complements the
+                global spectral branch.
+            local_kernel_size (int): Spatial kernel size for the local conv
+                layers (odd integer, default ``3``).
+            local_grid_width (float): Physical width of the domain for the
+                local conv layers (default ``2.0`` for ``[-1, 1]``). Used to
+                compute the grid spacing ``h = grid_width / (N - 1)``.
         """
-
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        if hidden_channels is None:
-            self.hidden_channels = out_channels
-        else:
-            self.hidden_channels = hidden_channels
-
+        self.hidden_channels = out_channels if hidden_channels is None else hidden_channels
+        if isinstance(modes, int):
+            modes = (modes, modes)
         self.modes = modes
         self.spectral_layer_type = spectral_layer_type
         self.ranks = ranks
         self.scaling = scaling
         self.channel_last = channel_last
 
-        # Core Spectral Convolution Layer
+        # Core spectral convolution (one of the three supported types)
+        common = dict(
+            in_channels=in_channels,
+            out_channels=self.hidden_channels,
+            modes=modes,
+            scaling=scaling,
+            channel_last=channel_last,
+        )
         if spectral_layer_type == "standard":
-            self.spectral_conv = SpectralConv2d(
-                in_channels, self.hidden_channels, modes, scaling=scaling, channel_last=channel_last
-            )
+            self.spectral_conv = SpectralConv2d(**common)
+        elif spectral_layer_type == "separable":
+            self.spectral_conv = SeparableSpectralConv2d(**common)
         elif spectral_layer_type == "tucker":
             if ranks is None:
-                raise ValueError("Ranks must be provided for TuckerSpectralConv2d.")
-            self.spectral_conv = TuckerSpectralConv2d(
-                in_channels, self.hidden_channels, modes, ranks, scaling=scaling, channel_last=channel_last
-            )
-        elif spectral_layer_type == "separable":
-            self.spectral_conv = SeparableSpectralConv2d(
-                in_channels, self.hidden_channels, modes, scaling=scaling, channel_last=channel_last
-            )
+                raise ValueError("ranks must be provided for spectral_layer_type='tucker'.")
+            self.spectral_conv = TuckerSpectralConv2d(ranks=ranks, **common)
         else:
-            raise ValueError(f"Unknown spectral_layer_type: {spectral_layer_type}. Choose 'standard' or 'tucker'.")
+            raise ValueError(
+                f"Unknown spectral_layer_type: {spectral_layer_type!r}. "
+                "Choose one of 'standard', 'separable', 'tucker'."
+            )
 
-        # Activation & normalization
-        self.activation = activation()
-        if normalization is not None:
-            self.norm = normalization(out_channels)
-        else:
-            self.norm = None
+        # Optional pre-norm (sized for in_channels, applied to the block input)
+        self.norm = normalization(in_channels) if normalization is not None else None
+        # Optional activation, applied exactly once (between spectral and pointwise)
+        self.activation = activation() if activation is not None else None
 
-        # mix channels
+        # Pointwise 1x1 channel mixing (spectral-conv output -> out_channels)
         self.linear = nn.Conv2d(self.hidden_channels, out_channels, kernel_size=1)
 
-        # Shortcut Branch Layer
-        # 1x1 Conv to potentially change input channels to output channels
+        # Residual shortcut (1x1 conv; identity-like when in_channels == out_channels)
         self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
+        # Optional local high-frequency branch (stack of FiniteDifferenceLayer)
+        self.local_conv_depth = local_conv
+        if local_conv > 0:
+            self.local_conv = nn.Sequential(
+                *[
+                    FiniteDifferenceLayer(
+                        in_channels=in_channels if i == 0 else out_channels,
+                        out_channels=out_channels,
+                        kernel_size=local_kernel_size,
+                        grid_width=local_grid_width,
+                    )
+                    for i in range(local_conv)
+                ]
+            )
+        else:
+            self.local_conv = None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (B, C_in, H, W) - spatial domain
-
-        # Shortcut branch
-        x_shortcut = self.shortcut(x)  # (B, out_channels, H, W)
-        if self.scaling != 1:
-            if self.channel_last:
-                x = x.permute(0, 3, 1, 2)
-            x_shortcut = F.interpolate(x_shortcut, scale_factor=self.scaling, mode="bilinear", align_corners=False)
-            if self.channel_last:
-                x = x.permute(0, 2, 3, 1)
-
-        # Main branch
-        if self.norm is not None:
-            x = self.norm(x)  # pre norm
-        x = self.spectral_conv(x)  # (B, hidden_channels, H, W)
-        x = self.activation(x)  # (B, hidden_channels, H, W)
-        x = self.linear(x)  # (B, out_channels, H, W)
-
-        if self.activation is not None:
-            x = self.activation(x)
-
-        return x + x_shortcut  # (B, out_channels, H, W)
-
-
-class FNOBlockv2(nn.Module):
-    """
-    Improved  Fourier Neural Operator (FNO) block with a double residual connection.
-
-    see
-    Multi-Grid Tensorized Fourier Neural Operator for High-Resolution PDEs,
-    Jean Kossaifi, Nikola Kovachki, Kamyar Azizzadenesheli, Anima Anandkumar
-    https://arxiv.org/abs/2310.00120
-
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        modes: tuple[int, int],
-        activation: Callable = nn.GELU,
-        normalization: Union[Callable, None] = LayerNorm2d,
-        spectral_layer_type: str = "standard",
-        mlp_layers=2,
-        ranks: Union[tuple[int, int, int], np.ndarray, None] = None,
-        scaling: Union[int, float] = 1,
-    ):
         """
         Args:
-            in_channels (int): Number of input channels for the block.
-            out_channels (int): Number of output channels for the block.
-            modes (tuple): Tuple (modes_x, modes_y) for the spectral convolution.
-            spectral_layer_type (str): Type of spectral layer ('standard' or 'tucker').
-            ranks (tuple, optional): Ranks (r1, r2, r3) for Tucker factorization, required if spectral_layer_type is 'tucker'.
-            A way to set (r1, r2, r3) is to fix a compression factor and to set
-            r1 = cin / k
-            r2 = cout / k
-            r3 = np.prod(modes) / k
-            For a k=2 the number of parameters is decreased by approx 5 times relatively to a standard SpectralConv
-            for k=4 it's 10 times, etc.
-            even with no compression, (k=1) the number of parameters is 2.5 times less
-            mlp_layers: number of linear layers after the SpectralConv (default 1)
+            x: Input of shape ``(B, C_in, H, W)`` (or channels-last when
+                ``channel_last=True``).
+
+        Returns:
+            torch.Tensor: Output of shape ``(B, C_out, H*scaling, W*scaling)``.
         """
-
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.modes = modes
-        self.spectral_layer_type = spectral_layer_type
-        self.ranks = ranks
-        self.scaling = scaling
-
-        # Core Spectral Convolution Layer
-        if spectral_layer_type == "standard":
-            self.spectral_conv = SpectralConv2d(in_channels, out_channels, modes, scaling=scaling)
-        elif spectral_layer_type == "tucker":
-            if ranks is None:
-                raise ValueError("Ranks must be provided for TuckerSpectralConv2d.")
-            self.spectral_conv = TuckerSpectralConv2d(in_channels, out_channels, modes, ranks, scaling=scaling)
-        else:
-            raise ValueError(f"Unknown spectral_layer_type: {spectral_layer_type}. Choose 'standard' or 'tucker'.")
-
-        # Activation & normalization
-        self.activation1 = activation()
-        self.norm1 = normalization(out_channels) if normalization is not None else None
-        self.activation2 = activation()
-        self.norm2 = normalization(out_channels) if normalization is not None else None
-
-        # mix channels with n mlp_layers of 1x1 conv.
-        # The hidden dimension is out_channels // 2
-        self.mlp = nn.ModuleList()
-        for i in range(mlp_layers):
-            if mlp_layers == 1:
-                self.mlp.append(nn.Conv2d(out_channels, out_channels, kernel_size=1))
-            else:
-                out_mlp = out_channels if i == mlp_layers - 1 else out_channels // 2
-                in_mlp = out_channels if i == 0 else out_channels // 2
-                self.mlp.append(nn.Conv2d(in_mlp, out_mlp, kernel_size=1))
-
-        # Shortcut Branch Layer
-        # 1x1 Conv to potentially change input channels to output channels
-        # If in_channels == out_channels, this acts as a trainable identity or scaling
-        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: (B, C_in, H, W) - spatial domain
 
-        # Shortcut branch computation
+        # Shortcut branch (residual)
         x_shortcut = self.shortcut(x)  # (B, out_channels, H, W)
         if self.scaling != 1:
+            # The spectral conv upsamples by `scaling`; match the shortcut to it.
             x_shortcut = F.interpolate(x_shortcut, scale_factor=self.scaling, mode="bilinear", align_corners=False)
 
-        x = self.spectral_conv(x)
+        # Local high-frequency branch (parallel to shortcut, operates on raw input)
+        if self.local_conv is not None:
+            x_local = self.local_conv(x)  # (B, out_channels, H, W)
+            if self.scaling != 1:
+                x_local = F.interpolate(x_local, scale_factor=self.scaling, mode="bilinear", align_corners=False)
+            x_shortcut = x_shortcut + x_local
 
-        if self.norm1 is not None:
-            x = self.norm1(x)
+        # Main branch: [norm] -> spectral_conv -> [activation] -> pointwise
+        if self.norm is not None:
+            x = self.norm(x)  # pre-norm on the block input
+        x = self.spectral_conv(x)  # (B, hidden_channels, H, W)
+        if self.activation is not None:
+            x = self.activation(x)  # optional activation, applied exactly once
+        x = self.linear(x)  # (B, out_channels, H, W)
 
-        x = x + x_shortcut
-
-        x = self.activation1(x)
-
-        for op in self.mlp:
-            x = op(x)
-
-        if self.norm2 is not None:
-            x = self.norm2(x)
-
-        x = x + x_shortcut
-
-        x = self.activation2(x)
-
-        return x
+        return x + x_shortcut  # (B, out_channels, H, W)
 
 
 class PixelShuffleUpsample(nn.Module):
@@ -776,197 +741,6 @@ class PatchEmbed(nn.Module):
     def forward_map(self, x: torch.Tensor) -> torch.Tensor:
         """Return the patch feature *map* ``(B, dim, H/p, W/p)`` (no flattening)."""
         return self.proj(x)
-
-
-class CoDABlock2D(nn.Module):
-    """Co-domain Attention Block (CODABlock) implement the transformer
-    architecture in the operator learning framework, as described in [1]_.
-    It is a simplified version of the implementation found in https://github.com/neuraloperator
-
-    We also use and equivariant mixing after the attention layer.
-    TODO: add BCs to the attention layer (how to do it?)
-
-    References
-    ----------
-    .. [1]: M. Rahman, R. George, M. Elleithy, D. Leibovici, Z. Li, B. Bonev,
-        C. White, J. Berner, R. Yeh, J. Kossaifi, K. Azizzadenesheli, A. Anandkumar (2024).
-        "Pretraining Codomain Attention Neural Operators for Solving Multiphysics PDEs."
-        arxiv:2403.12553
-    """
-
-    def __init__(
-        self,
-        modes: tuple[int, int],
-        token_dim: int,
-        attention_dim: int,
-        n_heads: int = 1,
-        activation: Callable = nn.GELU,
-        temperature: float = 1.0,
-        norm: Callable = partial(nn.InstanceNorm2d, affine=True),
-        spectral_compression_factor: Sequence = (1, 1, 1),
-        scaling: Union[float, int] = 1,
-    ):
-
-        super().__init__()
-
-        self.token_dim = token_dim
-        self.n_heads = n_heads
-        self.temperature = temperature
-        self.n_dim = 2  # only 2d spatial dimensions
-        self.ranks = [self.token_dim, n_heads * self.token_dim, np.prod(modes)]
-        self.ranks = tuple(np.ceil(np.divide(self.ranks, spectral_compression_factor)).astype(int))
-        self.attention_dim = attention_dim
-
-        self.Q = FNOBlock(
-            in_channels=self.token_dim,
-            hidden_channels=n_heads * self.attention_dim,
-            out_channels=n_heads * self.attention_dim,
-            modes=modes,
-            activation=activation,
-            spectral_layer_type="tucker",
-            ranks=self.ranks,
-            scaling=scaling,
-        )
-
-        self.V = FNOBlock(
-            in_channels=self.token_dim,
-            hidden_channels=n_heads * self.attention_dim,
-            out_channels=n_heads * self.attention_dim,
-            modes=modes,
-            activation=activation,
-            spectral_layer_type="tucker",
-            ranks=self.ranks,
-            scaling=scaling,
-        )
-
-        self.K = FNOBlock(
-            in_channels=self.token_dim,
-            hidden_channels=n_heads * self.attention_dim,
-            out_channels=n_heads * self.attention_dim,
-            modes=modes,
-            activation=activation,
-            spectral_layer_type="tucker",
-            ranks=self.ranks,
-            scaling=scaling,
-        )
-
-        # To project back each token from the n heads to token_dim
-
-        self.projection = FNOBlock(
-            in_channels=self.n_heads * self.attention_dim,
-            hidden_channels=self.token_dim,
-            out_channels=self.token_dim,
-            modes=modes,
-            activation=nn.Identity,
-            spectral_layer_type="tucker",
-            ranks=self.ranks,
-            scaling=1 / scaling,
-        )
-        mixer_ranks = [self.token_dim, self.token_dim, np.prod(modes)]
-        mixer_ranks = np.ceil(np.divide(mixer_ranks, spectral_compression_factor)).astype(int)
-
-        self.mixer = FNOBlock(
-            in_channels=self.token_dim,
-            hidden_channels=self.token_dim,
-            out_channels=self.token_dim,
-            modes=modes,
-            activation=activation,
-            spectral_layer_type="tucker",
-            ranks=mixer_ranks,
-        )
-        self.norm1 = norm(self.token_dim)
-        self.norm2 = norm(self.token_dim)
-        self.norm3 = norm(self.token_dim)
-
-    def MultiHeadAttention(self, tokens, batch_size):
-        """Compute multi-head Attention where each variable latent representation is a token
-
-        input tensor shape (b*t), d, h, w
-        The tensor is first transformed into k, q and v with shape (b*t),(n*d), h, w
-        where
-        b: batch size
-        t: number of tokens
-        n: number of heads
-        d: token dimension (the latent dimension of each variable)
-        h, w: spatial dimensions
-
-        Note taht when using per_channel attention, the token dimension is 1, so d=1
-
-        Then k, q and v are reshaped to b, n, t, (d h w)
-        as torch.matul multiplies the two last dimensions
-        Finally the output is reshaped to b, n, (t*d), h, w
-
-        """
-        # k, q, v (b*t, n*d, h, w)
-        k = self.K(tokens)
-        q = self.Q(tokens)
-        v = self.V(tokens)
-
-        spatial_shape = k.shape[-self.n_dim :]
-
-        assert k.size(1) % self.n_heads == 0, "Number of channels in k, q, and v should be divisible by number of heads"
-
-        # reshape from (b*t) (n*d) h w -> b n t (d*h*w ...)
-        t = k.size(0) // batch_size  # Compute the number of tokens `t` (each token is a variable here)
-        # n heads with token codimension `d` (in the case of per layer attention, d=1)
-        d = k.size(1) // self.n_heads
-
-        # reshape from (b*t) (n*d) h w ... to b n t d h w ...
-        k = k.view(batch_size, t, self.n_heads, d, *k.shape[-self.n_dim :])
-        q = q.view(batch_size, t, self.n_heads, d, *q.shape[-self.n_dim :])
-        v = v.view(batch_size, t, self.n_heads, d, *v.shape[-self.n_dim :])
-
-        k = torch.transpose(k, 1, 2)
-        q = torch.transpose(q, 1, 2)
-        v = torch.transpose(v, 1, 2)
-
-        # reshape to flatten the d, h and w dimensions
-        k = k.reshape(batch_size, self.n_heads, t, -1)
-        q = q.reshape(batch_size, self.n_heads, t, -1)
-        v = v.reshape(batch_size, self.n_heads, t, -1)
-
-        # print(q.shape, k.shape, v.shape)
-
-        # attention mechanism
-        dprod = torch.matmul(q, k.transpose(-1, -2)) / (np.sqrt(k.shape[-1]) * self.temperature)
-        dprod = F.softmax(dprod, dim=-1)
-
-        attention = torch.matmul(dprod, v)
-
-        # Reshape from (b, n, t, d * h * w) to (b, n, t, d, h, w, ...)
-        attention = attention.view(attention.size(0), attention.size(1), attention.size(2), d, *spatial_shape)
-        attention = torch.transpose(attention, 1, 2)  # b t n d h w
-        attention = attention.reshape(
-            attention.size(0) * attention.size(1), attention.size(2) * d, *spatial_shape
-        )  # (b * t) (n * d) h w
-
-        return attention
-
-    def forward(self, x):
-
-        # the input tensor must have a shape b (n_var * hidden_dim) h w
-        # if the token_dim is different than the hidden dim,  it means that each token does not represent the full latent embedding of a variable
-
-        batch_size = x.shape[0]
-        # spatial_shape = x.shape[-self.n_dim :]
-
-        assert x.shape[1] % self.token_dim == 0, "Number of channels in x should be divisible by token_codimension"
-
-        n_tokens = x.shape[1] // self.token_dim
-        # Reshape from shape b (t*d) h w ... to (b*t) d h w
-        x = x.view(x.size(0) * n_tokens, self.token_dim, *x.shape[-self.n_dim :])
-
-        attention = self.norm1(x)
-        attention = self.MultiHeadAttention(attention, batch_size)
-        attention = self.projection(attention)
-        attention = self.norm2(attention + x)  # shortcut
-        attention = self.mixer(attention)
-        attention = self.norm3(attention)
-
-        # reshape to b (n_var * hidden_var_dim // token_dim) h w
-        attention = attention.view(batch_size, n_tokens * attention.shape[1], *attention.shape[-self.n_dim :])
-
-        return attention
 
 
 class ComplexMLPBlock(nn.Module):
@@ -1563,137 +1337,6 @@ class SepNLITBlock(nn.Module):
         return output
 
 
-class ParametricITBlock(nn.Module):
-    """
-    ITBlock Module for Non-Linear or linear Integral Transform.
-
-    This module implements a non-linear integral transform that:
-        1. Generates learned basis functions K(u, v, x, y, f(x, y)) or K(u, v, x, y) based on input coordinates and values
-        2. Transforms the input to a 'spectral' representation via einsum operation
-        3. Multiply by learned weights in the transformed space
-        4. Applies inverse transform back to spatial domain using conjugate basis functions
-        5. Applies channel mixing, normalization, and activation
-        6. Adds shortcut connection with optional resampling
-
-        Parameters:
-        in_channels (int): Number of input channels.
-        out_channels (int): Number of output channels.
-        m1 (int): Number of modes in height dimension (u) in the basis
-        m2 (int): Number of modes in the width dimension (v) in the basis
-        activation (callable, optional): Activation function to use. Default is nn.GELU.
-        norm (callable, optional): Normalization layer to use. Default is AdaptiveLayerNorm.
-        dim (int, optional): Spatial dimensionality (default is 2 for 2d problems).
-
-    Forward Args:
-        x (torch.Tensor): Input tensor of shape (B, C, H, W), where H and W may vary.
-        basis (torch.Tensor): the kernels to perform the transformation
-
-    Forward Returns:
-        torch.Tensor: Output tensor of shape (B, out_channels, H, W) (real part)
-
-    """
-
-    def __init__(
-        self,
-        m1: int,
-        m2: int,
-        in_channels: int,
-        out_channels: int,
-        complex: bool = False,
-        activation: Callable = nn.GELU,
-        dim: int = 2,
-    ):
-
-        super().__init__()
-        self.m1 = m1
-        self.m2 = m2
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-
-        self.alpha = nn.Parameter(torch.ones(1, 1, 1, out_channels))
-
-        # Learned parameters for multiplication in the transformed space (per channel).
-        if complex:
-            # self.learned_weights = nn.Parameter(
-            #     torch.zeros(self.in_channels, out_channels, self.m1, self.m2, dtype=torch.cfloat)
-            # )
-            # std = (1.0 / (in_channels + out_channels)) ** 0.5
-            # with torch.no_grad():
-            #     self.learned_weights.real.normal_(0, std)
-            #     self.learned_weights.imag.normal_(0, std)
-
-            # channel wise multiplicaito
-            self.learned_weights_1 = nn.Parameter(torch.zeros(self.in_channels, self.m1, self.m2, dtype=torch.cfloat))
-            # mixing
-            self.learned_weights_2 = nn.Parameter(torch.zeros(self.in_channels, self.out_channels, dtype=torch.cfloat))
-
-            std = (1.0 / (in_channels + out_channels)) ** 0.5
-            with torch.no_grad():
-                self.learned_weights_1.real.normal_(0, std)
-                self.learned_weights_1.imag.normal_(0, std)
-                self.learned_weights_2.real.normal_(0, std)
-                self.learned_weights_2.imag.normal_(0, std)
-        else:
-            # self.learned_weights = nn.Parameter(torch.zeros(self.in_channels, out_channels, self.m1, self.m2))
-            # std = (2.0 / (in_channels + out_channels)) ** 0.5
-            # with torch.no_grad():
-            #     self.learned_weights.normal_(0, std)
-            # channel wise multiplicaito
-            self.learned_weights_1 = nn.Parameter(torch.zeros(self.in_channels, self.m1, self.m2))
-            # mixing
-            self.learned_weights_2 = nn.Parameter(torch.zeros(self.in_channels, self.out_channels))
-
-            std = (2.0 / (in_channels + out_channels)) ** 0.5
-            with torch.no_grad():
-                self.learned_weights_1.normal_(0, std)
-                self.learned_weights_2.normal_(0, std)
-
-        self.mixer = MLPBlock(out_channels, out_channels, hidden_dim=out_channels, num_layers=1, activation=activation)
-        self.norm = AdaptiveLayerNorm(out_channels, out_channels)
-
-    def forward(self, x: Tensor, fwd_basis: Tensor, time: Union[None, Tensor] = None):
-        """
-        Performs the forward pass of the module for variable resolution input.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, H, W, C).
-                                H and W may vary.
-            fwd_basis: basis for forward IT tranform
-            cond: contionning variable (e.g. time) passed to the norm layer
-
-        Returns:
-            torch.Tensor: Output tensor of shape (B, C, H_out, W_out), real part.
-        """
-        B, H, W, C = x.shape
-
-        # Convert input to complex numbers if it is real
-        if fwd_basis.is_complex():
-            xin = torch.complex(x, torch.zeros_like(x)) if not x.is_complex() else x
-        else:
-            xin = x
-
-        xhat = torch.einsum("bhwc,bhwmn->bmnc", xin, fwd_basis)  # "Spectral" representation
-
-        # Multiply by learned weigths in transformed space
-        # xhat = torch.einsum("bixy,oixy->boxy", xhat, self.learned_weights)
-        xhat = torch.einsum("bmni, imn -> bmni", xhat, self.learned_weights_1)
-        xhat = torch.einsum("bmni,oi->bmno", xhat, self.learned_weights_2)
-
-        if fwd_basis.is_complex():
-            x_rec = torch.einsum("bmnc,bhwmn->bhwc", xhat, fwd_basis.conj()).real
-        else:
-            x_rec = torch.einsum("bmnc,bhwmn->bhwc", xhat, fwd_basis)
-
-        x_rec = x_rec * self.alpha + x  # 1st shortcut
-        shortcut = x_rec
-        # Mixing channels
-        x_rec = self.norm(x_rec, time)
-        x_rec = self.mixer(x_rec)
-        x_rec = x_rec + shortcut  # 2nd shortcut"
-
-        return x_rec
-
-
 class LITBlock(nn.Module):
     """
     Learnable Intregral transform block for Non-Linear or linear Integral Transform.
@@ -1869,158 +1512,6 @@ class LITBlock(nn.Module):
         return x_rec
 
 
-class FNOLITBlock(nn.Module):
-    """
-    FNO  branch  + Learnable Intregral transform block
-
-    Forward Args:
-        x (torch.Tensor): Input tensor of shape (B, C, H, W), where H and W may vary.
-
-    Forward Returns:
-        torch.Tensor: Output tensor of shape (B, out_channels, H, W) (real part)
-
-    """
-
-    def __init__(
-        self,
-        in_channels,
-        m1,
-        m2,
-        mlp_hidden_dim=64,
-        mlp_num_layers=1,
-        separable="True",
-        activation=nn.GELU,
-        mlp_act=nn.GELU,
-        nonlinear=True,
-    ):
-
-        super().__init__()
-
-        self.in_channels = in_channels
-        self.m1 = m1  # Number of modes kept in height (u)
-        self.m2 = m2  # Number of modes kept in width (v)
-        self.nonlinear = nonlinear
-        self.separable = separable
-
-        self.IT_scale_forward = nn.Parameter(torch.empty(1))
-        self.IT_scale_inverse = nn.Parameter(torch.empty(1))
-        nn.init.constant_(self.IT_scale_forward, 1)
-        nn.init.constant_(self.IT_scale_inverse, 1)
-
-        self.pe = MLPBlock(
-            out_ch=self.m1 * self.m2,
-            in_ch=in_channels,
-            hidden_dim=mlp_hidden_dim,
-            num_layers=mlp_num_layers,
-            activation=mlp_act,
-        )
-
-        in_ch = in_channels + 2 if nonlinear else 2
-
-        self.generator = MLPBlock(
-            out_ch=self.m1 * self.m2,
-            in_ch=in_ch,
-            hidden_dim=mlp_hidden_dim,
-            num_layers=mlp_num_layers,
-            activation=mlp_act,
-        )
-
-        self.ortho_init_weights(self.generator)
-
-        # Learned parameters for multiplication in the transformed space (per channel).
-        # self.learned_weights = nn.Parameter(torch.zeros(self.in_channels, out_channels, self.m1, self.m2))
-        std = (1.0 / (in_channels)) ** 0.5
-        if self.separable:  # this is equivalent to a separable convolution
-            self.learned_weights_1 = nn.Parameter(torch.zeros(self.in_channels, self.m1, self.m2))
-            # mixing
-            self.learned_weights_2 = nn.Parameter(torch.zeros(self.in_channels, self.in_channels))
-            with torch.no_grad():
-                self.learned_weights_1.normal_(0, std)
-                self.learned_weights_2.normal_(0, std)
-        else:
-            self.learned_weights = nn.Parameter(torch.zeros(self.in_channels, in_channels, self.m1, self.m2))
-            with torch.no_grad():
-                self.learned_weights.normal_(0, std)
-
-        self.mixer = MLPBlock(in_channels, in_channels, num_layers=1, activation=activation)
-        self.in_norm = nn.RMSNorm(in_channels)
-
-    def ortho_init_weights(self, module):
-        with torch.no_grad():
-            if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
-                torch.nn.init.orthogonal_(module.weight)
-                if isinstance(module, torch.nn.Linear) and module.bias is not None:
-                    module.bias.data.zero_()
-
-    def _init_weights(self, module, std=0.02):
-        with torch.no_grad():
-            if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
-                nn.init.trunc_normal_(module.weight, std=std)
-                if isinstance(module, torch.nn.Linear) and module.bias is not None:
-                    module.bias.data.zero_()
-
-    def forward(self, x: Tensor, time: Union[None, Tensor] = None):
-        """
-        Performs the forward pass of the module for variable resolution input.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, H, W, C).
-
-        Returns:
-            torch.Tensor: Output tensor of shape (B, H, W, C)
-        """
-
-        shortcut = x
-
-        # Generate kernels
-        B, H, W, C = x.shape
-
-        h_coords = torch.linspace(-1, 1, H, device=x.device)
-        w_coords = torch.linspace(-1, 1, W, device=x.device)
-        grid_h, grid_w = torch.meshgrid(h_coords, w_coords, indexing="ij")
-
-        coords = torch.stack([grid_h, grid_w], dim=-1)  # [H, W, 2]
-        coords = coords.unsqueeze(0).expand(B, -1, -1, -1)
-        pe = self.pe(coords)
-
-        x = self.in_norm(x + pe, time)
-
-        if self.nonlinear:
-            basis_input = torch.cat([x, coords], dim=-1)
-        else:
-            basis_input = coords
-
-        # print(gamma.shape, beta.shape, x.shape, trunk.shape)
-        basis = self.generator(basis_input)
-
-        basis = basis.view(B, H, W, self.m1, self.m2) / (H * W)
-        # norm_factor = torch.sqrt(torch.mean(torch.abs(basis) ** 2, dim=(1, 2), keepdim=True))
-        # basis = basis / (norm_factor + 1e-6)
-
-        xhat = torch.einsum("bhwc,bhwmn->bcmn", x, basis) / (
-            (H * W) ** torch.sigmoid(self.IT_scale_forward)
-        )  # "Spectral" representation
-
-        # Multiply by learned weigths in transformed space
-        # xhat = torch.einsum("bixy,oixy->boxy", xhat, self.learned_weights)
-        if self.separable:
-            xhat = torch.einsum("bimn, imn -> bimn", xhat, self.learned_weights_1)
-            xhat = torch.einsum("bimn,oi->bomn", xhat, self.learned_weights_2)
-        else:
-            xhat = torch.einsum("bixy,oixy->boxy", xhat, self.learned_weights)
-
-        x_rec = torch.einsum("bcmn,bhwmn->bhwc", xhat, basis) / (
-            (self.m1 * self.m2) ** torch.sigmoid(self.IT_scale_inverse)
-        )
-        x_rec = x_rec * self.alpha + shortcut  # 1st shortcut
-        shortcut = x_rec
-        x_rec = self.out_norm(x_rec)
-        x_rec = self.mixer(x_rec)
-        x_rec = x_rec + shortcut  # 2nd shortcut
-
-        return x_rec
-
-
 class GalerkinTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -2098,16 +1589,15 @@ class TransformerBlock(nn.Module):
 
     - **additively**, by the caller (e.g. a ``PEBlock`` encoding added to the
       tokens before the block) -- the default behavior;
-    - **rotarily**, through the optional
-      :class:`~pynop.core.encoding.AdaptiveRoPE2D` (``rope=True``): the block
-      owns a 2-D rotary embedding applied to the query/key projections, driven
-      by the absolute 2-D coordinates passed at forward time (``coords``). It
-      is a no-op when no coordinates are passed.
+    - **rotarily**, through an optional
+      :class:`~pynop.core.encoding.AdaptiveRoPE2D` enabled with ``rope=True``:
+      the inner :class:`~pynop.core.ops.Attention` owns a 2-D rotary embedding
+      applied to the query/key projections, driven by the absolute 2-D
+      coordinates passed at forward time (``coords``). It is a no-op when no
+      coordinates are passed, or when ``rope`` is disabled.
 
-    An explicit ``rope`` module may also be injected per call; it takes
-    precedence over the block's own. This preserves the historical
-    ``RoPETransformerBlock`` call pattern (e.g. a 1-D temporal RoPE with time
-    coordinates).
+    The rotary embedding is defined at **initialization** time (``rope: bool``);
+    it is not injected per call.
 
     Args:
         dim: Model dimension.
@@ -2118,10 +1608,10 @@ class TransformerBlock(nn.Module):
         rmsnorm: If True use ``nn.RMSNorm`` (default), else ``nn.LayerNorm``.
         std_ini: Std of the truncated-normal init of the projections.
         scaling: Depth-scaled output-projection init (Megatron-LM style).
-        rope: If True, build an internal
+        rope: If True, the inner attention builds an
             :class:`~pynop.core.encoding.AdaptiveRoPE2D` (``dim // n_heads``
-            must then be divisible by 4) and apply it to q/k whenever ``coords``
-            is passed at forward time.
+            must then be divisible by 4) and applies it to q/k whenever
+            ``coords`` is passed at forward time.
         rope_kwargs: Extra keyword arguments forwarded to ``AdaptiveRoPE2D``
             (e.g. ``{"domain_size": 1.0, "base": 8.0}``).
     """
@@ -2147,12 +1637,8 @@ class TransformerBlock(nn.Module):
                 f"divisible by 4 for 2-D RoPE (dim={dim}, n_heads={n_heads})."
             )
 
-        # Attention layer assumed to handle its own input projection init
-        self.attention = Attention(dim, dim, n_heads, std_ini=std_ini)
-
-        # Optional 2-D rotary positional encoding (no-op when `coords` is not
-        # passed at forward time).
-        self.rope = AdaptiveRoPE2D(head_dim, **(rope_kwargs or {})) if rope else None
+        # Attention layer; owns the (optional) rotary positional embedding.
+        self.attention = Attention(dim, dim, n_heads, std_ini=std_ini, rope=rope, rope_kwargs=rope_kwargs)
 
         self.mlp = nn.Sequential(
             nn.Linear(dim, mlp_dim),
@@ -2172,6 +1658,15 @@ class TransformerBlock(nn.Module):
 
         self._init_weights(std_ini)
 
+    @property
+    def rope(self) -> Optional["nn.Module"]:
+        """The inner attention's rotary embedding (``None`` when ``rope=False``).
+
+        Kept as a convenience alias so the rotary module can be inspected at
+        ``block.rope`` even though it is owned by :attr:`attention`.
+        """
+        return self.attention.rope
+
     def _init_weights(self, std_ini: float):
         """Standardized normal initialization across layers."""
         with torch.no_grad():
@@ -2190,37 +1685,28 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         coords: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
-        rope: Optional[nn.Module] = None,
         causal_attn: bool = False,
     ) -> torch.Tensor:
         """Forward pass (clean pre-LN residual stream).
 
         Args:
-            x: Token sequence of shape [B, N, C].
-            coords: Optional 2-D coordinates for the block's rotary embedding,
-                shape [B, N, 2] or [B, H, W, 2] (the latter disambiguates
-                non-square grids). Ignored when no RoPE is active.
-            mask: Optional additive attention mask for ``scaled_dot_product_attention``.
-            rope: Optional explicit rotary-embedding module to inject (takes
-                precedence over the block's own ``rope``); e.g. a 1-D temporal
-                RoPE. Ignored when ``coords`` is None.
+            x: Token sequence of shape ``[B, N, C]``.
+            coords: Optional 2-D coordinates for the rotary embedding,
+                shape ``[B, N, 2]`` or ``[B, H, W, 2]`` (the latter disambiguates
+                non-square grids). Ignored when ``rope`` is disabled.
+            mask: Optional additive attention mask for
+                ``scaled_dot_product_attention``.
             causal_attn: If True, use causal (autoregressive) attention.
 
         Returns:
-            Tensor of shape [B, N, C].
+            Tensor of shape ``[B, N, C]``.
         """
-        # An explicitly injected `rope` takes precedence over the block's own
-        # (historical RoPETransformerBlock behavior, e.g. 1-D temporal RoPE).
-        # `Attention` applies the rotation only when both a rope module and
-        # `coords` are provided.
         x_norm = self.norm1(x)
-        effective_rope = rope if rope is not None else self.rope
         x = x + self.attention(
             Q=x_norm,
             K=x_norm,
             V=x_norm,
             mask=mask,
-            rope=effective_rope,
             coords=coords,
             causal_attn=causal_attn,
         )
