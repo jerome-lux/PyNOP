@@ -23,13 +23,14 @@ itérative, sur la branche `dev`.
 | **LatentGalerkin** | `pynop/models/LNO.py` | ✅ Analysé + bugs corrigés (PE, RoPE, activation) + **branche locale** ajoutée (voir §7) |
 | **ITLNO** | `pynop/models/LNO.py` | ✅ Analysé + bugs corrigés (voir §6) + **branche locale** ajoutée (voir §7) |
 | **LatentTransolver** | `pynop/models/LNO.py` | ✅ Vérifié (Transolver3 correct) + nettoyage + **branche locale** ajoutée (voir §7) |
-| **FNO** | `pynop/models/FNO.py` | ⏳ À analyser |
+| **FNO** | `pynop/models/FNO.py` | ✅ Analysé + bugs corrigés (crash forward, Tucker, invariance rés.) ; bloc aligné sur la référence + **branche locale** `FiniteDifferenceLayer` (voir §14) |
 | **Transolver** | `pynop/models/transolver.py` | ⏳ À analyser |
 | **ITNet** | `pynop/models/ITNet.py` | ⏳ À analyser |
 | **UNet** (classique) | `pynop/models/unet.py` | ✅ Réécrit : U-Net classique (non-NO) validé — 4 blocs acceptés, PatchEmbed option, bottleneck transformer (PE **ou** RoPE) (voir §8) |
 | **Resnet** (classique) | `pynop/models/resnet.py` | ✅ Unifiée : `block_type="basic"`/`"bottleneck"` + `bottleneck_ratio` + `se` ; `Resnetb` supprimé ; `resnet18`/`34`/`50`/`resnext50` fonctionnent (voir §11) |
 | **Blocs communs** | `pynop/core/blocks.py`, `pynop/core/ops.py` | Blocs Swin déplacés ici ; **`TransformerBlock` unifié** avec option RoPE (`AdaptiveRoPE2D`) (voir §9) |
 | **Blocs IT** | `pynop/core/blocks.py` | ✅ `SepLITBlock`/`SepNLITBlock`/`LITBlock` vérifiés — 3 bugs corrigés : norm channels-first, sur-normalisation `1/(H·W)` → échelle apprenable, shape du mixage de canaux (voir §12) |
+| **Training (Lightning)** | `pynop/training/lightning_model.py` | ✅ Réécrit : `predict_derivative` (sortie dérivée **ou** absolue), derivative-loss configurable, base unique `MultiStepLightningBase` (plumbing + rollout), compat. tous les modèles du dépôt (UNet/UNO/LNO/FNO/SWIN/Transolver/DeepONet/Galerkin), `DeepONetModel` dédié ; wrappers AE/`CausalNO` supprimés (non utilisés) (voir §15) |
 
 ---
 
@@ -261,11 +262,8 @@ Norm inter-couches : `LayerNorm2d` (channel-first compatible). Activation : `mlp
 Vérifié : forward + backward OK pour tous les configs (0/1/2/3 convs, filtres custom,
 kernel 3/5, avec/sans condition).
 
-> ⚠️ **Installation** : `pynop` est installé **non-editable** dans `site-packages` (copie
-> **obsolète**). Les modifications dans l'arborescence source ne sont vues que si on lance
-> depuis le répertoire PyNOP (CWD/notebook) — sinon la copie `site-packages` est importée.
-> Pour que les fixes soient toujours effectifs : `pip install -e .` (recommandé) ou
-> `pip install .` pour resynchroniser.
+> ✅ **Installation** : `pynop` est installé **en mode éditable** (`pip install -e .`) —
+> les modifications dans l'arborescence source sont vues immédiatement, sans resynchronisation.
 
 ### 8. UNet classique (`pynop/models/unet.py`) — réécriture + bug corrigé dans les blocs
 
@@ -315,8 +313,7 @@ pour `UNO` (voir §13).
   `norm="bn"` string). → **Supprimé** et remplacé par `Resnet` unifiée (`block_type=
   "bottleneck"`), voir §11.
 
-> ⚠️ `pynop` est installé non-editable (copie obsolète) : lancer depuis PyNOP ou `pip install -e .`.
-> `tests/conftest.py` insère la racine du repo dans `sys.path` pour contourner le problème.
+> ✅ `pynop` est installé en mode éditable (`pip install -e .`) — les modifications source sont vues immédiatement.
 
 ### 9. `TransformerBlock` unifié + option RoPE (`core/blocks.py`, `core/encoding.py`, `models/unet.py`)
 
@@ -460,7 +457,7 @@ dans `tests/test_lit_blocks.py`) : forward+backward + aucun param mort pour les 
 (ratio 0.1–10), `IT_scale` apprenable et effectif, invariance de résolution. Smoke
 `in=4/out=12/m1=6/m2=8` → OK, aucun param mort.
 
-> ⚠️ `pynop` est installé non-editable (copie obsolète) : lancer depuis PyNOP ou `pip install -e .`.
+> ✅ `pynop` est installé en mode éditable (`pip install -e .`) — les modifications source sont vues immédiatement.
 
 ### 13. UNO — U-Net Neural Operator (`pynop/models/UNO.py`)
 
@@ -518,34 +515,216 @@ backward (aucun param mort), invariance de résolution (32/64/128), conditionnem
 stages globaux (`None`), validation spatial size. Smoke : `SwinNO` et consommateurs
 des blocs partagés → OK.
 
-> ⚠️ `pynop` est installé non-editable (copie obsolète) : lancer depuis PyNOP ou `pip install -e .`.
+> ✅ `pynop` est installé en mode éditable (`pip install -e .`) — les modifications source sont vues immédiatement.
+
+---
+
+### 14. FNO — blocs spectraux + modèle (`pynop/core/ops.py`, `pynop/core/blocks.py`, `pynop/models/FNO.py`)
+
+**Contexte** : vérification des blocs FNO (les 3 convolutions spectrales + `FNOBlock` +
+modèle `FNO`). Objectif : rendre l'ordre des opérations du bloc cohérent avec les dépôts
+de référence (neuralop / Li et al. 2021), tout en gardant la normalisation et
+l'activation optionnelles et le choix parmi les **3** convolutions spectrales
+(`standard`, `separable`, `tucker`).
+
+**Bugs bloquants corrigés** :
+1. **`FNO.forward` crashait à 100 %** — `AttributeError: 'FNO' object has no attribute
+   'trainable_pos_encoding'` : le paramètre `trainable_pos_encoding` (et
+   `pos_embedding_weights`) avait été retiré de `__init__` lors du cleanup §12 alors que
+   le docstring et le `forward` (et le notebook `examples.ipynb`) y faisaient toujours
+   référence. Fix : paramètres restaurés (`trainable_pos_encoding`,
+   `trainable_pos_encoding_modes`, `trainable_pos_encoding_dims`) + PE spectral
+   apprenable re-câblée (resampelée à la résolution d'entrée via `irfftn`).
+2. **Tucker + `spectral_compression_factor=None` crashait au build** —
+   `TypeError: unsupported operand for /: 'int' and 'NoneType'` (la ligne
+   `ranks = (1,1,1)` était morte, immédiatement écrasée). Fix : `None` ⇒ pas de
+   compression (facteur `1`), i.e. rangs = `(cin, cout, prod(modes))`.
+3. **Clamping de modes qui corrompait l'état** (les 3 convolutions spectrales) — quand
+   l'entrée était plus petite que les modes configurés, le `forward` **mutait**
+   `self.modes_x/modes_y` (→ warning à chaque appel + module cassé pour *toutes* les
+   entrées suivantes) et crashait l'`einsum` (shape des poids fixée à l'init). Fix :
+   modes effectifs = `min(configuré, disponible)` appliqués à **l'entrée et aux
+   poids** (sous-espace basse fréquence) — aucune mutation d'état, **invariance de
+   résolution** (vérifié : même instance, entrée 8×8 puis 32×32 OK).
+
+**Bugs/design corrigés** :
+4. **Double activation de `FNOBlock`** — l'activation était appliquée 2× (garde morte
+   `if self.activation is not None:` autour d'une 2ᵉ application). Fix : bloc aligné sur
+   la référence — `[norm] → spectral_conv → [activation] → pointwise(1×1) → + shortcut`
+   — avec **norm** et **activation optionnelles** (`None` pour désactiver). L'activation
+   est appliquée **exactement une fois** (entre la conv spectrale et le pointwise).
+5. **Fallback silencieux du registre** — `REGISTERED_FNO.get(name, FNOBlock)`
+   construisait un `FNOBlock` pour n'importe quelle chaîne (ex. `"UFNO"` du notebook).
+   Fix : `ValueError` explicite listant les types valides (`FNO`).
+6. **API incohérente** — `modes` int, `hidden_channels` int et `blocks` scalaire
+   désormais acceptés (broadcast propre) ; `block_kwargs` n'est plus une default
+   mutable ; `dt` conservé (réservé, inutilisé) pour compatibilité d'API.
+
+**Choix de design** :
+- Les 3 convolutions spectrales restent disponibles et interchangeables via
+  `spectral_layer_type` dans `FNOBlock` **et** le modèle `FNO`.
+- `spectral_compression_factor` n'a d'effet que pour `tucker` (ignore pour
+  `standard`/`separable`) ; `int` ou séquence de 3.
+- `FNOBlockv2` (variante double-résidu, Kossaifi et al.) **supprimée** — retirée de
+  `blocks.py`, `FNO.py` (import + registre + docstring), et `tests/test_fno.py`.
+
+**Branche locale high-frequency (`local_conv`)** — nouveau paramètre de `FNOBlock`
+et du modèle `FNO` :
+- `local_conv: int = 0` — nombre de `FiniteDifferenceLayer` dans la branche locale
+  (0 = désactivé). La branche est ajoutée **en parallèle du shortcut**, opérant sur
+  l'entrée brute du bloc : `output = main_branch + shortcut(x) + local_branch(x)`.
+- `local_kernel_size: int = 3` — taille du noyau (impair).
+- `local_grid_width: float = 2.0` — largeur du domaine physique (pour `h = W/(N-1)`).
+- Motivation : la branche spectrale est un **passe-bas structurel** (modes bas only) ;
+  la conv différentielle (`K_diff = (K - mean(K)) / h`) est un **passe-haut**
+  resolution-invariant (NeuralOperator-style, Liu-Schiaffini et al. ICML 2024).
+  Ensemble, elles couvrent le spectre complet.
+- Implémentation : `nn.Sequential` de `FiniteDifferenceLayer` (in→out pour la 1ʳᵉ,
+  out→out pour les suivantes). Gradients vérifiés sur chaque couche.
+- Vérifié : `local_conv` 0/1/2/3, `in≠out`, kernel 3/5, invariance de résolution,
+  gradient flow, parallélisme au shortcut (zeroing change l'output).
+
+**Vérifié** (env. conda `pytorch`) : `pytest tests/` → **140/140 OK** (dont **41
+tests** dans `tests/test_fno.py`) : les 3 convolutions (entrée < et > modes, sans
+mutation d'état, gradients), `FNOBlock` (3 types spectraux, int modes, norm/activation
+optionnelles, `hidden_channels`, invariance de résolution, tucker sans ranks rejeté,
+type spectral inconnu rejeté, ordre de référence, **branche locale** 0/1/2/3 convs,
+`in≠out`, kernel 3/5, gradient flow, parallélisme shortcut), modèle `FNO` (forward
+sans crash, PE apprenable + gradient, PE fixe off, tucker `None`/`2`, separable,
+entrées scalaires, **local_conv 0/1/2**, `cond`, bloc inconnu rejeté, invariance de
+résolution, grille non-carrée, longueurs incohérentes rejetées). Tous sans paramètre mort.
+
+> ✅ `pynop` est installé en mode éditable (`pip install -e .`) — les modifications source sont vues immédiatement.
+
+### 15. `lightning_model` — réécriture (`pynop/training/lightning_model.py`, `pynop/core/loss.py`)
+
+**Contexte** : le fichier de travail était **tronqué** (55 lignes au lieu de 1188, coupé au
+milieu d'une docstring — une réécriture partielle avait perdu le reste). L'objectif de la
+session : (1) pouvoir préciser si la sortie du réseau est la **prédiction absolue** ou la
+**dérivée**, (2) vérifier `derivative_loss_fn` par défaut, (3) clarifier le code,
+(4) vérifier la compatibilité avec l'ensemble des modèles du dépôt, (5) décider, en cas
+d'incompatibilité, de modifier le modèle ou de créer un nouveau lightning model.
+
+**1. `predict_derivative` (dérivée vs absolue)** — nouveau champ `TrainingConfig`
+(défaut `True` = comportement d'origine) :
+- `True` : `out = du/dt` → `preds = u_t + dt·out`.
+- `False` : `out = u_{t+dt}` → `preds = out`. La perte dérivée (si active) est alors
+  évaluée sur la **dérivée implicite** `(preds − u_t)/dt` — restant un régulariseur
+  cohérent dans les deux modes.
+- Implémenté une seule fois dans `MultiStepLightningBase._rollout`, partagé par
+  `MultiStepNOModel` et `DeepONetModel`.
+
+**2. `derivative_loss_fn` par défaut — vérifié + rendu configurable** :
+- Défaut conservé : `NormalizedTimeDerivativeMSE` (nMSE de la dérivée prédite vs
+  dérivée finie `(target − previous)/dt`, par canal, invariant d'échelle) — le choix
+  est sound. Nettoyé : docstring, paramètre `input` → `previous` (shadowing builtin).
+- Rendu **configurable** : `TrainingConfig.derivative_loss_fn` (`None` → défaut) et
+  `derivative_loss_weight = 0.0` **désactive** la perte (plus du tout calculée).
+- **Cohérence train/val corrigée** : la perte dérivée était calculée seulement à
+  l'entraînement ; elle l'est désormais dans les deux boucles (`val_nMSEdt`).
+- **RMSE unifié** : la validation utilisait « moyenne des RMSE par sample »,
+  l'entraînement « RMSE global » — le même RMSE global est désormais utilisé partout
+  (cohérent avec la note du notebook : moyenne sur spatial/canal/batch).
+
+**3. Clarté** :
+- `configure_optimizers` était **duplicé 4×** → une seule implémentation dans la
+  classe de base (avec `forward`, `_unpack_batch`, normalisation `loss_fn`/`loss_weights`).
+- **Fusion des deux classes de base** (`BaseLightningNOModel` — plumbing — et
+  `MultiStepLightningBase` — rollout) en une seule `MultiStepLightningBase` : après la
+  suppression des wrappers autoencodeur/causal (non utilisés) tous les modules
+  Lightning du dépôt sont des wrappers multi-step, donc la base contient à la fois le
+  plumbing (modèle, optimizer, config, losses, introspection de signature,
+  `configure_optimizers`) **et** la machine multi-step (rollout
+  teacher-forcing/AR, curriculum, bruit, BPTT-truncation, logging). Les sous-classes
+  (`MultiStepNOModel`, `DeepONetModel`) n'implémentent plus que `_forward_window`.
+- **Wrappers supprimés** (non utilisés) : `CausalNOModel`,
+  `AutoEncoderModel`/`AutoEncoderModelv2` (+ `AETrainingConfig`). La famille
+  SpatioTemporal (`backup.py`) n'est plus couverte par un wrapper Lightning — à
+  recréer si besoin.
+- **Bugs corrigés** :
+  - `default_scheduler_config` utilisait la clé `"name"` alors que
+    `configure_optimizers` pop `"scheduler"` → `KeyError` à l'usage. Fix : clé
+    `"scheduler"` + classe réelle + `monitor="avg_loss"`.
+  - L'extraction des clés Lightning (`monitor`/`interval`/…) était faite **après** la
+    construction du scheduler → `TypeError: ReduceLROnPlateau got unexpected kwarg
+    'monitor'`. Fix : pop **avant** construction (comportement d'origine restauré).
+  - `TrainingConfig.save`/`to_json_dict` intelligents (sér. des loss en noms de
+    classe) — perdus dans la version tronquée, restaurés (le notebook appelle
+    `train_config.save(...)`).
+- Validation : `n_slices > 0`, `detach_grad_steps >= 0`, `dt > 0`.
+
+**4. Compatibilité avec l'ensemble des modèles** (détection par introspection de
+`model.forward` ; les mots-clés optionnels ne sont passés **que si acceptés**) :
+
+| Modèle | signature | Verdict |
+|---|---|---|
+| FNO, LatentNO, LatentGalerkin, ITLNO, LatentTransolver, SwinNO, MultiscaleSWINNO, UNO, Transolver | `(x, cond=None)` | ✅ `MultiStepNOModel` |
+| UNet, Resnet, ConvNext | `(x)` | ✅ `MultiStepNOModel` (cond non passé ; **erreur explicite** si le batch en fournit) |
+| GalerkinTransformer | `(x, time, residual)` | ✅ `MultiStepNOModel` — `time` passé en `(B,1)` (contrat du modèle), `residual=True` = sortie **absolue** → `predict_derivative=False` |
+| **DeepONet** | `(u, y)` — paradigme branch/trunk | ✅ **nouveau `DeepONetModel`** (voir §5) |
+| Famille SpatioTemporal (backup.py) | `(x, time, history, ...)` | ⛔ non couvert (wrapper `CausalNO` supprimé, non utilisé) |
+
+**5. Décision « modifier le modèle ou nouveau lightning model » — DeepONet** :
+`DeepONet.forward(u, y)` est un paradigme différent (opérateur sur fonction : branch =
+valeurs de la fonction, trunk = coordonnées de requête) → **nouvelle classe
+`DeepONetModel`** (les modèles ne sont pas modifiés). Mapping :
+- branch input = la fenêtre **aplatie** en vecteur fonction `(B, n·C·H·W)`
+  (`branchnet[0] = n·C·H·W`) — le layout par-point `(B, H·W, n·C)` **cassait l'einsum**
+  de DeepONet (`"ji, ki...->kj..."` exige dim-1 du branch = largeur du trunk),
+- trunk input = coordonnées de la grille de sortie `(H·W, 2)` (2-D, sans batch, sinon
+  l' MLP du trunk porte un batch et casse l'einsum),
+- sortie `(B, H·W)` (ou `(B·H·W, C)` si decoder) → reshape `(B, 1, H, W)`.
+`MultiStepNOModel` **refuse** un DeepONet avec un message pointant vers `DeepONetModel`.
+
+**Vérifié** (env. conda `pytorch`) : `pytest tests/` → **213/213 OK** (dont **32**
+dans `tests/test_lightning_model.py`) : FNO (2 modes + cond + gradients), SwinNO, UNet,
+Resnet, GalerkinTransformer (time), UNO, Transolver, LatentNO, DeepONet (2 modes +
+mapping branch/trunk + rejet cond), rejet DeepONet dans `MultiStepNOModel`,
+formule `predict_derivative` (dérivée/absolue), derivative-loss (défaut / weight 0 /
+custom), curriculum AR + feedback AR + bruit, optimizer/scheduler
+(`default_scheduler_config` non muté, `ReduceLROnPlateau`), abstraction
+`MultiStepLightningBase` (`_forward_window` non implémenté → `NotImplementedError`),
+`fit()` end-to-end avec `pl.Trainer`, exports top-level.
+
+> ✅ `pynop` est installé en mode éditable (`pip install -e .`) — les modifications source sont vues immédiatement.
 
 ---
 
 ## Prochaines étapes (session suivante)
 1. [x] **ITLNO** (`pynop/models/LNO.py`) : corriger le bug bloquant `kernel_mixing`
-       (accédé sans exister quand `linear_kernel=True`) → `AttributeError` avec les défauts. ✅ Fait
+      (accédé sans exister quand `linear_kernel=True`) → `AttributeError` avec les défauts. ✅ Fait
 2. [ ] **ITLNO — normalisation principielle** (optionnel) : orthonormaliser la base
-       (`Newton_Schulz`/QR dans `core/utils.py`) pour une projection orthogonale propre,
-       au lieu de l'échelle apprenable ad hoc. À discuter.
+      (`Newton_Schulz`/QR dans `core/utils.py`) pour une projection orthogonale propre,
+      au lieu de l'échelle apprenable ad hoc. À discuter.
 3. [ ] **ITLNO/LatentGalerkin — hautes fréquences** (optionnel) : ajouter une **branche locale**
-       autour du goulot (conv 3×3 + skip, ou noyau différentiel NeuralOp-style). C'est le vrai
-       remède au passe-bas global.
+      autour du goulot (conv 3×3 + skip, ou noyau différentiel NeuralOp-style). C'est le vrai
+      remède au passe-bas global.
 4. [ ] **LNO** : obtenir le script/config d'entraînement exact → identifier et corriger le
-       point de stagnation (candidats : loss relatif, grad clipping, LR+warmup, scheduler).
-5. [ ] **FNO** (`pynop/models/FNO.py`) : analyser, vérifier l'implémentation, trouver les bugs.
+      point de stagnation (candidats : loss relatif, grad clipping, LR+warmup, scheduler).
+5. [x] **FNO** (`pynop/models/FNO.py`) : analysé + bugs corrigés — crash forward
+        (`trainable_pos_encoding`), crash Tucker `factor=None`, clamping de modes qui
+        corrompait l'état du module, double activation du bloc, fallback silencieux du
+        registre ; bloc aligné sur la référence (neuralop / Li et al. 2021) avec norm +
+        activation optionnelles et les 3 convolutions spectrales ; **branche locale**
+        `FiniteDifferenceLayer` (passe-haut resolution-invariant) ajoutée en parallèle
+        du shortcut ; `FNOBlockv2` supprimée (voir §14). ✅ Fait
 6. [ ] **Transolver** (`pynop/models/transolver.py`) : idem.
 7. [ ] **ITNet** (`pynop/models/ITNet.py`) : idem.
 8. [x] **UNet** (`pynop/models/unet.py`) : version classique réécrite + 4 blocs vérifiés. ✅ Fait
 9. [x] **UNO** (`pynop/models/UNO.py`) : version *neural operator* du U-Net — U-Net
-       multi-échelle avec skips first-class, fusion `"add"`/`"concat"`, bottleneck
-       transformer global, invariance de résolution (voir §13). ✅ Fait
- 10. [ ] Vérifier les autres classes de `pynop/core/blocks.py` et `pynop/core/ops.py`.
- 11. [x] **`Resnetb`** (`models/resnet.py`) : **supprimé** — `Resnet` unifiée avec
-        `block_type="basic"/"bottleneck"` + `bottleneck_ratio` + `se` (voir §11). ✅ Fait
- 12. [x] **Blocs IT** (`pynop/core/blocks.py`) : `SepLITBlock`/`SepNLITBlock`/`LITBlock`
-        vérifiés — 3 bugs corrigés (norm channels-first, sur-normalisation → échelle
-        apprenable, shape du mixage de canaux `SepNLITBlock`). ✅ Fait (voir §12)
+      multi-échelle avec skips first-class, fusion `"add"`/`"concat"`, bottleneck
+      transformer global, invariance de résolution (voir §13). ✅ Fait
+10. [ ] Vérifier les autres classes de `pynop/core/blocks.py` et `pynop/core/ops.py`.
+11. [x] **`Resnetb`** (`models/resnet.py`) : **supprimé** — `Resnet` unifiée avec
+       `block_type="basic"/"bottleneck"` + `bottleneck_ratio` + `se` (voir §11). ✅ Fait
+12. [x] **Blocs IT** (`pynop/core/blocks.py`) : `SepLITBlock`/`SepNLITBlock`/`LITBlock`
+       vérifiés — 3 bugs corrigés (norm channels-first, sur-normalisation → échelle
+       apprenable, shape du mixage de canaux `SepNLITBlock`). ✅ Fait (voir §12)
+13. [x] **`lightning_model`** (`pynop/training/lightning_model.py`) : réécrit —
+        `predict_derivative` (sortie dérivée ou absolue), `derivative_loss_fn`
+        configurable + vérifié, base unique `MultiStepLightningBase` (plumbing +
+        rollout), wrappers AE/`CausalNO` supprimés (non utilisés), compatibilité tous
+        les modèles du dépôt, `DeepONetModel` dédié. ✅ Fait (voir §15)
 
 ## Conventions
 - Environnement : conda `pytorch` (Python 3.12, Linux).
