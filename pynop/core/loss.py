@@ -168,17 +168,29 @@ class DWMSELoss(nn.Module):
 
 
 class NormalizedTimeDerivativeMSE(nn.Module):
+    """Normalized MSE between a predicted time derivative and the ground-truth one.
+
+    The ground-truth derivative is the finite-difference one
+    ``(target - previous) / dt``. The error is computed per channel and
+    normalized by the energy of the ground-truth derivative, so the loss is
+    invariant to the amplitude scale of the field.
+
+    All tensors must be channels-first ``(B, C, H, W, ...)``.
+    """
 
     def __init__(self, eps=1e-8):
         super().__init__()
         self.eps = eps
 
-    def forward(self, pred, target, input, dt):
-        # input MUSt be B, C, H, W, ...
-        # pred is the time derivative prediction
-
+    def forward(self, pred, target, previous, dt):
+        """Args:
+            pred: predicted derivative ``du/dt``, shape ``(B, C, H, W, ...)``.
+            target: field at ``t + dt``.
+            previous: field at ``t``.
+            dt: time step size.
+        """
         spatial_dims = tuple(range(2, pred.ndim))
-        gt_derivative = (target - input) / dt
+        gt_derivative = (target - previous) / dt
 
         # per channel - MSE
         mse_per_channel = torch.mean((pred - gt_derivative) ** 2, dim=spatial_dims)
@@ -460,11 +472,6 @@ def preprocess_to_sigreg(latent):
     # Permute from [B, M, C] to [M, B, C]
     # Axe -3 inside SIGReg will point to B
     return latent_norm.permute(1, 0, 2)
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 
 class SIGReg(nn.Module):
