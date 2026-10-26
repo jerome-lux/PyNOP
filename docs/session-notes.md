@@ -908,16 +908,32 @@ l'identique les paramètres des notebooks (`/run/media/jlux/SSD2/pyNOP`) — pr�
 t∈[0,50] / stride 2 / lr 2e-4 / 300 époques / AR 2→10 sur [0,200], fulltraining 400 sims / tout t /
 stride 4 / lr 1e-4 / 100 époques / AR fixe 10.
 
- ### 19. `eval.py` — driver d'évaluation CLI + métriques de champ (`pynop/training/eval.py`, `pynop/training/metrics.py`, `tests/test_eval_cli.py`)
+ ### 19. `eval.py` — driver d'évaluation CLI : rollout autorégressif **trajectoire complète** + métriques de champ (`pynop/training/eval.py`, `pynop/training/metrics.py`, `tests/test_eval_cli.py`)
 
 **Contexte** : demande utilisateur — un module compagnon de `train.py` (§18) qui charge un
-checkpoint entraîné et évalue sur des **échantillons non utilisés pendant l'entraînement**, avec
-des métriques par bande spectrale (style PDEBench), MSE/nMSE et autres. Point de vigilance soulevé :
-la pertinence de la normalisation du nMSE quand le dataset est recentré à moyenne nulle → arbitrage
-documenté ci-dessous.
+checkpoint entraîné et évalue sur des **trajectoires non utilisées pendant l'entraînement**.
+Précision importante apportée par l'utilisateur (oct. 2026) : le protocole d'évaluation doit être le
+**rollout autorégressif de la trajectoire complète**, à l'identique des cellules `## Multi-step model eval`
+des notebooks PDEBench (`/run/media/jlux/SSD2/pyNOP/training_*_PDEBench.ipynb`) : pour chaque simulation,
+le modèle reçoit les `input_steps` premiers snapshots et prédit **tous** les pas suivants jusqu'à la fin de
+la trajectoire (fenêtre glissante sur ses propres prédictions) ; les erreurs sont moyennées sur toutes les
+trajectoires et tracées en fonction du pas de temps. La première version (évaluation par fenêtres stride,
+`window_size = max_AR_steps + input_steps + 1`) a été **remplacée** par ce protocole.
+
+**Protocole d'évaluation** :
+- Pour chaque simulation du split : chargement de la trajectoire complète sur `[min_id, max_id]` de la
+  phase (cropping + `(x + shift) * scale`, espace modèle), rollout AR via `_rollout(training=False)` —
+  1ʳᵉ prédiction teacher-forcée sur la fenêtre ground truth, toutes les suivantes autorégressives
+  (identique au notebook ; le notebook s'arrête un frame avant la fin, ici on prédit **jusqu'au dernier**).
+- `S = T_avail − input_steps` prédictions par trajectoire ; l'index de pas k (0-based) cible le frame
+  absolu `t = min_id + input_steps + k` pour toutes les trajectoires → la courbe par pas est poolée sur
+  **l'axe temps absolu** (les traj. de longueurs différentes contribuent simplement moins de pas).
+- Batchs : les IDs sont groupés par longueur égale puis chunkés en `batch_size` (`_group_by_length`) —
+  mémoire O(batch × T) seulement, car chaque prédiction est consommée immédiatement via le callback
+  `_rollout(on_step=...)` (mémoire constante, pas de stockage des champs).
 
 **Choix des métriques** (`pynop/training/metrics.py`) — toutes calculées sur les champs en
-**espace modèle** (après `(x + shift) * scale` du dataset), tenseurs channels-first `(..., C, H, W)` :
+**espace modèle**, tenseurs channels-first `(..., C, H, W)` :
 - **nRMSE = relative L2** (le « normalized RMSE » de PDEBench, `pdebench/models/metrics.py::metric_func`) :
   par échantillon ET canal `‖pred − target‖₂ / ‖target‖₂` (normes sur les dims spatiales), moyenné.
   **Invariante d'échelle** ; pour des champs normalisés à moyenne nulle `(x−μ)/σ`, le dénominateur est
@@ -934,54 +950,69 @@ documenté ci-dessous.
   invariante d'échelle) ; mode absolu (énergie brute, plus proche de l'erreur Fourier raw de PDEBench) via
   `relative_spectral=False`. ⚠️ Les bornes sont des indices de coquille **dépendants de la résolution**
   (comme chez PDEBench), pas des fréquences physiques.
-- **`FieldMetricAccumulator`** : accumulation incrémentale par batch (mémoire constante) avec
-  **pooling exact** sur toutes les unités (fenêtre, pas[, canal]) — jamais une moyenne de moyennes ;
-  courbe **par pas AR** (RMSE + nRMSE à chaque index de pas, poolés entre batches) = le diagnostic clé de
-  croissance d'erreur du rollout. `compute_field_metrics` = wrapper one-shot équivalent.
+- **`FieldMetricAccumulator`** : accumulation incrémentale (mémoire constante) avec **pooling exact** sur
+  toutes les unités — jamais une moyenne de moyennes ; courbe **par pas AR** maintenant complète : RMSE,
+  MAE, R² et nRMSE à chaque index de pas (+ bandes spectrales par pas si `track_per_step_spectral=True`,
+  défaut ON côté eval — coût quasi nul car les FFT sont déjà calculées pour le pooling global). Deux API :
+  `update(preds_list, targets_list)` (liste complète des pas d'un batch) et **`update_per_step(p, t, step)`**
+  (un pas à la fois avec index explicite — utilisé par l'eval via `on_step`, indispensable pour ne pas
+  tout pooler au pas 0). `compute_field_metrics` = wrapper one-shot équivalent.
 
 **Driver CLI** (`pynop/training/eval.py`) :
 ```bash
 python -m pynop.training.eval MODEL_CONFIG.json TRAINING_CONFIG.json --checkpoint PATH \
     [--split val|test] [--n-test N] [--pretrain] [--device auto|cuda|cpu] \
-    [--batch-size B] [--max-windows W] [--output-dir DIR]
+    [--batch-size B] [--max-sims S] [--no-plots] [--output-dir DIR]
 ```
-- Mêmes configs que l'entraînement ; la section de phase fournit le protocole de fenêtres (stride,
-  plage t, `window_size = max_AR_steps + input_steps + 1`) — identique à celui de l'entraînement.
-- **Sélection du jeu d'évaluation** (`select_eval_ids`) :
+- Mêmes configs que l'entraînement ; la section de phase fournit la **plage temporelle** (`min_id`/`max_id`).
+  `--max-windows` (protocole fenêtres) remplacé par `--max-sims` (cap sur le nombre de trajectoires).
+- **Sélection du jeu d'évaluation** (`select_eval_ids`, inchangée) :
   - `--split val` (défaut) : le split validation du protocole — disjoint de l'entraînement par construction.
     Si un `run_info.json` (§18) est trouvé à côté du checkpoint, ses `train_ids`/`val_ids` stockés sont la
     **source de vérité** (robuste au drift de config après entraînement).
   - `--split test` : les premières `n_test` IDs du **pool inutilisé** — IDs jamais dans aucune phase
     (au-delà de `n_samples` dans l'ordre du shuffle seedé, même protocole RNG que `train.py`). Repli sur le
-    split val (avec warning) si le pool est vide (toutes les sims du fichier ont été consommées).
-  - Garde-fou : tout chevauchement eval/train lève une `RuntimeError`.
-- **Inférence** : wrapper Lightning sans optimizer (`optimizer` rendu optionnel dans
-  `MultiStepLightningBase.__init__`), `TrainingConfig` d'inférence (losses désactivées → liste vide,
-  bruit 0, BPTT off, `predict_derivative`/`dt`/normalisation temporelle repris de `shared_params`).
-  Rollout **AR complet** via `_rollout(..., training=False, store_fields=True)` — nouveau flag qui
-  collecte les prédictions/cibles détachées par pas (liste `(B, C, H, W)`) sans rien changer au chemin
-  d'entraînement. `DeepONetModel` vs `MultiStepNOModel` choisi via `_is_deeponet`.
-- **Sortie** : table formatée sur stdout + `eval_results_<split>.json` (à côté du checkpoint ou
-  `--output-dir`) auto-contenu : toutes les métriques scalaires, bandes spectrales, courbe par pas AR,
-  bookkeeping complet (checkpoint, phase, split effectif, source des IDs, IDs évalués + train_ids en audit).
+    split val (avec warning) si le pool est vide. Garde-fou : chevauchement eval/train → `RuntimeError`.
+- **Inférence** : wrapper Lightning sans optimizer (`optimizer` optionnel dans
+  `MultiStepLightningBase.__init__`), `TrainingConfig` d'inférence (losses désactivées, bruit 0, BPTT off,
+  `predict_derivative`/`dt`/normalisation temporelle repris de `shared_params`). Nouveau callback
+  `_rollout(on_step=...)` : chaque prédiction détachée `(B, C, H, W)` est remise au callback immédiatement
+  (l'eval l'accumule via `update_per_step`) — pas de liste de champs en mémoire sur les longs rollouts.
+  `DeepONetModel` vs `MultiStepNOModel` choisi via `_is_deeponet`. Trajectoires trop courtes
+  (`T_avail ≤ input_steps`) : warning + skip.
+- **Sortie** (à côté du checkpoint ou `--output-dir`) :
+  - table formatée sur stdout (métriques scalaires, bandes spectrales, résumé condensé de la courbe par pas
+    — first/min/max/last avec le temps absolu) ;
+  - `eval_results_<split>.json` auto-contenu : métriques scalaires, **courbes complètes par pas**
+    (`step`, `time`, rmse/mae/r2/nrmse + bandes spectrales), bookkeeping (checkpoint, phase, split effectif,
+    source des IDs, IDs évalués + train_ids en audit, longueurs de trajectoires, total prédictions) ;
+  - **graphiques** (`plot_error_evolution`, labels **en anglais**, matplotlib Agg) :
+    `eval_error_evolution_<split>.png` (grille 2×2 : RMSE / nRMSE / MAE en échelle log + R², vs time step)
+    et `eval_spectral_evolution_<split>.png` (erreur spectrale par bande radiale vs time step, log).
 - Section optionnelle `"eval"` de TrainingConfig : `spectral_bands` (défaut PDEBench),
-  `spectral_relative` (défaut true), `n_test` (taille du split test).
+  `spectral_relative` (défaut true), **`per_step_spectral`** (défaut true — bandes par pas pour les plots),
+  `n_test` (taille du split test).
 
 **Bugs corrigés en route** :
-1. `radial_frequency_grid` initialement en **cycles/échantillon** (`fftfreq`) → les bornes de bandes
-   PDEBench (4, 12) n'avaient plus le même sens ; remplacé par l'**index de bin FFT** (coquilles de
-   PDEBench), docstrings alignés.
-2. `r_squared` initialement centrée globalement → refaite **par (échantillon, canal)** avec centrage
-   spatial uniquement (même unité que le nRMSE ; identité `R² = 1 − nRMSE²` vérifiée numériquement).
-3. `pynop/training/__init__.py` : import mort `from .callbacks import *` supprimé (module retiré au §15) ;
-   `from .eval import *` ajouté.
+1. `radial_frequency_grid` initialement en **cycles/échantillon** (`fftfreq`) → remplacé par l'**index de bin
+   FFT** (coquilles de PDEBench), docstrings alignés.
+2. `r_squared` initialement centrée globalement → refaite **par (échantillon, canal)** avec centrage spatial
+   uniquement (identité `R² = 1 − nRMSE²` vérifiée numériquement).
+3. `pynop/training/__init__.py` : import mort `from .callbacks import *` supprimé ; `from .eval import *` ajouté.
+4. **Écrasement de l'index par pas** (refonte trajectoire complète) : appeler `update([p],[t])` une fois par
+   pas poolait tout au pas 0 (l'index s est la position dans la liste passée) → ajout de `update_per_step(p, t, step)`
+   avec index explicite + compteur par batch côté eval.
+5. **Sous-comptage des prédictions en batch** : `_rollout` renvoie `num_predictions` **par trajectoire**
+   (le compteur s'incrémente une fois par pas de boucle, pas par élément du batch) → `total_predictions += n × B`.
 
 **Vérifié** (env. conda `pytorch`) :
-- `pytest tests/` → **282/282 OK**, dont 20 nouveaux (`tests/test_eval_cli.py`) : invariances des
-  métriques (nRMSE d'échelle, R² affine, bandes spectrales relatives), identité par unité
-  `R² = 1 − nRMSE²` sur données à moyenne nulle, propriétés du grid radial (forme, symétrie fft, rayon max),
-  équivalence one-shot ≡ accumulation incrémentale (pooling exact) + courbe par pas ; sélection des splits
-  (config / `run_info.json` / repli test→val / pool inutilisé / split inconnu) ; dataloader d'évaluation
-  (protocole de fenêtres, shapes, cap `max_windows`) ; et **3 runs end-to-end CPU** sur HDF5 synthétique :
-  1 époque de prétraining → évaluation du split val (IDs pris dans le `run_info.json` du run), du split test
-  (disjoint de train ET val) et via l'entrée CLI `main()`.
+- `pytest tests/` → **286/286 OK**, dont 24 dans `tests/test_eval_cli.py` : invariances des métriques,
+  identité par unité `R² = 1 − nRMSE²`, grid radial, pooling exact one-shot ≡ incrémental, courbe par pas
+  (rmse/mae/r2/nrmse + bandes spectrales via `update_per_step`), sélection des splits, chargement de
+  trajectoires (cropping `[min_id, max_id]`, normalisation `(x+shift)*scale`, groupage par longueur/batchs),
+  génération des figures (contenu non vide vérifié) et **3 runs end-to-end CPU** sur HDF5 synthétique :
+  1 époque de prétraining → évaluation du split val (IDs du `run_info.json`), du split test (disjoint de train
+  ET val, 2 traj. en un batch) et via l'entrée CLI `main()` — courbe par pas de longueur `T − input_steps`,
+  mapping temps absolu vérifié, PNG écrits.
+- Validation multi-chunks dédiée : 2 trajectoires × 38 pas avec `batch_size=1` (2 chunks) → pooling par pas
+  correct entre chunks ; identité globale `RMSE = sqrt(mean_k(RMSE_k²))` et `nRMSE = mean_k(nRMSE_k)` vérifiées.

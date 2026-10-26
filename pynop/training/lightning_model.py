@@ -418,7 +418,7 @@ class MultiStepLightningBase(pl.LightningModule):
             time = time.unsqueeze(-1)
         return time
 
-    def _rollout(self, inputs, time_idx, cond, training: bool, store_fields: bool = False) -> dict:
+    def _rollout(self, inputs, time_idx, cond, training: bool, store_fields: bool = False, on_step=None) -> dict:
         """Run the teacher-forcing / AR rollout over the time axis.
 
         Args:
@@ -432,6 +432,11 @@ class MultiStepLightningBase(pl.LightningModule):
                 predictions and targets (lists of ``(B, C, H, W)`` in step
                 order) under ``"preds"`` / ``"targets"`` — used by the
                 evaluation driver to compute field-level metrics.
+            on_step: Optional callback ``on_step(preds, targets)`` invoked with
+                the detached ``(B, C, H, W)`` pair after every prediction step.
+                Lets a caller consume each step immediately (e.g. an incremental
+                metric accumulator) without keeping all fields in memory —
+                preferred over ``store_fields`` for long rollouts.
 
         Returns:
             Dict with the accumulated (unnormalized) losses, the RMSE, the
@@ -486,9 +491,14 @@ class MultiStepLightningBase(pl.LightningModule):
 
             targets_t = inputs[:, t + 1, ...]
 
-            if store_fields:
-                stored_preds.append(preds.detach())
-                stored_targets.append(targets_t.detach())
+            if store_fields or on_step is not None:
+                p_det = preds.detach()
+                t_det = targets_t.detach()
+                if store_fields:
+                    stored_preds.append(p_det)
+                    stored_targets.append(t_det)
+                if on_step is not None:
+                    on_step(p_det, t_det)
 
             # ------------------------------------------------------------------ losses
             step_loss, step_indiv = self._weighted_losses(preds, targets_t, weighting)

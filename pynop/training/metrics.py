@@ -41,8 +41,10 @@ Metric definitions
 
 :class:`FieldMetricAccumulator` accumulates these metrics incrementally over a
 dataloader of rollout predictions (constant memory), and also tracks the
-per-AR-step RMSE / nRMSE curve — the error growth along the autoregressive
-unroll, which is the key diagnostic for multi-step models.
+per-AR-step RMSE / MAE / R² / nRMSE curve — the error growth along the
+autoregressive unroll, which is the key diagnostic for multi-step models. With
+``track_per_step_spectral=True`` it additionally pools the per-band spectral
+error at every step (for plotting the frequency-dependent error growth).
 """
 
 from typing import Optional, Sequence, Tuple
@@ -294,6 +296,10 @@ class FieldMetricAccumulator:
         eps: Numerical guard for the relative metrics.
         relative_spectral: If True report relative spectral band errors
             (scale-free), otherwise absolute band energies.
+        track_per_step_spectral: If True also pool the per-band spectral error
+            at every AR step index (adds one FFT pair per step — used by the
+            evaluation driver to plot the spectral error growth along a
+            trajectory).
     """
 
     def __init__(
@@ -301,10 +307,12 @@ class FieldMetricAccumulator:
         spectral_bands: Sequence[Tuple[float, Optional[float]]] = ((0.0, 4.0), (4.0, 12.0), (12.0, None)),
         eps: float = 1e-8,
         relative_spectral: bool = True,
+        track_per_step_spectral: bool = False,
     ):
         self.spectral_bands = tuple((float(a), None if b is None else float(b)) for a, b in spectral_bands)
         self.eps = float(eps)
         self.relative_spectral = bool(relative_spectral)
+        self.track_per_step_spectral = bool(track_per_step_spectral)
         self.band_labels = [_band_label(a, b) for a, b in self.spectral_bands]
         self.reset()
 
@@ -321,20 +329,31 @@ class FieldMetricAccumulator:
         self.n_r2 = 0
         self.spectral_sums = {label: 0.0 for label in self.band_labels}
         self.spectral_counts = {label: 0 for label in self.band_labels}
-        # Per AR-step index: pooled squared error / element count, and the
-        # relative-L2 sum / unit count (per sample-channel ratios).
+        # Per AR-step index: pooled squared error / element count, absolute
+        # error sum (MAE), R² sum / unit count and relative-L2 sum / unit
+        # count (per sample-channel ratios).
         self._step_err2_sum: dict = {}
         self._step_elem_count: dict = {}
+        self._step_abserr_sum: dict = {}
+        self._step_r2_sum: dict = {}
+        self._step_r2_count: dict = {}
         self._step_rel_l2_sum: dict = {}
         self._step_rel_l2_count: dict = {}
+        if self.track_per_step_spectral:
+            self._step_spectral_sums: dict = {label: {} for label in self.band_labels}
+            self._step_spectral_counts: dict = {label: {} for label in self.band_labels}
 
-    def update(self, preds: Sequence[torch.Tensor], targets: Sequence[torch.Tensor]):
+    def update(self, preds: Sequence[torch.Tensor], targets: Sequence[torch.Tensor], count_windows: bool = True):
         """Accumulate one batch of rollout predictions.
 
         Args:
             preds: List (length S) of per-step prediction tensors
                 ``(B, C, H, W)``, in AR-step order.
             targets: Matching list of ground-truth tensors.
+            count_windows: If True add the batch size to the window counter
+                (one window per batch element). Pass False when calling once
+                *per step* of a long rollout — the caller then tracks the
+                trajectory/window bookkeeping itself.
 
         Raises:
             ValueError: If the two lists have different lengths or a step pair
@@ -343,49 +362,83 @@ class FieldMetricAccumulator:
         if len(preds) != len(targets):
             raise ValueError(f"preds/targets length mismatch: {len(preds)} vs {len(targets)}.")
 
-        if preds:
+        if preds and count_windows:
             self.n_windows += preds[0].shape[0]  # one window per batch element
 
         for s, (p, t) in enumerate(zip(preds, targets)):
-            if p.shape != t.shape:
-                raise ValueError(f"Step {s}: shape mismatch {tuple(p.shape)} vs {tuple(t.shape)}.")
-            err = p - t
+            self._accumulate_step(s, p, t)
 
-            # --- pooled pointwise metrics -----------------------------------
-            self.n_elements += err.numel()
-            self.sum_err2 += float(err.pow(2).sum())
-            self.sum_abserr += float(err.abs().sum())
-            self.max_abserr = max(self.max_abserr, float(err.abs().max()))
+    def update_per_step(self, preds: torch.Tensor, targets: torch.Tensor, step: int):
+        """Accumulate a single rollout step at an explicit step index.
 
-            # --- relative metrics (per sample / channel units) ---------------
-            p4 = _to_samples(p)  # (B, C, H, W)
-            t4 = _to_samples(t)
-            rel_l2 = _l2_over_spatial(p4 - t4) / (_l2_over_spatial(t4) + self.eps)  # (B, C)
-            self.sum_rel_l2 += float(rel_l2.sum())
-            self.n_rel_l2 += rel_l2.numel()
+        Companion to :meth:`update` for long rollouts where the caller consumes
+        each prediction immediately (e.g. through
+        ``MultiStepLightningBase._rollout(on_step=...)``) instead of collecting
+        all fields: call this once per step with the running step counter, so
+        the per-step curve is pooled at the correct index across batches.
 
-            # R² per (sample, channel), centered over the spatial dims only —
-            # same unit as rel_l2 above.
-            ss_res = ((p4 - t4).reshape(p4.shape[0], p4.shape[1], -1)).pow(2).sum(dim=-1)  # (B, C)
-            centered = t4 - t4.mean(dim=(-2, -1), keepdim=True)
-            r2 = 1.0 - ss_res / (centered.reshape(p4.shape[0], p4.shape[1], -1).pow(2).sum(dim=-1) + self.eps)
-            self.sum_r2 += float(r2.sum())
-            self.n_r2 += r2.numel()
+        Args:
+            preds: Prediction tensor ``(B, C, H, W)`` for one rollout step.
+            targets: Matching ground-truth tensor.
+            step: 0-based AR-step index of this prediction (relative to the
+                start of each trajectory's rollout).
 
-            # --- spectral bands ----------------------------------------------
-            # band_vals[label] is the mean over all (sample, channel) units of
-            # this step; multiply back to keep an exactly pooled sum.
-            band_vals = spectral_band_error(p, t, self.spectral_bands, eps=self.eps, relative=self.relative_spectral)
-            n_units = p4.shape[0] * p4.shape[1]
+        Raises:
+            ValueError: If the shapes do not match.
+        """
+        self._accumulate_step(int(step), preds, targets)
+
+    def _accumulate_step(self, s: int, p: torch.Tensor, t: torch.Tensor):
+        """Pool one (step index, prediction, target) triple into all accumulators."""
+        if p.shape != t.shape:
+            raise ValueError(f"Step {s}: shape mismatch {tuple(p.shape)} vs {tuple(t.shape)}.")
+        err = p - t
+
+        # --- pooled pointwise metrics -----------------------------------
+        self.n_elements += err.numel()
+        self.sum_err2 += float(err.pow(2).sum())
+        self.sum_abserr += float(err.abs().sum())
+        self.max_abserr = max(self.max_abserr, float(err.abs().max()))
+
+        # --- relative metrics (per sample / channel units) ---------------
+        p4 = _to_samples(p)  # (B, C, H, W)
+        t4 = _to_samples(t)
+        rel_l2 = _l2_over_spatial(p4 - t4) / (_l2_over_spatial(t4) + self.eps)  # (B, C)
+        self.sum_rel_l2 += float(rel_l2.sum())
+        self.n_rel_l2 += rel_l2.numel()
+
+        # R² per (sample, channel), centered over the spatial dims only —
+        # same unit as rel_l2 above.
+        ss_res = ((p4 - t4).reshape(p4.shape[0], p4.shape[1], -1)).pow(2).sum(dim=-1)  # (B, C)
+        centered = t4 - t4.mean(dim=(-2, -1), keepdim=True)
+        r2 = 1.0 - ss_res / (centered.reshape(p4.shape[0], p4.shape[1], -1).pow(2).sum(dim=-1) + self.eps)
+        self.sum_r2 += float(r2.sum())
+        self.n_r2 += r2.numel()
+
+        # --- spectral bands ----------------------------------------------
+        # band_vals[label] is the mean over all (sample, channel) units of
+        # this step; multiply back to keep an exactly pooled sum.
+        band_vals = spectral_band_error(p, t, self.spectral_bands, eps=self.eps, relative=self.relative_spectral)
+        n_units = p4.shape[0] * p4.shape[1]
+        for label in self.band_labels:
+            self.spectral_sums[label] += float(band_vals[label]) * n_units
+            self.spectral_counts[label] += n_units
+
+        # --- per-step curve ------------------------------------------------
+        self._step_err2_sum[s] = self._step_err2_sum.get(s, 0.0) + float(err.pow(2).sum())
+        self._step_elem_count[s] = self._step_elem_count.get(s, 0) + err.numel()
+        self._step_abserr_sum[s] = self._step_abserr_sum.get(s, 0.0) + float(err.abs().sum())
+        self._step_r2_sum[s] = self._step_r2_sum.get(s, 0.0) + float(r2.sum())
+        self._step_r2_count[s] = self._step_r2_count.get(s, 0) + r2.numel()
+        self._step_rel_l2_sum[s] = self._step_rel_l2_sum.get(s, 0.0) + float(rel_l2.sum())
+        self._step_rel_l2_count[s] = self._step_rel_l2_count.get(s, 0) + rel_l2.numel()
+
+        if self.track_per_step_spectral:
             for label in self.band_labels:
-                self.spectral_sums[label] += float(band_vals[label]) * n_units
-                self.spectral_counts[label] += n_units
-
-            # --- per-step curve ------------------------------------------------
-            self._step_err2_sum[s] = self._step_err2_sum.get(s, 0.0) + float(err.pow(2).sum())
-            self._step_elem_count[s] = self._step_elem_count.get(s, 0) + err.numel()
-            self._step_rel_l2_sum[s] = self._step_rel_l2_sum.get(s, 0.0) + float(rel_l2.sum())
-            self._step_rel_l2_count[s] = self._step_rel_l2_count.get(s, 0) + rel_l2.numel()
+                self._step_spectral_sums[label][s] = (
+                    self._step_spectral_sums[label].get(s, 0.0) + float(band_vals[label]) * n_units
+                )
+                self._step_spectral_counts[label][s] = self._step_spectral_counts[label].get(s, 0) + n_units
 
     def compute(self) -> dict:
         """Return the pooled metrics as a JSON-serializable dict.
@@ -394,11 +447,29 @@ class FieldMetricAccumulator:
             Dict with scalar entries ``mse``, ``rmse``, ``nrmse`` (relative L2),
             ``mae``, ``max_abs_error``, ``r2``, a nested ``spectral_bands`` dict,
             the bookkeeping ``n_windows_evaluated`` / ``n_steps`` and the
-            per-AR-step curve ``per_step`` (list of ``{"step", "rmse", "nrmse"}``
-            with 1-based step indices). Empty accumulators yield zeros.
+            per-AR-step curve ``per_step`` — a list of entries with 1-based step
+            indices carrying ``rmse``, ``mae``, ``r2`` and ``nrmse`` (and, when
+            :attr:`track_per_step_spectral` is set, a nested ``spectral_bands``
+            dict per step). Empty accumulators yield zeros.
         """
         n = self.n_elements
         mse = self.sum_err2 / n if n else 0.0
+
+        def _step_entry(s: int) -> dict:
+            entry = {
+                "step": s + 1,
+                "rmse": float(torch.sqrt(torch.tensor(self._step_err2_sum[s] / self._step_elem_count[s]))),
+                "mae": self._step_abserr_sum[s] / self._step_elem_count[s],
+                "r2": self._step_r2_sum[s] / self._step_r2_count[s],
+                "nrmse": self._step_rel_l2_sum[s] / self._step_rel_l2_count[s],
+            }
+            if self.track_per_step_spectral:
+                entry["spectral_bands"] = {
+                    label: (self._step_spectral_sums[label][s] / self._step_spectral_counts[label][s])
+                    for label in self.band_labels
+                }
+            return entry
+
         result = {
             "mse": mse,
             "rmse": float(torch.sqrt(torch.tensor(mse))),
@@ -412,14 +483,7 @@ class FieldMetricAccumulator:
             },
             "n_windows_evaluated": int(self.n_windows),
             "n_steps": len(self._step_err2_sum),
-            "per_step": [
-                {
-                    "step": s + 1,
-                    "rmse": float(torch.sqrt(torch.tensor(self._step_err2_sum[s] / self._step_elem_count[s]))),
-                    "nrmse": self._step_rel_l2_sum[s] / self._step_rel_l2_count[s],
-                }
-                for s in sorted(self._step_err2_sum)
-            ],
+            "per_step": [_step_entry(s) for s in sorted(self._step_err2_sum)],
         }
         return result
 

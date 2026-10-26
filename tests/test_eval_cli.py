@@ -5,15 +5,19 @@ Covers:
 * the metric functions (relative L2 / nRMSE, R², spectral band errors, radial
   frequency grid) — invariance properties and exact pooling identities;
 * :class:`~pynop.training.metrics.FieldMetricAccumulator` — one-shot vs
-  incremental equivalence, per-step curve, window bookkeeping;
+  incremental equivalence, per-step curve (RMSE/MAE/R²/nRMSE + optional
+  per-band spectral), window bookkeeping;
 * :func:`pynop.training.eval.select_eval_ids` — val/test split selection from
   the training config or a stored ``run_info.json``, test -> val fallback and
   overlap protection;
-* :func:`pynop.training.eval.build_eval_dataloader` — window protocol, batch
-  shapes, ``max_windows`` cap;
+* full-trajectory loading (:func:`scan_trajectories`, ``_load_trajectory``,
+  ``_group_by_length``) — time-range cropping, normalization, batching by equal
+  trajectory length;
+* :func:`pynop.training.eval.plot_error_evolution` — figure generation from a
+  synthetic results dict (skipped when matplotlib is unavailable);
 * a tiny end-to-end CPU run: one pretraining epoch (shared fixture) followed by
-  evaluation on the validation split, on an unused-simulations test split and
-  through the CLI entry point.
+  full-trajectory evaluation on the validation split, on an unused-simulations
+  test split and through the CLI entry point.
 """
 
 import json
@@ -26,11 +30,14 @@ import pytest
 import torch
 
 from pynop.training.eval import (
-    build_eval_dataloader,
+    _group_by_length,
+    _load_trajectory,
     format_results_table,
     main,
     parse_args,
+    plot_error_evolution,
     run_evaluation,
+    scan_trajectories,
     select_eval_ids,
 )
 from pynop.training.metrics import (
@@ -303,13 +310,49 @@ def test_accumulator_per_step_curve_and_window_count():
     assert len(res["per_step"]) == 2
     assert [p["step"] for p in res["per_step"]] == [1, 2]
     for p in res["per_step"]:
-        assert math.isfinite(p["rmse"]) and math.isfinite(p["nrmse"])
+        # Every per-step entry carries the full error set (RMSE/MAE/R²/nRMSE).
+        for key in ("rmse", "mae", "r2", "nrmse"):
+            assert math.isfinite(p[key]), (key, p)
 
     # Mismatched list lengths / shapes are rejected.
     with pytest.raises(ValueError):
         acc.update([pred], [])
     with pytest.raises(ValueError):
         acc.update([pred, torch.randn(2, Cc, Hh, Ww)], [target, target])
+
+
+def test_accumulator_per_step_spectral_tracking():
+    """track_per_step_spectral pools the per-band error at every step index."""
+    torch.manual_seed(0)
+    B, Cc, Hh, Ww = 2, 1, 32, 32
+    target = torch.randn(B, Cc, Hh, Ww)
+    pred = target + 0.1 * torch.randn_like(target)
+
+    acc = FieldMetricAccumulator(track_per_step_spectral=True)
+    # Simulate a per-step evaluation loop: one update_per_step call per rollout step.
+    for k in range(3):
+        p_k = pred + 0.01 * k * torch.randn_like(pred)
+        acc.update_per_step(p_k, target, step=k)
+    res = acc.compute()
+
+    assert res["n_windows_evaluated"] == 0  # update_per_step never counts windows
+    assert len(res["per_step"]) == 3
+    for p in res["per_step"]:
+        assert set(p["spectral_bands"]) == {"k[0,4)", "k[4,12)", "k>=12"}
+        assert all(math.isfinite(v) for v in p["spectral_bands"].values())
+
+    # The per-step band error of a single step equals the one-shot metric.
+    p_k = pred + 0.02 * torch.randn_like(pred)
+    ref = spectral_band_error(p_k, target)
+    acc_ref = FieldMetricAccumulator(track_per_step_spectral=True)
+    acc_ref.update([p_k], [target])
+    for label in ref:
+        assert abs(acc_ref.compute()["per_step"][0]["spectral_bands"][label] - float(ref[label])) < 1e-9, label
+
+    # Default (flag off): no per-step spectral entries.
+    acc_plain = FieldMetricAccumulator()
+    acc_plain.update([pred], [target])
+    assert "spectral_bands" not in acc_plain.compute()["per_step"][0]
 
 
 # ---------------------------------------------------------------------------
@@ -379,29 +422,115 @@ def test_select_eval_ids_unknown_split_raises(pdebench_h5):
 
 
 # ---------------------------------------------------------------------------
-# Evaluation dataloader
+# Full-trajectory loading
 # ---------------------------------------------------------------------------
 
 
-def test_build_eval_dataloader_shapes_and_cap(pdebench_h5):
-    ds_cfg = _ds_cfg(pdebench_h5)
-    phase = {"delta_ts": 2, "min_id": 0, "max_id": None, "n_samples": N_SAMPLES, "max_AR_steps": 2}
+def test_scan_trajectories_lengths_and_cropping(pdebench_h5):
+    lengths = scan_trajectories(str(pdebench_h5), ["0", "1"], min_id=0, max_id=None)
+    assert lengths == {"0": T_STEPS, "1": T_STEPS}
 
-    loader, window_size = build_eval_dataloader(ds_cfg, phase, input_steps=2, eval_ids=["0", "1"])
-    assert window_size == 5  # max_AR_steps + input_steps + 1
+    # Cropping the time range shortens the available trajectories.
+    cropped = scan_trajectories(str(pdebench_h5), ["0"], min_id=5, max_id=20)
+    assert cropped["0"] == 15
 
-    batch = next(iter(loader))
-    fields, time_idx = batch[0], batch[1]
-    assert fields.shape[-3:] == (C, H, W) and fields.shape[1] == window_size
-
-    capped, _ = build_eval_dataloader(ds_cfg, phase, input_steps=2, eval_ids=["0", "1"], max_windows=3)
-    assert len(capped.dataset) == 3
+    with pytest.raises(KeyError):
+        scan_trajectories(str(pdebench_h5), ["999"])
 
 
-def test_build_eval_dataloader_rejects_other_types(pdebench_h5):
-    ds_cfg = dict(_ds_cfg(pdebench_h5), type="thewell")
+def test_load_trajectory_shape_normalization_and_crop(pdebench_h5):
+    shift, scale = 3.0, 2.0
+    with h5py.File(str(pdebench_h5), "r") as f:
+        fields = _load_trajectory(f, "0", min_id=4, max_id=None, shift=shift, scale=scale)
+
+    assert fields.shape == (T_STEPS - 4, C, H, W)
+    # The transform is exactly (x + shift) * scale on the cropped frames.
+    with h5py.File(str(pdebench_h5), "r") as f:
+        expected = torch.from_numpy(np.moveaxis(np.asarray(f["0"]["data"][4:]), -1, 1)).float()
+    assert torch.allclose(fields, (expected + shift) * scale)
+
+
+def test_group_by_length_batches_and_order():
+    lengths = {"a": 30, "b": 30, "c": 25, "d": 25}
+    chunks = _group_by_length(["a", "b", "c", "d"], lengths, batch_size=2)
+
+    # Groups keep first-appearance order; each chunk is uniform-length and <= batch_size.
+    assert chunks == [["a", "b"], ["c", "d"]]
+    for chunk in chunks:
+        assert len(chunk) <= 2
+        assert len({lengths[s] for s in chunk}) == 1
+
+    # All IDs are preserved exactly once, regardless of the grouping.
+    flat = [sid for chunk in chunks for sid in chunk]
+    assert sorted(flat) == ["a", "b", "c", "d"]
+
+    # batch_size=1 splits every group into singletons (order preserved).
+    assert _group_by_length(["a", "b", "c"], lengths, batch_size=1) == [["a"], ["b"], ["c"]]
+
+
+def test_run_evaluation_rejects_other_dataset_types(trained_run):
+    """The driver only supports the PDEBench HDF5 layout."""
+    cfg = json.loads(trained_run["train_cfg"].read_text())
+    cfg["dataset"]["type"] = "thewell"
+    bad_cfg = trained_run["train_cfg"].parent / "training_bad_type.json"
+    with open(bad_cfg, "w") as f:
+        json.dump(cfg, f)
+
     with pytest.raises(ValueError, match="only 'pdebench'"):
-        build_eval_dataloader(ds_cfg, {"max_AR_steps": 2}, input_steps=2, eval_ids=["0"])
+        run_evaluation(
+            model_config_path=trained_run["model_cfg"],
+            training_config_path=bad_cfg,
+            checkpoint=trained_run["logdir"] / "last.ckpt",
+            device="cpu",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Plots
+# ---------------------------------------------------------------------------
+
+
+def test_plot_error_evolution_writes_figures(tmp_path):
+    """Synthetic per-step curves produce both PNG figures with English labels."""
+    pytest.importorskip("matplotlib")
+
+    results = {
+        "model": {"name": "TinyFNO"},
+        "split_effective": "val",
+        "n_eval_simulations": 2,
+        "metrics": {
+            "per_step": [
+                {
+                    "step": k + 1,
+                    "time": 2 + k,
+                    "rmse": 1e-3 * (k + 1),
+                    "mae": 8e-4 * (k + 1),
+                    "r2": max(0.9 - 0.05 * k, 0.01),
+                    "nrmse": 5e-3 * (k + 1),
+                    "spectral_bands": {"k[0,4)": 1e-3 * (k + 1), "k>=12": 9e-3 * (k + 1)},
+                }
+                for k in range(5)
+            ]
+        },
+    }
+
+    written = plot_error_evolution(results, tmp_path)
+    names = [p.name for p in written]
+    assert "eval_error_evolution_val.png" in names
+    assert "eval_spectral_evolution_val.png" in names
+    for p in written:
+        assert p.is_file() and p.stat().st_size > 0
+
+    # Without per-step spectral bands only the field-error figure is written.
+    results_no_spec = json.loads(json.dumps(results))
+    for entry in results_no_spec["metrics"]["per_step"]:
+        del entry["spectral_bands"]
+    written2 = plot_error_evolution(results_no_spec, tmp_path / "nospec")
+    assert [p.name for p in written2] == ["eval_error_evolution_val.png"]
+
+    # Empty per-step data: no figures, no crash.
+    empty = {"model": {"name": "X"}, "split_effective": "val", "metrics": {"per_step": []}}
+    assert plot_error_evolution(empty, tmp_path) == []
 
 
 # ---------------------------------------------------------------------------
@@ -416,15 +545,16 @@ def test_parse_args_defaults():
     assert args.checkpoint == Path("run/last.ckpt")
     assert args.split == "val" and args.n_test is None
     assert args.pretrain is False and args.device == "auto"
-    assert args.batch_size is None and args.max_windows is None and args.output_dir is None
+    assert args.batch_size is None and args.max_sims is None and args.output_dir is None
+    assert args.no_plots is False
 
 
 def test_parse_args_flags():
     args = parse_args(
-        ["--pretrain", "--split", "test", "--n-test", "7", "--device", "cpu", "--max-windows", "3", "m.json", "t.json", "--checkpoint", "c.ckpt"]
+        ["--pretrain", "--split", "test", "--n-test", "7", "--device", "cpu", "--max-sims", "3", "--no-plots", "m.json", "t.json", "--checkpoint", "c.ckpt"]
     )
     assert args.pretrain is True and args.split == "test" and args.n_test == 7
-    assert args.device == "cpu" and args.max_windows == 3
+    assert args.device == "cpu" and args.max_sims == 3 and args.no_plots is True
 
 
 def test_format_results_table_smoke():
@@ -433,9 +563,10 @@ def test_format_results_table_smoke():
         "model": {"class": "FNO", "name": "TinyFNO"},
         "phase": "pretraining",
         "split_effective": "val",
-        "n_eval_simulations": 1,
+        "n_eval_simulations": 2,
         "id_source": "run_info.json",
-        "window_size": 5,
+        "dataset": {"min_id": 0, "max_id": None},
+        "trajectory": {"input_steps": 2, "length_min": 30, "length_max": 30},
         "metrics": {
             "mse": 1e-3,
             "rmse": 0.032,
@@ -444,23 +575,33 @@ def test_format_results_table_smoke():
             "max_abs_error": 0.4,
             "r2": 0.99,
             "spectral_bands": {"k[0,4)": 0.1, "k>=12": 0.2},
-            "n_windows_evaluated": 7,
             "n_steps": 3,
-            "per_step": [{"step": i + 1, "rmse": 1e-3 * (i + 1), "nrmse": 0.05} for i in range(3)],
+            "total_predictions": 6,
+            "per_step": [
+                {"step": i + 1, "time": 2 + i, "rmse": 1e-3 * (i + 1), "mae": 8e-4 * (i + 1), "r2": 0.99, "nrmse": 0.05}
+                for i in range(3)
+            ],
         },
+        "plots": ["/tmp/run/eval_error_evolution_val.png"],
     }
     table = format_results_table(results)
-    assert "EVALUATION RESULTS" in table
+    assert "EVALUATION RESULTS" in table and "full-trajectory" in table
     assert "TinyFNO" in table and "run_info.json" in table
+    assert "2 trajectories" in table
     assert "Spectral k>=12" in table
-    assert "Per-step RMSE" in table and "s3=" in table
+    # Condensed per-step summary: first/last times and min/max values.
+    assert "Per-step RMSE" in table and "t=4" in table  # last time = input_steps + n_steps
+    assert "@t=" in table
+    assert "/tmp/run/eval_error_evolution_val.png" in table
 
 
 # ---------------------------------------------------------------------------
 # End-to-end (tiny CPU runs)
 # ---------------------------------------------------------------------------
 
-N_PREDICTIONS_PER_WINDOW = 5 - 2  # window_size(5) - input_steps(2), from the pretraining phase
+# Full-trajectory protocol: every trajectory of length T_STEPS rolled out from
+# input_steps(2) yields T_STEPS - 2 predictions.
+N_PREDICTIONS_PER_TRAJECTORY = T_STEPS - 2
 
 
 def _assert_results_json(path: Path, expected_split: str):
@@ -478,8 +619,7 @@ def _assert_results_json(path: Path, expected_split: str):
         "n_eval_simulations",
         "eval_ids",
         "train_ids",
-        "window_size",
-        "n_windows_evaluated",
+        "trajectory",
         "metrics",
     ):
         assert key in res, f"missing key {key!r}"
@@ -493,9 +633,30 @@ def _assert_results_json(path: Path, expected_split: str):
     # The eval set must be disjoint from the training IDs (audit trail).
     assert not set(res["eval_ids"]) & set(res["train_ids"]), "eval set overlaps with train IDs"
     assert res["split_effective"] == expected_split
-    assert res["n_windows_evaluated"] > 0
-    # Per-step curve: one entry per prediction of the rollout.
-    assert len(m["per_step"]) == N_PREDICTIONS_PER_WINDOW, m["per_step"]
+    assert res["n_eval_simulations"] > 0
+
+    # Trajectory bookkeeping: full length of the synthetic file, 2 input slices.
+    traj = res["trajectory"]
+    assert traj["input_steps"] == 2 and traj["length_min"] == T_STEPS and traj["length_max"] == T_STEPS
+
+    # Per-step curve: one entry per prediction of the FULL trajectory rollout,
+    # with the absolute time mapping t_k = min_id + input_steps + (k - 1).
+    assert len(m["per_step"]) == N_PREDICTIONS_PER_TRAJECTORY, m["per_step"]
+    for k, p in enumerate(m["per_step"]):
+        assert p["time"] == 2 + k, p
+        for key in ("rmse", "mae", "r2", "nrmse"):
+            assert math.isfinite(p[key]), (key, p)
+        # Per-step spectral bands are pooled by default.
+        assert set(p["spectral_bands"]) == {"k[0,4)", "k[4,12)", "k>=12"}
+
+    # Total predictions = n trajectories x predictions per trajectory.
+    assert m["total_predictions"] == res["n_eval_simulations"] * N_PREDICTIONS_PER_TRAJECTORY
+
+    # Figures: both PNGs written next to the JSON (matplotlib is available in CI env).
+    if pytest.importorskip("matplotlib") is not None:
+        for name in ("eval_error_evolution_val.png", "eval_spectral_evolution_val.png"):
+            fig = path.parent / name.replace("_val", f"_{expected_split}")
+            assert fig.is_file() and fig.stat().st_size > 0, f"missing figure {fig}"
 
 
 def test_end_to_end_eval_val_split(trained_run):
