@@ -1,0 +1,44 @@
+# PyNOP — build & packaging configuration (replaces setup.py).
+#
+# Build:  python -m build            # sdist + wheel
+# Install: pip install .             # or: pip install -e . for development
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pynop"
+version = "1.0.0"
+description = "pytorch neural operators"
+readme = "readme.md"
+license = "Apache-2.0"  # PEP 639 SPDX expression; full text in LICENSE
+authors = [{ name = "J. Lux" }]
+requires-python = ">=3.10"
+
+# Hard dependencies: every package imported at module level by shipped code.
+# Lower bounds are conservative; tested against the `pytorch` conda env
+# (Python 3.12, torch 2.14 / torchvision 0.29 / pytorch-lightning 2.6).
+dependencies = [
+    "einops>=0.7",          # pynop/core/blocks.py: rearrange
+    "h5py>=3.8",            # pynop/dataloader/h5_dataloader.py
+    "numpy>=1.24",          # FNO, dataloaders, metrics
+    "pandas>=2.0",          # pynop/dataloader/dataloader.py
+    "pillow>=9.0",          # pynop/dataloader/dataloader.py (PIL.Image)
+    "pytorch-lightning>=2.0",  # pynop/training/* (PL 2.x API)
+    "sympy>=1.12",          # pynop/models/Galerkin.py: chebyshevt_poly
+    "torch>=2.0",           # core
+    "torchmetrics>=1.3",    # pynop/training/lightning_model.py: MeanMetric
+    "torchvision>=0.15",    # core/blocks.py (SqueezeExcitation), dataloader (ToTensor)
+    "tqdm>=4.65",           # pynop/dataloader/h5_dataloader.py
+]
+
+# CLI entry points (equivalent to `python -m pynop.training.train|eval`).
+[project.scripts]
+pynop-train = "pynop.training.train:main"
+pynop-eval = "pynop.training.eval:main"
+
+# Explicit package discovery: only the `pynop` tree (the repo root also holds
+# tests/, notebooks/, configs/, docs/ which must not be packaged).
+[tool.setuptools.packages.find]
+include = ["pynop*"]
