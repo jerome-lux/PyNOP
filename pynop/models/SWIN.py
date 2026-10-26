@@ -46,6 +46,8 @@ class SwinNO(nn.Module):
             activation: Activation class used by the MLP layers.
             block_type: Type of Swin block to use: "swin" or "padded".
             bc_mode: Boundary padding mode for padded blocks.
+            rmsnorm: Use RMSNorm if True, else LayerNorm.
+            cond_dim: If set, a conditioning field with this many channels is concatenated to the input.
             ndim: Number of spatial coordinates used as positional features.
         """
         super().__init__()
@@ -366,6 +368,7 @@ class MultiscaleCADecoder(nn.Module):
             n_heads: Number of attention heads per stage.
             mlp_ratio: Multiplier for MLP hidden dimension.
             rmsnorm: Use RMSNorm if True, else LayerNorm.
+            repeats: Number of self-attention block pairs per stage (int or list matching the number of stages).
             activation: Activation function class.
         """
         super().__init__()
@@ -518,10 +521,13 @@ class MultiscaleSWINNO(nn.Module):
             dec_num_windows: Number of windows per axis for the decoder stages (None for a global stage).
             model_dim:         Hidden dimensions (int or list mapping resolutions).
             grid_resolutions:  Target resolutions for downsampling stages.
+            enc_repeats:       Number of self-attention block pairs per encoder stage (int or list matching the number of stages).
+            dec_repeats:       Number of self-attention block pairs per decoder stage (int or list matching the number of stages).
             num_heads:         Number of attention heads.
             mlp_factor:        Multiplier for MLP hidden dimension.
             rmsnorm:           Use RMSNorm if True, else LayerNorm.
             activation:        Activation function class.
+            cond_dim:          If set, a conditioning field with this many channels is concatenated to the input.
         """
         super().__init__()
 
