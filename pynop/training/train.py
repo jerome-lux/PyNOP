@@ -1,703 +1,953 @@
-import os
-from typing import Callable, Sequence, Union
+"""Command-line training driver for PyNOP multi-step prediction models.
+
+This module replaces the legacy in-process training loops with a single,
+config-driven entry point that reproduces the PDEBench two-phase protocol of
+the ``training_*_PDEBench.ipynb`` notebooks:
+
+* **Phase 1 — pretraining**: small ensemble (e.g. 40 simulations), restricted
+  time range, short window stride, AR curriculum ramping from
+  ``min_AR_steps`` to ``max_AR_steps`` between epochs ``start_AR`` and
+  ``final_AR``.
+* **Phase 2 — full training**: larger ensemble (e.g. 400 simulations), full
+  time range, fixed AR steps at the maximum.
+
+Usage
+-----
+::
+
+    python -m pynop.training.train MODEL_CONFIG.json TRAINING_CONFIG.json [--pretrain] [options]
+
+``--pretrain`` selects the ``"pretraining"`` section of the training config;
+without it the ``"fulltraining"`` section is used.
+
+ModelConfig.json
+----------------
+::
+
+    {
+        "name":   "FNOvanilla",          # optional run name (default: model class name)
+        "model":  "FNO",                 # class in pynop.models, or a dotted import path
+        "params": { ... }                # constructor kwargs (JSON-serializable)
+    }
+
+String values matching an activation name (``"GELU"``, ``"SiLU"``, ...) are
+resolved to the corresponding ``torch.nn`` class, so e.g.
+``"activation": "GELU"`` works in place of ``nn.GELU``. Tuples may be written
+as lists.
+
+TrainingConfig.json
+-------------------
+::
+
+    {
+        "input_steps": 10,               # n_slices: past slices given to the network
+        "dataset": {                     # PDEBench dataset (only type supported so far)
+            "type":         "pdebench",
+            "path":         "/.../133017.hdf5",
+            "batch_size":   5,
+            "num_workers":  10,          # optional, default 0
+            "load_in_ram":  true,        # optional, default false
+            "shift":        0.0,         # optional normalization (x + shift) * scale
+            "scale":        1.0,
+            "split_ratio":  0.9,         # train fraction of the simulation IDs
+            "random_seed":  42           # seeds ID shuffle + torch/PL RNGs
+        },
+        "shared_params": {               # common to both phases (notebook shared_params)
+            "timestep":             5e-2,   # dt between slices
+            "loss_weights":         [1e4, 1e4, 1e4],
+            "temporal_weighting":   1.1,    # gamma: AR-step k loss weight = gamma**k
+            "detach_grad_steps":    40,     # BPTT truncation (0 disables)
+            "derivative_loss_weight": 1.0,  # 0 disables the derivative regularizer
+            "predict_derivative":   true,   # output is du/dt -> u_{t+dt} = u_t + dt*out
+            "noise_level":          0.0,    # teacher-forcing input noise
+            "time_normalization":   101     # divisor for models accepting `time`
+        },
+        "losses": [                      # ordered list; weights match by position
+            {"name": "DWMSELoss"},
+            {"name": "SpectralLoss", "params": {"beta": 2}},
+            {"name": "SobolevLoss",  "params": {"l1": 1.0, "l2": 1.0}}
+        ],
+        "optimizer": {                   # torch.optim class name + constructor kwargs
+            "name": "AdamW",
+            "weight_decay": 5e-4,
+            "betas": [0.9, 0.99]
+        },
+        "scheduler": {                   # optional; see below for tokens
+            "name": "OneCycleLR",
+            "div_factor": 1e3,
+            "final_div_factor": 1e2,
+            "pct_start": 0.02,
+            "total_steps": "$total_steps",
+            "interval": "step"
+        },
+        "trainer": {                     # optional pl.Trainer overrides
+            "gradient_clip_val": 1.0,    # 0 disables clipping (default)
+            "log_every_n_steps": 50
+        },
+        "output": {                      # where runs are written
+            "root":       "/run/media/jlux/SSD2/PDETraining",
+            "experiment": "PDEBENCH"
+        },
+        "loggers": ["csv", "tensorboard"],   # optional, default as shown
+        "pretraining":  { ...phase params... },
+        "fulltraining": { ...phase params... }
+    }
+
+Phase parameters (both sections use the same keys):
+
+* ``delta_ts``      — window stride of :class:`~pynop.PDEBenchDataSet`.
+* ``min_id`` / ``max_id`` — time range kept for windows (``null`` = full).
+* ``n_samples``     — number of simulations used (``null`` = all).
+* ``split_ratio``   — optional per-phase override of the dataset split.
+* ``lr``            — learning rate (OneCycleLR maximum LR, optimizer base LR).
+* ``max_epochs``    — number of epochs for this phase.
+* ``start_AR`` / ``final_AR`` — AR curriculum ramp interval (epochs).
+* ``min_AR_steps`` / ``max_AR_steps`` — AR step bounds; the window length is
+  derived as ``window_size = max_AR_steps + input_steps + 1``.
+* ``scheduler``     — optional dict of overrides merged over the base
+  ``"scheduler"`` section (e.g. per-phase ``pct_start``).
+
+Scheduler tokens: string values ``"$total_steps"`` and ``"$steps_per_epoch"``
+are replaced by ``max_epochs * len(train_dataloader)`` and
+``len(train_dataloader)`` respectively, so the config does not need to know
+the dataset size. For OneCycleLR, an omitted ``max_lr`` defaults to the phase
+``lr`` (as in the notebooks).
+
+Checkpoint policy
+-----------------
+All checkpoints are written to::
+
+    <output.root>/<output.experiment>/<phase logdir>/<model name>/<input_steps>steps_<timestamp>/
+
+* ``last.ckpt`` — saved **every epoch from the start** (overwritten), so the
+  weights of the last completed epoch are always available for resuming or
+  warm-starting phase 2 from phase 1.
+* ``best_RMSE.ckpt`` / ``best_val_RMSE.ckpt`` (top-k = 2) — monitoring starts
+  **only once the rollout reaches the maximum number of AR steps**
+  (epoch >= ``final_AR``), and not before: during the curriculum ramp the
+  per-epoch metrics are computed over different numbers of AR steps and are
+  therefore not comparable, so selecting a "best" model earlier would be
+  meaningless. If ``final_AR >= max_epochs``, no best checkpoint is ever
+  written (a warning is printed at startup).
+
+Other options: ``--resume PATH`` performs a full Lightning resume from a
+checkpoint (optimizer/scheduler/epoch restored); ``--init-from PATH`` loads
+only the model weights from a previous run's ``last.ckpt`` (fresh optimizer —
+the phase-1 -> phase-2 warm start of the notebooks).
+
+The module contains no visualization or evaluation code: it trains, logs and
+saves checkpoints only.
+"""
+
+import argparse
+import datetime
+import importlib
+import json
+import random
 from pathlib import Path
+from typing import Any, Optional, Sequence, Union
+
+import h5py
 import torch
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, TQDMProgressBar
+from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 from torch import nn
-import torch.nn.functional as F
-from tqdm.auto import tqdm
-from .metrics import AverageMeter
-from ..core.loss import G_GANLoss, D_GANLoss, ZeroCenteredGradientPenalty, diffusion_loss
+from torch.utils.data import DataLoader
 
-from torch.utils.tensorboard import SummaryWriter
+from ..dataloader.h5_dataloader import PDEBenchDataSet
+from .lightning_model import (
+    CurriculumCheckpoint,
+    DeepONetModel,
+    MultiStepNOModel,
+    TrainingConfig,
+)
 
-import torch
-import torch.nn.functional as F
+__all__ = [
+    "parse_args",
+    "main",
+    "run_training",
+    "build_model",
+    "build_losses",
+    "build_optimizer",
+    "build_scheduler_config",
+    "build_pdebench_dataloaders",
+    "select_phase",
+]
 
-
-def train_step(model, inputs, targets, loss_fn, optimizer, lossweights=1.0):
-    preds = model(inputs)
-    # residual = targets - preds
-    loss = 0.0
-    if not (isinstance(lossweights, tuple) or isinstance(lossweights, list)):
-        lossweights = [lossweights] * len(loss_fn)
-    for i, loss_function in enumerate(loss_fn):
-        # loss += loss_function(residual, torch.zeros_like(residual)) * lossweights[i]
-        loss += loss_function(preds, targets) * lossweights[i]
-    # loss = loss / len(loss_fn)
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-    return loss
+PathLike = Union[str, Path]
 
 
-def test_step(model, inputs, targets, loss_fn, lossweights=1.0):
-
-    preds = model(inputs)
-    # residual = targets - preds
-    loss = 0.0
-    if not (isinstance(lossweights, tuple) or isinstance(lossweights, list)):
-        lossweights = [lossweights] * len(loss_fn)
-    for i, loss_function in enumerate(loss_fn):
-        # loss += loss_function(residual, torch.zeros_like(residual)) * lossweights[i]
-        loss += loss_function(preds, targets) * lossweights[i]
-    return loss
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
 
 
-# 3 TODO: implemmmment one stage GAN https://github.com/zju-vipa/OSGAN
+def load_json(path: PathLike) -> dict:
+    """Load a JSON file and return its content as a dict.
 
+    Args:
+        path: Path to the JSON file.
 
-def train(
-    model,
-    dataloader,
-    epochs,
-    optimizer,
-    loss_fn,
-    savepath,
-    test_loader=None,
-    device=None,
-    lossweights=1.0,
-    scheduler=None,
-    iterations=None,
-):
+    Returns:
+        The parsed JSON object (expected to be an object/dict).
 
-    os.makedirs(savepath, exist_ok=True)
-
-    writer = SummaryWriter(savepath)
-
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") if device is None else device
-    model.to(device)
-
-    best_loss = float("inf")
-    best_val_loss = float("inf")
-
-    if iterations is None:
-        iterations = len(dataloader)
-
-    for epoch in range(epochs):
-
-        model.train()
-        loss_meter = AverageMeter()
-
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} [Training]", leave=True, total=iterations)
-
-        for i, (inputs, targets) in enumerate(progress_bar):
-            inputs = inputs.to(device)
-
-            loss = train_step(model, inputs, targets, loss_fn, optimizer, lossweights=lossweights)
-
-            # Update loss and accuracy
-            loss_meter.update(loss.item(), inputs.size(0))
-
-            progress_bar.set_postfix(loss=loss_meter.avg, lr=optimizer.param_groups[0]["lr"])
-
-            if i >= iterations:
-                break
-
-            if scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step()
-
-        avg_loss = loss_meter.avg
-
-        if scheduler is not None and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step(avg_loss)
-
-        if avg_loss < best_loss or epoch == 0:
-            best_loss = avg_loss
-            torch.save(model.state_dict(), Path(savepath) / Path("best_model.pth"))
-
-        writer.add_scalar("loss", avg_loss, epoch + 1)
-        writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch + 1)
-
-        if test_loader is not None:
-
-            with torch.no_grad():
-                valoss_meter = AverageMeter()
-                # Test step: set the model to inference mode
-                model.eval()
-                progress_bar = tqdm(
-                    test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test]", leave=True, total=len(test_loader)
-                )
-                for i, (inputs, targets) in enumerate(progress_bar):
-                    inputs = inputs.to(device)
-
-                    valoss = test_step(model, inputs, targets, loss_fn, lossweights=lossweights)
-
-                    # Update loss and accuracy
-                    valoss_meter.update(valoss.item(), inputs.size(0))
-
-            progress_bar.set_postfix(loss=valoss_meter.avg)
-
-            avg_valoss = valoss_meter.avg
-
-            if avg_valoss < best_val_loss or epoch == 0:
-                best_val_loss = avg_valoss
-                torch.save(model.state_dict(), Path(savepath) / Path("best_val_model.pth"))
-
-            writer.add_scalar("val_loss", avg_valoss, epoch + 1)
-
-
-def adversarial_train(
-    generator,
-    discriminator,
-    dataloader,
-    epochs,
-    gen_optimizer,
-    discr_optimizer,
-    test_loader=None,
-    gen_loss_func=G_GANLoss,
-    discr_loss_func=D_GANLoss,
-    rec_loss_func=None,
-    rec_loss_weight=0.5,
-    savepath=os.path.join(os.getcwd(), "logs"),
-    d_train_steps_ratio=1,
-    gen_scheduler=None,
-    discr_scheduler=None,
-    iterations=None,
-    device=None,
-):
-    """TODO:
-    Maybe implement update rule in Accelerated WGAN update strategy with loss change rate balancing abs()
-    update D if (Ld(i) - Ld(i-1)) / Ld(i-1) > lambda * (Lg(i) - Lg(i-1)) / Lg(i-1)
+    Raises:
+        FileNotFoundError: If ``path`` does not exist.
+        ValueError: If the top-level JSON value is not an object.
     """
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Config file not found: {p}")
+    with open(p, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"{p}: the top-level JSON value must be an object, got {type(data).__name__}.")
+    return data
 
-    writer = SummaryWriter(savepath)
 
-    os.makedirs(savepath, exist_ok=True)
+def _resolve_activation(value: Any) -> Any:
+    """Resolve a string activation name to its ``torch.nn`` class.
 
-    device = device if device is not None else torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    generator.to(device)
-    discriminator.to(device)
+    Args:
+        value: A config value; strings matching a known activation name are
+            replaced by the corresponding class, everything else is returned
+            unchanged (recursing into lists and dicts).
 
-    gen_best_loss = float("inf")
-    rec_best_loss = float("inf")
-    discr_best_loss = float("inf")
+    Returns:
+        The resolved value.
+    """
+    activations = {
+        name: getattr(nn, name)
+        for name in ("ReLU", "LeakyReLU", "GELU", "SiLU", "Sigmoid", "Tanh", "ELU", "Mish", "Softplus")
+    }
+    if isinstance(value, str):
+        return activations.get(value, value)
+    if isinstance(value, list):
+        return [_resolve_activation(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _resolve_activation(v) for k, v in value.items()}
+    return value
 
-    test_gen_best_loss = float("inf")
-    test_rec_best_loss = float("inf")
-    test_discr_best_loss = float("inf")
 
-    if iterations is None:
-        iterations = len(dataloader)
+# ---------------------------------------------------------------------------
+# Model / loss / optimizer / scheduler builders
+# ---------------------------------------------------------------------------
+
+
+def build_model(model_cfg: dict) -> nn.Module:
+    """Instantiate a model from a ``ModelConfig.json`` dict.
+
+    Args:
+        model_cfg: Dict with keys ``"model"`` (class name in ``pynop.models``
+            or a dotted import path), optional ``"name"`` and ``"params"``
+            (constructor kwargs). String activation names are resolved to
+            their ``torch.nn`` classes.
+
+    Returns:
+        The instantiated model (on CPU; the caller moves it to device via the
+        Lightning trainer).
+
+    Raises:
+        KeyError: If the ``"model"`` key is missing.
+        ValueError: If the class cannot be resolved or instantiation fails.
+    """
+    if "model" not in model_cfg:
+        raise KeyError('ModelConfig must contain a "model" key (class name or dotted path).')
+
+    name = str(model_cfg["model"])
+    if "." in name:  # dotted import path, e.g. "pynop.models.FNO"
+        module_path, cls_name = name.rsplit(".", 1)
+        module = importlib.import_module(module_path)
+        model_cls = getattr(module, cls_name)
     else:
-        iterations = min(len(dataloader), iterations)
+        models_pkg = importlib.import_module("pynop.models")
+        if not hasattr(models_pkg, name):
+            available = sorted(n for n in dir(models_pkg) if n[0].isupper())
+            raise ValueError(f"Model class {name!r} not found in pynop.models. Available: {available}")
+        model_cls = getattr(models_pkg, name)
 
-    for epoch in range(epochs):
+    params = _resolve_activation(model_cfg.get("params", {}))
+    try:
+        model = model_cls(**params)
+    except TypeError as e:
+        raise ValueError(f"Failed to instantiate {model_cls.__name__} with params {sorted(params)}: {e}") from e
 
-        generator.train()
-        discriminator.train()
-
-        gen_loss_meter = AverageMeter()
-        discr_loss_meter = AverageMeter()
-        adv_loss_meter = AverageMeter()
-        rec_loss_val_meter = AverageMeter()
-        rec_loss_val_meter.update(0.0, 1)
-        gp1_meter = AverageMeter()
-        gp2_meter = AverageMeter()
-
-        # Training loop
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} [Training]", leave=True, total=iterations)
-
-        for i, (real_data, _) in enumerate(progress_bar):
-            real_data = real_data.to(device)
-            fake_data = generator(real_data)
-
-            # discriminator loss
-            discr_optimizer.zero_grad()
-            discr_loss, gp1, gp2 = discr_loss_func(discriminator, fake_data, real_data)
-
-            discr_loss.backward()
-            discr_optimizer.step()
-            discr_loss_meter.update(discr_loss.item(), real_data.size(0))
-            gp1_meter.update(gp1.item(), real_data.size(0))
-            gp2_meter.update(gp2.item(), real_data.size(0))
-
-            # generator loss
-            if i % d_train_steps_ratio == 0:
-
-                gen_optimizer.zero_grad()
-
-                adv_loss = gen_loss_func(discriminator, fake_data, real_data)
-
-                rec_loss_value = 0.0
-                if rec_loss_func is not None:
-                    if not isinstance(rec_loss_func, (list, tuple)):
-                        rec_loss_func = [rec_loss_func]
-                    for rec_loss in rec_loss_func:
-                        rec_loss_value += rec_loss(fake_data, real_data)
-
-                    gen_loss = (1.0 - rec_loss_weight) * adv_loss + rec_loss_weight * rec_loss_value
-
-                else:
-                    gen_loss = adv_loss
-
-                gen_loss.backward()
-                gen_optimizer.step()
-
-                # Update loss meter
-                gen_loss_meter.update(gen_loss.item(), real_data.size(0))
-                adv_loss_meter.update(adv_loss.item(), real_data.size(0))
-                if rec_loss_func is not None:
-                    rec_loss_val_meter.update(rec_loss_value.item(), real_data.size(0))
-
-            progress_bar.set_postfix(
-                ordered_dict={
-                    "gen_loss": gen_loss_meter.avg,
-                    "adv_loss": adv_loss_meter.avg,
-                    "rec_loss": rec_loss_val_meter.avg,
-                    "discr_loss": discr_loss_meter.avg,
-                    "gp1": gp1_meter.avg,
-                    "gp2": gp2_meter.avg,
-                    "gen_lr": gen_optimizer.param_groups[0]["lr"],
-                    "discr_lr": discr_optimizer.param_groups[0]["lr"],
-                }
-            )
-
-            # Schedulers qui doivent être updatés à chaque batch
-            if gen_scheduler is not None and not isinstance(gen_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                gen_scheduler.step()
-
-            if discr_scheduler is not None and not isinstance(
-                discr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau
-            ):
-                discr_scheduler.step()
-
-            if i >= iterations:
-                break
-
-        gen_avg_loss = gen_loss_meter.avg
-        discr_avg_loss = discr_loss_meter.avg
-
-        # Schedulers qui doivent être updatés à chaque epoch
-        if gen_scheduler is not None and isinstance(gen_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            gen_scheduler.step(gen_avg_loss)
-
-        if discr_scheduler is not None and isinstance(discr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            discr_scheduler.step(discr_avg_loss)
-
-        if gen_avg_loss < gen_best_loss or epoch == 0:
-            gen_best_loss = gen_avg_loss
-            torch.save(generator.state_dict(), Path(savepath) / Path("gen_best_model.pth"))
-
-        if rec_loss_val_meter.avg < rec_best_loss or epoch == 0:
-            rec_best_loss = rec_loss_val_meter.avg
-            torch.save(generator.state_dict(), Path(savepath) / Path("rec_best_model.pth"))
-
-        if discr_avg_loss < discr_best_loss or epoch == 0:
-            discr_best_loss = discr_avg_loss
-            torch.save(discriminator.state_dict(), Path(savepath) / Path("discriminator_best_model.pth"))
-
-        writer.add_scalar("Gen_loss", gen_avg_loss, epoch + 1)
-        writer.add_scalar("Gen GAN loss", adv_loss_meter.avg, epoch + 1)
-        writer.add_scalar("Gen rec_loss", rec_loss_val_meter.avg, epoch + 1)
-        writer.add_scalar("Discriminator_loss", discr_loss_meter.avg, epoch + 1)
-        writer.add_scalar("Gen lr", gen_optimizer.param_groups[0]["lr"], epoch + 1)
-        writer.add_scalar("Discr lr", discr_optimizer.param_groups[0]["lr"], epoch + 1)
-
-        if test_loader is not None:
-
-            test_gen_loss_meter = AverageMeter()
-            test_discr_loss_meter = AverageMeter()
-            test_adv_loss_meter = AverageMeter()
-            test_rec_loss_val_meter = AverageMeter()
-            test_rec_loss_val_meter.update(0, 1)
-
-            # Test step: set the model to inference mode
-            generator.eval()
-            discriminator.eval()
-            progress_bar = tqdm(
-                test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test]", leave=True, total=len(test_loader)
-            )
-
-            for i, (real_data, _) in enumerate(progress_bar):
-                real_data = real_data.to(device)
-                fake_data = generator(real_data)
-
-                discr_loss, _, _ = discr_loss_func(discriminator, fake_data, real_data)
-
-                adv_loss = gen_loss_func(discriminator, fake_data, real_data)
-
-                rec_loss_value = 0.0
-                if rec_loss_func is not None:
-                    if not isinstance(rec_loss_func, (list, tuple)):
-                        rec_loss_func = [rec_loss_func]
-                    for rec_loss in rec_loss_func:
-                        rec_loss_value += rec_loss(fake_data, real_data)
-
-                    gen_loss = (1.0 - rec_loss_weight) * adv_loss + rec_loss_weight * rec_loss_value
-
-                else:
-                    gen_loss = adv_loss
-                test_discr_loss_meter.update(discr_loss.item(), real_data.size(0))
-                test_discr_loss_meter.update(gen_loss.item(), real_data.size(0))
-                test_adv_loss_meter.update(adv_loss.item(), real_data.size(0))
-                if rec_loss_func is not None:
-                    test_rec_loss_val_meter.update(rec_loss_value.item(), real_data.size(0))
-                test_gen_loss_meter.update(gen_loss.item(), real_data.size(0))
-
-                progress_bar.set_postfix(
-                    ordered_dict={
-                        "gen_loss": test_gen_loss_meter.avg,
-                        "adv_loss": test_adv_loss_meter.avg,
-                        "rec_loss": test_rec_loss_val_meter.avg,
-                        "discr_loss": test_discr_loss_meter.avg,
-                    }
-                )
-
-            if test_gen_loss_meter.avg < test_gen_best_loss or epoch == 0:
-                test_gen_best_loss = test_gen_loss_meter.avg
-                torch.save(generator.state_dict(), Path(savepath) / Path("test_gen_best_model.pth"))
-
-            if test_rec_loss_val_meter.avg < test_rec_best_loss or epoch == 0:
-                rec_best_loss = test_rec_loss_val_meter.avg
-                torch.save(generator.state_dict(), Path(savepath) / Path("test_rec_best_model.pth"))
-
-            if test_discr_loss_meter.avg < test_discr_best_loss or epoch == 0:
-                discr_best_loss = test_discr_loss_meter.avg
-                torch.save(discriminator.state_dict(), Path(savepath) / Path("test_discriminator_best_model.pth"))
-
-            writer.add_scalar("Gen_test_loss", test_gen_loss_meter.avg, epoch + 1)
-            writer.add_scalar("Gen GAN test loss", test_adv_loss_meter.avg, epoch + 1)
-            writer.add_scalar("Gen rec test loss", test_rec_loss_val_meter.avg, epoch + 1)
-            writer.add_scalar("Discriminator test loss", test_discr_loss_meter.avg, epoch + 1)
+    # The notebooks silence per-forward prints before training; do the same
+    # unless the config explicitly sets `verbose`.
+    if "verbose" not in model_cfg.get("params", {}) and hasattr(model, "verbose"):
+        model.verbose = False
+    return model
 
 
-def train_unrolled(
-    model,
-    dataloader,
-    epochs,
-    optimizer,
-    savepath,
-    loss_fn: Callable = F.mse_loss,
-    detach_every_k: int = 4,
-    test_loader=None,
-    device=None,
-    lossweights=1.0,
-    scheduler=None,
-    iterations=None,
-):
-    """The dataloader must return a sequence of tensors at different successive times: t_0, ..., t_n
-    -> shape b t_n c h w
+def build_losses(loss_specs: Optional[Sequence[Any]]) -> list:
+    """Build loss modules from JSON specs.
+
+    Args:
+        loss_specs: List of entries, each either a string (loss name) or a
+            dict ``{"name": ..., "params": {...}}``. Names are resolved in
+            ``pynop.core.loss`` first, then in ``torch.nn``. If ``None``, a
+            single :class:`torch.nn.MSELoss` is returned.
+
+    Returns:
+        List of instantiated loss modules (order preserved — it defines the
+        position of each weight in ``loss_weights``).
+
+    Raises:
+        ValueError: If a loss name cannot be resolved or instantiation fails.
     """
+    if not loss_specs:
+        return [nn.MSELoss()]
 
-    os.makedirs(savepath, exist_ok=True)
+    from ..core.loss import (  # local import: keep module import light
+        DWMSELoss,
+        MaskedSpectralLoss,
+        NormalizedTimeDerivativeMSE,
+        SobolevLoss,
+        SpectralLoss,
+        StructureLoss,
+        WeightedMSE,
+        nDWMSELoss,
+    )
 
-    writer = SummaryWriter(savepath)
+    registry = {
+        "DWMSELoss": DWMSELoss,
+        "nDWMSELoss": nDWMSELoss,
+        "WeightedMSE": WeightedMSE,
+        "SpectralLoss": SpectralLoss,
+        "MaskedSpectralLoss": MaskedSpectralLoss,
+        "StructureLoss": StructureLoss,
+        "SobolevLoss": SobolevLoss,
+        "NormalizedTimeDerivativeMSE": NormalizedTimeDerivativeMSE,
+        "MSELoss": nn.MSELoss,
+        "L1Loss": nn.L1Loss,
+        "SmoothL1Loss": nn.SmoothL1Loss,
+        "HuberLoss": nn.HuberLoss,
+    }
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") if device is None else device
-    model.to(device)
-
-    best_loss = float("inf")
-    best_val_loss = float("inf")
-
-    if iterations is None:
-        iterations = len(dataloader)
-
-    for epoch in range(epochs):
-
-        model.train()
-        loss_meter = AverageMeter()
-
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} [Training]", leave=True, total=iterations)
-
-        for i, inputs in enumerate(progress_bar):
-            inputs = inputs.to(device)
-            T_unroll = inputs.shape[1]
-            loss = 0.0
-            preds = inputs[:, 0, ...]
-            for t in range(1, T_unroll):
-                preds = model(preds)  # Predict u_{t} from u{t-1}
-
-                # Ground truth
-                targets = inputs[:, t, ...]
-
-                # Accumulate loss
-                loss += loss_fn(preds, targets)
-
-                # Truncated gradient: detach every k steps
-                if (t % detach_every_k) == 0:
-                    preds = preds.detach()
-
-            loss = loss / T_unroll
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            # Update loss and accuracy
-            loss_meter.update(loss.item(), inputs.size(0))
-
-            progress_bar.set_postfix(loss=loss_meter.avg, lr=optimizer.param_groups[0]["lr"])
-
-            if i >= iterations:
-                break
-
-            if scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step()
-
-        avg_loss = loss_meter.avg
-
-        if scheduler is not None and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step(avg_loss)
-
-        if avg_loss < best_loss or epoch == 0:
-            best_loss = avg_loss
-            torch.save(model.state_dict(), Path(savepath) / Path("best_model.pth"))
-
-        writer.add_scalar("loss", avg_loss, epoch + 1)
-        writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch + 1)
-
-        if test_loader is not None:
-
-            with torch.no_grad():
-                valoss_meter = AverageMeter()
-                # Test step: set the model to inference mode
-                model.eval()
-                progress_bar = tqdm(
-                    test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test]", leave=True, total=len(test_loader)
-                )
-
-                for i, (inputs, targets) in enumerate(progress_bar):
-                    inputs = inputs.to(device)
-                    T_unroll = inputs.shape[1]
-                    valoss = 0.0
-                    preds = inputs[:, 0, ...]
-                    for t in range(1, T_unroll):
-                        preds = model(preds)  # Predict u_{t}
-                        # Ground truth
-                        targets = inputs[:, t, ...]
-
-                        # Accumulate loss
-                        valoss += loss_fn(preds, targets)
-
-                    valoss = test_step(model, inputs, targets, loss_fn, lossweights=lossweights)
-
-                    # Update loss and accuracy
-                    valoss_meter.update(valoss.item(), inputs.size(0))
-
-            progress_bar.set_postfix(loss=valoss_meter.avg)
-
-            avg_valoss = valoss_meter.avg
-
-            if avg_valoss < best_val_loss or epoch == 0:
-                best_val_loss = avg_valoss
-                torch.save(model.state_dict(), Path(savepath) / Path("best_val_model.pth"))
-
-            writer.add_scalar("val_loss", avg_valoss, epoch + 1)
-
-
-def CoDANO_training(
-    model: nn.Module,
-    dataloader: torch.utils.data.DataLoader,
-    epochs: int,
-    optimizer: torch.optim.Optimizer,
-    savepath: Union[str, Path],
-    loss_fn: Callable = F.mse_loss,
-    loss_method: str = "physical",
-    dt: Union[float, None] = None,
-    detach_every_k: int = 4,
-    test_loader: Union[None, torch.utils.data.DataLoader] = None,
-    device: Union[torch.device, None] = None,
-    lossweights: Union[Sequence[float], None] = None,
-    scheduler: Union[None,] = None,
-    iterations: Union[None, int] = None,
-):
-    """Train a model using the CoDANO method.
-    Parameters
-    ----------
-    model : torch.nn.Module
-        The model to train.
-    dataloader : torch.utils.data.DataLoader
-        The dataloader to use for training. It must return a tuple of (inputs, static_field).
-        The inputs are the sequence of tensors at different successive times: t_0, ..., t_n
-        -> shape b t_n c h w, where c is the number of variables (e.g. velocity, pressure, etc.) and h, w are the spatial dimensions.
-        The static_field is the static field to use for training. It must be the same spatial shape as the inputs.
-    epochs : int
-        The number of epochs to train for.
-    optimizer : torch.optim.Optimizer
-        The optimizer to use for training.
-    savepath : str
-        The path to save the model.
-    loss_fn : Callable
-        The loss function to use for training.
-    loss_method : str
-        The method to use for loss calculation. "physical", "data" or "both".
-    dt : float
-        The time step size. Must be set if loss_method == 'physical' or 'both'.
-    detach_every_k : int
-        The number of steps to detach the gradient.
-    test_loader : torch.utils.data.DataLoader
-        The dataloader to use for testing.
-    device : torch.device
-        The device to use for training. If None, will use the first available GPU or CPU.
-    lossweights : float
-        The weights to use for physical and data loss. If None, will use 1.0 for both.
-    scheduler : torch.optim.lr_scheduler
-        The scheduler to use for training.
-    iterations : int
-        The number of iterations to train for. If None, will use the length of the dataloader.
-    """
-
-    os.makedirs(savepath, exist_ok=True)
-
-    writer = SummaryWriter(savepath)
-
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") if device is None else device
-    model.to(device)
-
-    best_loss = float("inf")
-    best_val_loss = float("inf")
-
-    if iterations is None:
-        iterations = len(dataloader)
-
-    if lossweights is None:
-        lossweights = [1.0, 1.0]
-
-    for epoch in range(epochs):
-
-        model.train()
-        loss_meter = AverageMeter()
-        physical_loss_meter = AverageMeter()
-        data_loss_meter = AverageMeter()
-
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} [Training]", leave=True, total=iterations)
-
-        for i, (inputs, static_field) in enumerate(progress_bar):
-            inputs = inputs.to(device)
-            static_field = static_field.to(device)
-            T_unroll = inputs.shape[1]
-            loss = 0.0
-            physical_loss = 0.0
-            data_loss = 0.0
-            previous_preds = inputs[:, 0, ...]
-            for t in range(1, T_unroll):
-
-                preds, coords = model(
-                    previous_preds, static_channel=static_field, return_coords=True
-                )  # Predict u_{t} from u{t-1}
-                # Ground truth
-                targets = inputs[:, t, ...]
-
-                # Accumulate loss
-                if loss_method == "physical" or loss_method == "both":
-                    physical_loss += diffusion_loss(
-                        preds,
-                        previous_preds,
-                        dt=dt,
-                        diffusivity=static_field,
-                        x_coords=coords[0],
-                        y_coords=coords[1],
-                        time_derivative="fd",
-                    )
-                if loss_method == "data" or loss_method == "both":
-                    data_loss += loss_fn(preds, targets)
-
-                loss += lossweights[0] * data_loss + lossweights[1] * physical_loss
-
-                # Truncated gradient: detach every k steps
-                if (t % detach_every_k) == 0:
-                    preds = preds.detach()
-
-                previous_preds = preds
-
-            loss = loss / (T_unroll - 1)
-            physical_loss = physical_loss / (T_unroll - 1)
-            data_loss = data_loss / (T_unroll - 1)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            # Update loss and accuracy
-            loss_meter.update(loss.item(), inputs.size(0))
-            physical_loss_meter.update(physical_loss.item(), inputs.size(0))
-            data_loss_meter.update(data_loss.item(), inputs.size(0))
-
-            progress_bar.set_postfix(
-                loss=loss_meter.avg,
-                data_loss=data_loss_meter.avg,
-                physical_loss=physical_loss_meter.avg,
-                lr=optimizer.param_groups[0]["lr"],
+    losses = []
+    for spec in loss_specs:
+        if isinstance(spec, str):
+            name, params = spec, {}
+        elif isinstance(spec, dict) and "name" in spec:
+            name, params = str(spec["name"]), spec.get("params", {})
+        else:
+            raise ValueError(f"Invalid loss spec {spec!r}: expected a name string or {{'name': ..., 'params': ...}}.")
+        if name not in registry:
+            raise ValueError(
+                f"Unknown loss {name!r}. Available losses: {sorted(registry)}."
             )
+        try:
+            losses.append(registry[name](**_resolve_activation(params)))
+        except TypeError as e:
+            raise ValueError(f"Failed to instantiate loss {name} with params {sorted(params)}: {e}") from e
+    return losses
 
-            if i >= iterations:
-                break
 
-            if scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step()
+def build_optimizer(model: nn.Module, opt_cfg: Optional[dict], lr: float) -> torch.optim.Optimizer:
+    """Build the optimizer from a JSON config dict.
 
-        avg_loss = loss_meter.avg
+    Args:
+        model: Model whose (trainable) parameters are optimized.
+        opt_cfg: Dict with ``"name"`` (a ``torch.optim`` class name, default
+            ``"AdamW"``) plus constructor kwargs (e.g. ``weight_decay``,
+            ``betas``). The learning rate is taken from the phase config and
+            passed as ``lr``.
+        lr: Learning rate for this phase.
 
-        if scheduler is not None and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step(avg_loss)
+    Returns:
+        The instantiated optimizer over all parameters with ``requires_grad``.
 
-        if avg_loss < best_loss or epoch == 0:
-            best_loss = avg_loss
-            torch.save(model.state_dict(), Path(savepath) / Path("best_model.pth"))
+    Raises:
+        ValueError: If the optimizer name cannot be resolved or instantiation fails.
+    """
+    opt_cfg = dict(opt_cfg or {})
+    name = opt_cfg.pop("name", "AdamW")
+    if not hasattr(torch.optim, name):
+        raise ValueError(f"Unknown optimizer {name!r}. Use a torch.optim class name (e.g. 'AdamW', 'SGD').")
+    opt_cls = getattr(torch.optim, name)
 
-        writer.add_scalar("loss", avg_loss, epoch + 1)
-        writer.add_scalar("data_loss", data_loss_meter.avg, epoch + 1)
-        writer.add_scalar("physical_loss", physical_loss_meter.avg, epoch + 1)
-        writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch + 1)
+    params = _resolve_activation(opt_cfg)  # e.g. betas list -> kept as-is; no activations expected here
+    if "betas" in params:
+        params["betas"] = tuple(params["betas"])
+    try:
+        return opt_cls(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, **params)
+    except TypeError as e:
+        raise ValueError(f"Failed to instantiate optimizer {name} with kwargs {sorted(params)}: {e}") from e
 
-        if test_loader is not None:
 
-            with torch.no_grad():
-                valoss_meter = AverageMeter()
-                physical_loss_meter = AverageMeter()
-                data_loss_meter = AverageMeter()
-                # Test step: set the model to inference mode
-                model.eval()
-                progress_bar = tqdm(
-                    test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test]", leave=True, total=len(test_loader)
-                )
+def build_scheduler_config(
+    scheduler_cfg: Optional[dict], phase_lr: float, total_steps: int, steps_per_epoch: int
+) -> Optional[list]:
+    """Build the Lightning ``scheduler_config`` list from a JSON dict.
 
-                for i, (inputs, static_field) in enumerate(progress_bar):
-                    inputs = inputs.to(device)
-                    static_field = static_field.to(device)
-                    T_unroll = inputs.shape[1]
-                    valoss = 0.0
-                    physical_loss = 0.0
-                    data_loss = 0.0
-                    previous_preds = inputs[:, 0, ...]
-                    for t in range(1, T_unroll):
-                        preds, coords = model(previous_preds, static_channel=static_field, return_coords=True)
-                        targets = inputs[:, t, ...]
-                        if loss_method == "physical" or loss_method == "both":
-                            physical_loss += diffusion_loss(
-                                preds,
-                                previous_preds,
-                                dt=dt,
-                                diffusivity=static_field,
-                                x_coords=coords[0],
-                                y_coords=coords[1],
-                                time_derivative="fd",
-                            )
-                        if loss_method == "data" or loss_method == "both":
-                            data_loss += loss_fn(preds, targets)
-                        valoss += lossweights[0] * data_loss + lossweights[1] * physical_loss
-                        previous_preds = preds
+    Args:
+        scheduler_cfg: Dict with ``"name"`` (a ``torch.optim.lr_scheduler``
+            class name or ``"cosine_schedule_with_warmup"``), constructor
+            kwargs, and optional Lightning keys ``interval`` / ``monitor`` /
+            ``frequency`` / ``strict``. String tokens ``"$total_steps"`` and
+            ``"$steps_per_epoch"`` are replaced by the computed values. For
+            OneCycleLR an omitted ``max_lr`` defaults to ``phase_lr``.
+        phase_lr: Learning rate of the current phase (OneCycleLR maximum LR).
+        total_steps: ``max_epochs * len(train_dataloader)``.
+        steps_per_epoch: ``len(train_dataloader)``.
 
-                    valoss = valoss / (T_unroll - 1)
-                    physical_loss = physical_loss / (T_unroll - 1)
-                    data_loss = data_loss / (T_unroll - 1)
+    Returns:
+        A list with a single scheduler dict in the format expected by
+        :meth:`MultiStepLightningBase.configure_optimizers`, or ``None`` if no
+        scheduler is configured (the optimizer then runs at constant LR).
 
-                    valoss_meter.update(valoss.item(), inputs.size(0))
-                    physical_loss_meter.update(physical_loss.item(), inputs.size(0))
-                    data_loss_meter.update(data_loss.item(), inputs.size(0))
+    Raises:
+        ValueError: If the scheduler name cannot be resolved, an unknown token
+            is used, or instantiation fails.
+    """
+    if not scheduler_cfg:
+        return None
 
-                progress_bar.set_postfix(
-                    loss=valoss_meter.avg,
-                    data_loss=data_loss_meter.avg,
-                    physical_loss=physical_loss_meter.avg,
-                )
+    from .schedulers import cosine_schedule_with_warmup  # local import (package-level cycle safety)
 
-                avg_valoss = valoss_meter.avg
+    cfg = dict(scheduler_cfg)
+    name = str(cfg.pop("name"))
 
-                if avg_valoss < best_val_loss or epoch == 0:
-                    best_val_loss = avg_valoss
-                    torch.save(model.state_dict(), Path(savepath) / Path("best_val_model.pth"))
+    registry = {n: getattr(torch.optim.lr_scheduler, n) for n in ("OneCycleLR", "ReduceLROnPlateau", "StepLR", "CosineAnnealingLR", "ExponentialLR")}
+    registry["cosine_schedule_with_warmup"] = cosine_schedule_with_warmup
 
-                writer.add_scalar("val_loss", avg_valoss, epoch + 1)
-                writer.add_scalar("val_data_loss", data_loss_meter.avg, epoch + 1)
-                writer.add_scalar("val_physical_loss", physical_loss_meter.avg, epoch + 1)
+    if name not in registry:
+        raise ValueError(f"Unknown scheduler {name!r}. Available: {sorted(registry)}")
 
-    writer.close()
+    # Lightning-specific keys are consumed by configure_optimizers, not passed to the
+    # scheduler constructor — keep them out of the token substitution below.
+    lightning_keys = ("interval", "monitor", "frequency", "strict")
+    lightning_params = {k: cfg.pop(k) for k in list(cfg) if k in lightning_keys}
+
+    tokens = {"$total_steps": total_steps, "$steps_per_epoch": steps_per_epoch}
+    for key, value in list(cfg.items()):
+        if isinstance(value, str):
+            if value not in tokens:
+                raise ValueError(f"Unknown scheduler token {value!r} (key {key!r}). Available: {sorted(tokens)}")
+            cfg[key] = tokens[value]
+
+    if name == "OneCycleLR" and "max_lr" not in cfg:
+        cfg["max_lr"] = phase_lr  # as in the notebooks: phase lr is the OneCycle maximum
+
+    entry = {"scheduler": registry[name], **cfg, **lightning_params}
+    return [entry]
+
+
+# ---------------------------------------------------------------------------
+# Phase selection / dataset
+# ---------------------------------------------------------------------------
+
+
+def select_phase(training_cfg: dict, pretrain: bool) -> tuple:
+    """Select the training-phase section of a ``TrainingConfig.json`` dict.
+
+    Args:
+        training_cfg: Parsed training config.
+        pretrain: If True use the ``"pretraining"`` section, otherwise the
+            ``"fulltraining"`` section (mirrors the CLI ``--pretrain`` flag).
+
+    Returns:
+        Tuple ``(phase_name, phase_dict)``.
+
+    Raises:
+        KeyError: If the requested section is missing from the config.
+    """
+    phase_name = "pretraining" if pretrain else "fulltraining"
+    if phase_name not in training_cfg or not isinstance(training_cfg[phase_name], dict):
+        raise KeyError(
+            f'TrainingConfig must contain a "{phase_name}" section '
+            f"(use --pretrain to select the pretraining phase). Found sections: {sorted(training_cfg)}"
+        )
+    return phase_name, training_cfg[phase_name]
+
+
+def build_pdebench_dataloaders(ds_cfg: dict, phase_cfg: dict, input_steps: int) -> tuple:
+    """Build train/val :class:`DataLoader` pairs for the PDEBench dataset.
+
+    Reproduces the notebook protocol: all simulation IDs are shuffled with a
+    seeded RNG, truncated to ``n_samples``, then split by ``split_ratio`` on
+    the *simulation IDs* (so both phases share the same subset of simulations).
+    The window length is derived as ``max_AR_steps + input_steps + 1``.
+
+    Args:
+        ds_cfg: The ``"dataset"`` section of the training config. Requires
+            ``type == "pdebench"``, ``path`` and ``batch_size``; optional keys
+            are ``num_workers``, ``load_in_ram``, ``shift``, ``scale``,
+            ``split_ratio`` (default 0.9) and ``random_seed`` (default 42).
+        phase_cfg: The selected phase section (provides ``delta_ts``,
+            ``min_id``, ``max_id``, ``n_samples``, ``max_AR_steps``; an
+            optional per-phase ``split_ratio`` override).
+        input_steps: Number of past slices given to the network.
+
+    Returns:
+        Tuple ``(train_loader, val_loader, window_size)``.
+
+    Raises:
+        ValueError: If the dataset type is not supported or a required key is missing.
+    """
+    ds_type = str(ds_cfg.get("type", "")).lower()
+    if ds_type != "pdebench":
+        raise ValueError(f"Unsupported dataset type {ds_cfg.get('type')!r}: only 'pdebench' is supported for now.")
+    if "path" not in ds_cfg:
+        raise KeyError('The "dataset" section requires a "path".')
+    if "batch_size" not in ds_cfg:
+        raise KeyError('The "dataset" section requires a "batch_size".')
+
+    path = Path(ds_cfg["path"])
+    window_size = int(phase_cfg["max_AR_steps"]) + input_steps + 1
+    delta_ts = phase_cfg.get("delta_ts")
+    min_id = int(phase_cfg.get("min_id", 0))
+    max_id = phase_cfg.get("max_id")
+    n_samples = phase_cfg.get("n_samples")
+    split_ratio = float(phase_cfg.get("split_ratio", ds_cfg.get("split_ratio", 0.9)))
+    seed = int(ds_cfg.get("random_seed", 42))
+
+    with h5py.File(path, "r") as f:
+        all_ids = list(f.keys())
+    rng = random.Random(seed)
+    rng.shuffle(all_ids)
+    if n_samples is not None:
+        all_sample_ids = all_ids[: min(len(all_ids), int(n_samples))]
+    else:
+        all_sample_ids = all_ids
+
+    n_train = int(len(all_sample_ids) * split_ratio)
+    train_ids, val_ids = all_sample_ids[:n_train], all_sample_ids[n_train:]
+    if not train_ids or not val_ids:
+        raise ValueError(
+            f"Empty split: {len(train_ids)} train / {len(val_ids)} valid simulations "
+            f"(n_samples={n_samples}, split_ratio={split_ratio}). Check the dataset config."
+        )
+
+    common = dict(
+        T_unroll=window_size,
+        step=int(delta_ts) if delta_ts is not None else None,
+        load_in_ram=bool(ds_cfg.get("load_in_ram", False)),
+        min_id=min_id,
+        max_id=max_id,
+        shift=float(ds_cfg.get("shift", 0.0)),
+        scale=float(ds_cfg.get("scale", 1.0)),
+    )
+    train_set = PDEBenchDataSet(path, indexes=train_ids, **common)
+    val_set = PDEBenchDataSet(path, indexes=val_ids, **common)
+
+    batch_size = int(ds_cfg["batch_size"])
+    num_workers = int(ds_cfg.get("num_workers", 0))
+    train_loader = DataLoader(train_set, shuffle=True, batch_size=batch_size, num_workers=num_workers)
+    val_kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())
+    if num_workers > 0:
+        val_kwargs["persistent_workers"] = True
+    val_loader = DataLoader(val_set, shuffle=False, **val_kwargs)
+
+    print(
+        f"Dataset '{path.name}': {len(train_ids)} train / {len(val_ids)} valid simulations, "
+        f"window_size={window_size}, stride={common['step']}, t in [{min_id}, {max_id if max_id is not None else 'end'}]"
+    )
+    return train_loader, val_loader, window_size
+
+
+# ---------------------------------------------------------------------------
+# TrainingConfig / callbacks / loggers
+# ---------------------------------------------------------------------------
+
+
+def build_training_config(shared: dict, losses: list, input_steps: int, phase_cfg: dict) -> TrainingConfig:
+    """Build the :class:`TrainingConfig` from the shared + phase sections.
+
+    Args:
+        shared: The ``"shared_params"`` section (dt, loss weights, AR detach,
+            derivative regularizer, noise, temporal weighting, ...).
+        losses: Loss modules built by :func:`build_losses`.
+        input_steps: Number of past slices given to the network (``n_slices``).
+        phase_cfg: The selected phase section (AR curriculum bounds).
+
+    Returns:
+        The populated :class:`TrainingConfig`.
+    """
+    return TrainingConfig(
+        dt=float(shared.get("timestep", 1.0)),
+        start_autoregressive=phase_cfg.get("start_AR"),
+        final_autoregressive=phase_cfg.get("final_AR"),
+        min_autoregressive_steps=int(phase_cfg.get("min_AR_steps", 0)),
+        max_autoregressive_steps=int(phase_cfg["max_AR_steps"]),
+        detach_grad_steps=int(shared.get("detach_grad_steps", 4)),
+        loss_fn=losses,
+        loss_weights=shared.get("loss_weights", 1.0),
+        derivative_loss_weight=float(shared.get("derivative_loss_weight", 1.0)),
+        predict_derivative=bool(shared.get("predict_derivative", True)),
+        noise_level=float(shared.get("noise_level", 0.0)),
+        time_normalization=float(shared.get("time_normalization", 1.0)),
+        n_slices=input_steps,
+        temporal_weighting=float(shared.get("temporal_weighting", 1.2)),
+    )
+
+
+class _ScientificTQDMProgressBar(TQDMProgressBar):
+    """TQDM progress bar printing float metrics in scientific notation."""
+
+    def get_metrics(self, trainer, model):  # noqa: D102 - Lightning API signature
+        items = super().get_metrics(trainer, model)
+        return {k: (f"{v:.3e}" if isinstance(v, float) else v) for k, v in items.items()}
+
+
+def make_callbacks(logdir: Path, start_monitoring: int) -> list:
+    """Build the checkpoint / logging callbacks.
+
+    Checkpoint policy (see module docstring): ``last.ckpt`` is saved every
+    epoch from the start; the monitored best checkpoints only start saving
+    once the rollout reaches the maximum number of AR steps
+    (epoch >= ``start_monitoring``, i.e. ``final_AR``).
+
+    Args:
+        logdir: Run directory where checkpoints are written.
+        start_monitoring: Epoch at which best-model monitoring starts
+            (the phase's ``final_AR``).
+
+    Returns:
+        List of Lightning callbacks.
+
+    Notes:
+        ``save_on_train_epoch_end=False`` pins every save to the end of
+        validation, where both monitored metrics (train ``RMSE`` and
+        ``val_RMSE``) are available in ``callback_metrics`` — with the PL 2.x
+        default (auto), saving would happen at train-epoch-end instead.
+    """
+    return [
+        # Always the weights of the last completed epoch (overwritten each epoch).
+        ModelCheckpoint(dirpath=logdir, filename="last", save_top_k=1, save_on_train_epoch_end=False),
+        # Best models: only once max AR steps are reached (metrics comparable from then on).
+        CurriculumCheckpoint(
+            start_epoch=start_monitoring,
+            dirpath=logdir,
+            monitor="RMSE",
+            filename="best_RMSE",
+            mode="min",
+            save_top_k=2,
+            save_on_train_epoch_end=False,
+        ),
+        CurriculumCheckpoint(
+            start_epoch=start_monitoring,
+            dirpath=logdir,
+            monitor="val_RMSE",
+            filename="best_val_RMSE",
+            mode="min",
+            save_top_k=2,
+            save_on_train_epoch_end=False,
+        ),
+        LearningRateMonitor(logging_interval="epoch"),
+        _ScientificTQDMProgressBar(leave=True),
+    ]
+
+
+def make_loggers(logdir: Path, names: Optional[Sequence[str]]) -> list:
+    """Build the loggers from a list of names.
+
+    Args:
+        logdir: Run directory (CSV is written there, TensorBoard under ``tb_logs``).
+        names: Iterable of logger names among ``"csv"`` and ``"tensorboard"``/``"tb"``.
+            If None, both are enabled (notebook default); an empty list disables logging.
+
+    Returns:
+        List of Lightning loggers.
+
+    Raises:
+        ValueError: On unknown logger names.
+    """
+    if names is None:
+        names = ["csv", "tensorboard"]
+    loggers = []
+    for name in names:
+        key = str(name).lower()
+        if key == "csv":
+            loggers.append(CSVLogger(save_dir=logdir))
+        elif key in ("tensorboard", "tb"):
+            loggers.append(TensorBoardLogger(save_dir=Path(logdir) / "tb_logs"))
+        else:
+            raise ValueError(f"Unknown logger {name!r}. Available: 'csv', 'tensorboard'.")
+    return loggers
+
+
+def resolve_device(device: str) -> str:
+    """Resolve the ``--device`` option to a Lightning accelerator name.
+
+    Args:
+        device: One of ``"auto"``, ``"cuda"``, ``"cpu"``.
+
+    Returns:
+        ``"gpu"`` or ``"cpu"``.
+
+    Raises:
+        RuntimeError: If CUDA is requested but unavailable.
+    """
+    if device == "auto":
+        return "gpu" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested (--device cuda) but no GPU is available.")
+        return "gpu"
+    return "cpu"
+
+
+def _load_weights_only(model: nn.Module, path: PathLike) -> None:
+    """Load model weights (only) from a checkpoint file.
+
+    Accepts either a full Lightning checkpoint (the ``state_dict`` entry with
+    the ``model.`` prefix is extracted and stripped) or a bare state dict.
+
+    Args:
+        model: Target model to load into.
+        path: Path to the checkpoint file.
+
+    Raises:
+        ValueError: If the state dict cannot be matched strictly.
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+
+    has_prefix = any(k.startswith("model.") for k in state_dict)
+    cleaned = {k[len("model."):]: v for k, v in state_dict.items() if k.startswith("model.")} if has_prefix else dict(state_dict)
+    try:
+        model.load_state_dict(cleaned, strict=True)
+    except RuntimeError as e:
+        raise ValueError(f"Could not load weights from {path} into {type(model).__name__}: {e}") from e
+    print(f"Weights loaded from {path} ({len(cleaned)} tensors).")
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+
+def run_training(
+    model_config_path: PathLike,
+    training_config_path: PathLike,
+    pretrain: bool = False,
+    device: str = "auto",
+    output_root: Optional[PathLike] = None,
+    resume_from: Optional[PathLike] = None,
+    init_from: Optional[PathLike] = None,
+) -> Path:
+    """Run a full training phase from two JSON config files.
+
+    Args:
+        model_config_path: Path to the ``ModelConfig.json`` file.
+        training_config_path: Path to the ``TrainingConfig.json`` file.
+        pretrain: If True use the ``"pretraining"`` section, otherwise
+            ``"fulltraining"``.
+        device: ``"auto"``, ``"cuda"`` or ``"cpu"``.
+        output_root: Optional override of ``output.root`` from the config.
+        resume_from: Optional checkpoint path for a full Lightning resume
+            (optimizer/scheduler/epoch restored).
+        init_from: Optional checkpoint path to warm-start the model weights
+            only (fresh optimizer — phase-1 -> phase-2 handoff).
+
+    Returns:
+        The run log directory (checkpoints, logs and saved configs are there).
+    """
+    model_cfg = load_json(model_config_path)
+    training_cfg = load_json(training_config_path)
+
+    # ------------------------------------------------------------------ setup
+    phase_name, phase_cfg = select_phase(training_cfg, pretrain)
+    ds_cfg = training_cfg.get("dataset")
+    if not isinstance(ds_cfg, dict):
+        raise KeyError('TrainingConfig must contain a "dataset" section.')
+    shared = training_cfg.get("shared_params", {})
+
+    input_steps = int(training_cfg["input_steps"]) if "input_steps" in training_cfg else 10
+    seed = int(ds_cfg.get("random_seed", 42))
+    pl.seed_everything(seed, workers=True)
+
+    accelerator = resolve_device(device)
+    torch.set_float32_matmul_precision("highest")
+
+    # ------------------------------------------------------------------ model
+    model_name = str(model_cfg.get("name") or model_cfg["model"])
+    model = build_model(model_cfg)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Model: {type(model).__name__} ({n_params / 1e6:.2f} M params), run name '{model_name}', phase '{phase_name}'")
+
+    # ------------------------------------------------------------------ data
+    train_loader, val_loader, window_size = build_pdebench_dataloaders(ds_cfg, phase_cfg, input_steps)
+    max_epochs = int(phase_cfg["max_epochs"])
+    total_steps = max_epochs * len(train_loader)
+    steps_per_epoch = len(train_loader)
+
+    # ------------------------------------------------------------------ losses / optimizer / scheduler
+    losses = build_losses(training_cfg.get("losses"))
+    train_config = build_training_config(shared, losses, input_steps, phase_cfg)
+
+    lr = float(phase_cfg["lr"])
+    optimizer = build_optimizer(model, training_cfg.get("optimizer"), lr=lr)
+
+    base_scheduler = dict(training_cfg.get("scheduler") or {})
+    if "scheduler" in phase_cfg:  # per-phase overrides merged over the base section
+        base_scheduler.update(phase_cfg["scheduler"])
+    scheduler_config = build_scheduler_config(base_scheduler, phase_lr=lr, total_steps=total_steps, steps_per_epoch=steps_per_epoch)
+
+    # ------------------------------------------------------------------ lightning module
+    if hasattr(model, "branchnet") and hasattr(model, "trunknet"):
+        lightning_model = DeepONetModel(model=model, optimizer=optimizer, train_config=train_config, scheduler_config=scheduler_config)
+    else:
+        lightning_model = MultiStepNOModel(model=model, optimizer=optimizer, train_config=train_config, scheduler_config=scheduler_config)
+
+    # ------------------------------------------------------------------ run directory / bookkeeping
+    output_cfg = training_cfg.get("output", {})
+    root = Path(output_root if output_root is not None else output_cfg.get("root", "./PDETraining"))
+    experiment = str(output_cfg.get("experiment", "PDEBENCH"))
+    phase_logdir = str(phase_cfg.get("logdir", phase_name))
+    now = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    logdir = root / experiment / phase_logdir / model_name / f"{input_steps}steps_{now}"
+    logdir.mkdir(parents=True, exist_ok=True)
+
+    final_ar = int(phase_cfg.get("final_AR", 0))
+    if final_ar >= max_epochs:
+        print(
+            f"WARNING: final_AR ({final_ar}) >= max_epochs ({max_epochs}): the rollout never reaches "
+            "the maximum AR steps, so no best checkpoint will be saved (only last.ckpt)."
+        )
+
+    run_info = {
+        "timestamp": now,
+        "phase": phase_name,
+        "pretrain": pretrain,
+        "model": {"name": model_name, "class": type(model).__name__, "params": n_params},
+        "input_steps": input_steps,
+        "window_size": window_size,
+        "dataset": {
+            "path": str(ds_cfg["path"]),
+            "delta_ts": phase_cfg.get("delta_ts"),
+            "min_id": phase_cfg.get("min_id", 0),
+            "max_id": phase_cfg.get("max_id"),
+            "n_samples_used": len(train_loader.dataset.sample_ids) + len(val_loader.dataset.sample_ids),
+        },
+        "train_ids": list(train_loader.dataset.sample_ids),
+        "val_ids": list(val_loader.dataset.sample_ids),
+        "lr": lr,
+        "max_epochs": max_epochs,
+        "total_steps": total_steps,
+        "checkpoint_gate_epoch": final_ar,  # best checkpoints start saving at this epoch
+        "device": accelerator,
+        "seed": seed,
+    }
+    with open(logdir / "model_config.json", "w", encoding="utf-8") as f:
+        json.dump(model_cfg, f, indent=4)
+    with open(logdir / "training_config.json", "w", encoding="utf-8") as f:
+        json.dump(training_cfg, f, indent=4)
+    with open(logdir / "run_info.json", "w", encoding="utf-8") as f:
+        json.dump(run_info, f, indent=4)
+
+    print(f"Total number of steps: {total_steps} ({max_epochs} epochs x {steps_per_epoch} batches)")
+    print(
+        f"Checkpoints in {logdir}: last.ckpt every epoch; best_RMSE/best_val_RMSE from "
+        f"epoch {final_ar} (max AR steps reached)."
+    )
+
+    # ------------------------------------------------------------------ trainer
+    trainer_cfg = training_cfg.get("trainer", {})
+    callbacks = make_callbacks(logdir, start_monitoring=final_ar)
+    loggers = make_loggers(logdir, training_cfg.get("loggers"))
+
+    trainer_kwargs = dict(
+        max_epochs=max_epochs,
+        callbacks=callbacks,
+        accelerator=accelerator,
+        devices=1,
+        logger=loggers if loggers else False,
+        num_sanity_val_steps=0,
+        log_every_n_steps=int(trainer_cfg.get("log_every_n_steps", 50)),
+    )
+    gradient_clip_val = float(trainer_cfg.get("gradient_clip_val", 0.0))
+    if gradient_clip_val > 0:
+        trainer_kwargs["gradient_clip_val"] = gradient_clip_val
+        trainer_kwargs["gradient_clip_algorithm"] = str(trainer_cfg.get("gradient_clip_algorithm", "norm"))
+
+    trainer = pl.Trainer(**trainer_kwargs)
+
+    # ------------------------------------------------------------------ (re)start
+    if init_from is not None:
+        _load_weights_only(lightning_model.model, Path(init_from))
+    ckpt_path = str(Path(resume_from)) if resume_from is not None else None
+    if ckpt_path is not None:
+        print(f"Resuming from checkpoint {ckpt_path}")
+
+    trainer.fit(
+        lightning_model,
+        train_dataloaders=train_loader,
+        val_dataloaders=val_loader,
+        ckpt_path=ckpt_path,
+    )
+    return logdir
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Parse the command-line arguments.
+
+    Args:
+        argv: Argument list (defaults to ``sys.argv[1:]``).
+
+    Returns:
+        The parsed namespace.
+    """
+    parser = argparse.ArgumentParser(
+        prog="pynop.train",
+        description=(
+            "Train a PyNOP multi-step prediction model from JSON configs "
+            "(PDEBench dataset, two-phase protocol of the training notebooks)."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("model_config", type=Path, help="Path to ModelConfig.json (model class + constructor params).")
+    parser.add_argument("training_config", type=Path, help="Path to TrainingConfig.json (dataset, losses, phases).")
+    parser.add_argument(
+        "--pretrain",
+        action="store_true",
+        help='Use the "pretraining" section of the training config (default: "fulltraining").',
+    )
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto", help="Compute device.")
+    parser.add_argument("--output-root", type=Path, default=None, help="Override output.root from the training config.")
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="Full Lightning resume from a checkpoint (e.g. <logdir>/last.ckpt): optimizer/scheduler/epoch restored.",
+    )
+    parser.add_argument(
+        "--init-from",
+        dest="init_from",
+        type=Path,
+        default=None,
+        help="Load only the model weights from a previous run's checkpoint (fresh optimizer; phase-1 -> phase-2 warm start).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> Path:
+    """CLI entry point.
+
+    Args:
+        argv: Argument list (defaults to ``sys.argv[1:]``).
+
+    Returns:
+        The run log directory.
+    """
+    args = parse_args(argv)
+    return run_training(
+        model_config_path=args.model_config,
+        training_config_path=args.training_config,
+        pretrain=args.pretrain,
+        device=args.device,
+        output_root=args.output_root,
+        resume_from=args.resume,
+        init_from=args.init_from,
+    )
+
+
+if __name__ == "__main__":
+    main()

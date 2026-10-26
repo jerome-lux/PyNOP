@@ -1,0 +1,75 @@
+{
+    "input_steps": 10,
+    "dataset": {
+        "type": "pdebench",
+        "path": "/run/media/jlux/SSD2/datasets/pdebench/2d_reaction_diffusion/133017.hdf5",
+        "batch_size": 5,
+        "num_workers": 10,
+        "load_in_ram": true,
+        "shift": 0.0,
+        "scale": 1.0,
+        "split_ratio": 0.9,
+        "random_seed": 42
+    },
+    "shared_params": {
+        "timestep": 5e-2,
+        "loss_weights": [1e4, 1e4, 1e4],
+        "temporal_weighting": 1.1,
+        "detach_grad_steps": 40,
+        "derivative_loss_weight": 1.0,
+        "predict_derivative": true,
+        "noise_level": 0.0,
+        "time_normalization": 101
+    },
+    "losses": [
+        {"name": "DWMSELoss"},
+        {"name": "SpectralLoss", "params": {"beta": 2}},
+        {"name": "SobolevLoss", "params": {"l1": 1.0, "l2": 1.0}}
+    ],
+    "optimizer": {
+        "name": "AdamW",
+        "weight_decay": 5e-4,
+        "betas": [0.9, 0.99]
+    },
+    "scheduler": {
+        "name": "OneCycleLR",
+        "div_factor": 1e3,
+        "final_div_factor": 1e2,
+        "pct_start": 0.02,
+        "total_steps": "$total_steps",
+        "interval": "step"
+    },
+    "trainer": {
+        "gradient_clip_val": 1.0,
+        "log_every_n_steps": 50
+    },
+    "output": {
+        "root": "/run/media/jlux/SSD2/PDETraining",
+        "experiment": "PDEBENCH"
+    },
+    "loggers": ["csv", "tensorboard"],
+    "pretraining": {
+        "delta_ts": 2,
+        "min_id": 0,
+        "max_id": 50,
+        "n_samples": 40,
+        "lr": 2e-4,
+        "max_epochs": 300,
+        "start_AR": 0,
+        "final_AR": 200,
+        "min_AR_steps": 2,
+        "max_AR_steps": 10
+    },
+    "fulltraining": {
+        "delta_ts": 4,
+        "min_id": 0,
+        "max_id": null,
+        "n_samples": 400,
+        "lr": 1e-4,
+        "max_epochs": 100,
+        "start_AR": 0,
+        "final_AR": 0,
+        "min_AR_steps": 10,
+        "max_AR_steps": 10
+    }
+}
