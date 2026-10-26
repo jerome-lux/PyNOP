@@ -29,7 +29,6 @@ class ITLNO(nn.Module):
         out_channels (int): Number of output channels.
         modes (Union[int, Sequence[int]]): Number of modes for the integral transform. If int, uses the same
             value for both dimensions. If sequence, uses modes[0] for m1 and modes[1] for m2.
-        dt (float): Time step or scaling factor for the integral transform. Default: 1.
         num_blocks (int): Number of transformer blocks in the latent domain. Default: 4.
         hidden_channels (int): Hidden channel dimension for the latent representation. Default: 256.
         num_heads (int): Number of attention heads in transformer blocks. Default: 4.
@@ -41,14 +40,20 @@ class ITLNO(nn.Module):
         mlp_act (Callable): Activation function used in MLP embedding blocks. Default: nn.GELU.
         mlp_factor (int): Expansion factor for the MLP hidden dimension. Default: 4.
         dropout (float): Dropout probability. Default: 0.
-        dim (int): Spatial dimension of the input domain. Default: 2.
+        ndim (int): Spatial dimension of the input domain. Default: 2.
         orthogonal_init (bool): Whether to use orthogonal initialization for basis weights. Default: True.
         cond_dim (Union[int, None]): Dimension of optional conditioning input. Default: None.
-        basis_mode (str): Type of basis to use for the integral transform. Default: "learned".
+        basis_mode (str): Type of basis to use for the integral transform ("learned" or "cheb"). Default: "learned".
         rmsnorm (bool): Whether to use RMS normalization instead of layer norm. Default: True.
         verbose (bool): Whether to print additional model information. Default: False.
-        std_ini (float): Standard deviation used for initial weight scaling. Default: 2e-2.
-        use_sin_pe (bool): Whether to use sinusoidal positional encoding. Default: False.
+        std_init (float): Standard deviation used for initial weight scaling in the transformer blocks. Default: 2e-2.
+        pe (str or None): Positional encoding method passed to PEBlock. When set, the encoded positions are also concatenated to the lifted features before kernel mixing; when None, raw coordinates feed the basis generator only and nothing is mixed into the signal path. Default: None.
+        pe_param (float): Frequency scale forwarded to PEBlock as ``max_freq_val``, only for Fourier-family methods ("random_fourier"/"random_ipe": Gaussian sigma; "fourier"/"ipe": max frequency). Not used with "adaptive" (frequencies are derived from the grid resolution), "siren" or "mlp". Default: 10.
+        transform_normalization (str): Forward integral transform normalization, "mode" (per-mode L2 norm) or "glob" (global scale N^e with learnable exponent). Default: "mode".
+        n_local_conv (int): Number of differential conv layers in the local branch (0 = disabled). Default: 0.
+        local_filters (Union[int, Sequence[int], None]): Number of filters per local conv layer. If int, all layers use this value; if sequence, one value per layer; if None, hidden_channels is used. Default: None.
+        local_kernel_size (int): Spatial kernel size for the differential conv (odd int). Default: 3.
+        grid_width (float): Physical domain width for the 1/h rescaling of the local branch (e.g. 2.0 for [-1, 1]). Default: 2.0.
     """
 
     def __init__(
@@ -75,7 +80,6 @@ class ITLNO(nn.Module):
         std_init=2e-2,
         pe=None,
         pe_param=10,
-        cat_coords: bool = True,
         transform_normalization: str = "mode",
         n_local_conv: int = 0,
         local_filters: Union[int, Sequence[int], None] = None,
@@ -94,7 +98,6 @@ class ITLNO(nn.Module):
         self.basis_mode = basis_mode
         self.verbose = verbose
         self.pe = pe
-        self.cat_coords = cat_coords
 
         norm_layer = nn.RMSNorm if rmsnorm else nn.LayerNorm
 
@@ -110,24 +113,29 @@ class ITLNO(nn.Module):
                 activation=mlp_act,
             )
 
+        # Only Fourier-family methods consume a fixed frequency scale; "adaptive"
+        # derives frequencies from the grid resolution (Nyquist), and "siren"/"mlp"
+        # don't use one at all.
+        pe_kwargs = {"max_freq_val": pe_param} if pe in ("random_fourier", "fourier", "ipe", "random_ipe") else {}
         self.pelayer = PEBlock(
             ndim,
             hidden_channels,
             method=pe,
-            max_freq_val=pe_param,
-            mlp_layers=pe_param,
             mlp_dim=hidden_channels,
             mlp_act=mlp_act,
+            **pe_kwargs,
         )
 
         # Basis-generator input: a learned positional encoding (hidden_channels)
         # when `pe` is a method, or the raw coordinates (ndim) when `pe is None`.
         basis_in_ch = ndim if pe is None else hidden_channels
 
-        if cat_coords:
+        # When a PE method is set, its output is also concatenated to the lifted
+        # features before kernel mixing; with pe=None nothing is mixed in.
+        if pe is not None:
             self.mixer = MLPBlock(
                 out_ch=hidden_channels,
-                in_ch=hidden_channels + basis_in_ch,
+                in_ch=2 * hidden_channels,
                 hidden_dim=hidden_channels,
                 num_layers=1,
                 activation=mlp_act,
@@ -219,14 +227,14 @@ class ITLNO(nn.Module):
                 filters = [local_filters] * n_local_conv
             else:
                 filters = list(local_filters)
-                assert len(filters) == n_local_conv, (
-                    f"local_filters has {len(filters)} entries but n_local_conv={n_local_conv}"
-                )
+                assert (
+                    len(filters) == n_local_conv
+                ), f"local_filters has {len(filters)} entries but n_local_conv={n_local_conv}"
             self.local_conv = nn.ModuleList()
             for i in range(n_local_conv):
                 in_ch = in_channels if i == 0 else filters[i - 1]
                 out_ch = out_channels if i == n_local_conv - 1 else filters[i]
-                is_last = (i == n_local_conv - 1)
+                is_last = i == n_local_conv - 1
                 self.local_conv.append(
                     FiniteDifferenceLayer(
                         in_channels=in_ch,
@@ -288,7 +296,7 @@ class ITLNO(nn.Module):
         kernel = self.trunk_generator(trunk_input).view(1, H * W, self.m1 * self.m2).expand(B, -1, -1)  # B, H*W, M
         kernel = self.kernel_norm(kernel)
 
-        if self.cat_coords:
+        if self.pe is not None:
             x = torch.cat([x, pe.expand(B, -1, -1, -1)], dim=-1)
             x = self.mixer(x)
 
@@ -377,12 +385,9 @@ class LatentGalerkin(nn.Module):
         in_channels (int): Number of input channels.
         out_channels (int): Number of output channels.
         modes (int): Number of latent modes / tokens used for Galerkin projection.
-        dt (float): Time step or scaling factor applied when return_derivative=False. Default: 1.0.
         num_blocks (int): Number of transformer blocks applied in latent space. Default: 4.
         hidden_channels (int): Hidden feature dimension for lifted and latent representations. Default: 256.
         num_heads (int): Number of attention heads in Galerkin/Transformer blocks. Default: 4.
-        mlp_layers (int): Number of layers in MLP blocks used for conditional and latent embeddings. Default: 2.
-        mlp_dim (int): Hidden dimension for the MLP blocks. Default: 128.
         activation (Callable): Activation function used by Transformer blocks. Default: nn.GELU.
         mlp_act (Callable): Activation function used by MLP blocks. Default: nn.GELU.
         mlp_factor (int): Expansion factor for Transformer MLP hidden dimension. Default: 4.
@@ -391,8 +396,15 @@ class LatentGalerkin(nn.Module):
         cond_dim (Union[int, None]): Dimension of optional conditioning vector. If provided, a conditioning embedding is used. Default: None.
         latent_attention (str): Type of latent attention block to use, either "galerkin" or any standard transformer. Default: "galerkin".
         verbose (bool): If True, prints intermediate tensor statistics during forward pass. Default: False.
-        galerkin_norm (bool): Whether to apply normalization inside Galerkin attention layers. Default: True.
-        pe (str): which type of positional encoding
+        galerkin_norm (bool): Whether to apply normalization inside Galerkin attention layers. Default: False.
+        rmsnorm (bool): Whether to use RMS normalization instead of layer norm for the block norms. Default: True.
+        pe (str or None): Positional encoding method passed to PEBlock; if None, no positional encoding is applied. Default: "adaptive".
+        pe_param (float): Frequency scale forwarded to PEBlock as ``max_freq_val``, only for Fourier-family methods ("random_fourier"/"random_ipe": Gaussian sigma; "fourier"/"ipe": max frequency). Not used with "adaptive" (frequencies are derived from the grid resolution), "siren" or "mlp". Default: 10.
+        std_init (float): Standard deviation for weight initialization in the Galerkin attention encoder/decoder. Default: 1e-2.
+        n_local_conv (int): Number of differential conv layers in the local branch (0 = disabled). Default: 0.
+        local_filters (Union[int, Sequence[int], None]): Number of filters per local conv layer. If int, all layers use this value; if sequence, one value per layer; if None, hidden_channels is used. Default: None.
+        local_kernel_size (int): Spatial kernel size for the differential conv (odd int). Default: 3.
+        grid_width (float): Physical domain width for the 1/h rescaling of the local branch (e.g. 2.0 for [-1, 1]). Default: 2.0.
     """
 
     def __init__(
@@ -411,7 +423,7 @@ class LatentGalerkin(nn.Module):
         cond_dim: Union[int, None] = None,
         latent_attention="galerkin",
         verbose: bool = False,
-        galerkin_norm=False,
+        galerkin_norm=True,
         rmsnorm: bool = True,
         pe="adaptive",
         pe_param=10,
@@ -439,14 +451,17 @@ class LatentGalerkin(nn.Module):
         self.lifting = nn.Linear(in_channels + cdim, hidden_channels, bias=True)
 
         if pe is not None:
+            # Only Fourier-family methods consume a fixed frequency scale; "adaptive"
+            # derives frequencies from the grid resolution (Nyquist), and "siren"/"mlp"
+            # don't use one at all.
+            pe_kwargs = {"max_freq_val": pe_param} if pe in ("random_fourier", "fourier", "ipe", "random_ipe") else {}
             self.pelayer = PEBlock(
                 dim,
                 hidden_channels,
                 method=pe,
-                max_freq_val=pe_param,
-                mlp_layers=pe_param,
                 mlp_dim=hidden_channels,
                 mlp_act=mlp_act,
+                **pe_kwargs,
             )
 
             self.mixer = MLPBlock(
@@ -518,14 +533,14 @@ class LatentGalerkin(nn.Module):
                 filters = [local_filters] * n_local_conv
             else:
                 filters = list(local_filters)
-                assert len(filters) == n_local_conv, (
-                    f"local_filters has {len(filters)} entries but n_local_conv={n_local_conv}"
-                )
+                assert (
+                    len(filters) == n_local_conv
+                ), f"local_filters has {len(filters)} entries but n_local_conv={n_local_conv}"
             self.local_conv = nn.ModuleList()
             for i in range(n_local_conv):
                 in_ch = in_channels if i == 0 else filters[i - 1]
                 out_ch = out_channels if i == n_local_conv - 1 else filters[i]
-                is_last = (i == n_local_conv - 1)
+                is_last = i == n_local_conv - 1
                 self.local_conv.append(
                     FiniteDifferenceLayer(
                         in_channels=in_ch,
@@ -764,15 +779,15 @@ class LatentTransolver(nn.Module):
                 filters = [local_filters] * n_local_conv
             else:
                 filters = list(local_filters)
-                assert len(filters) == n_local_conv, (
-                    f"local_filters has {len(filters)} entries but n_local_conv={n_local_conv}"
-                )
+                assert (
+                    len(filters) == n_local_conv
+                ), f"local_filters has {len(filters)} entries but n_local_conv={n_local_conv}"
 
             self.local_conv = nn.ModuleList()
             for i in range(n_local_conv):
                 in_ch = in_channels if i == 0 else filters[i - 1]
                 out_ch = out_channels if i == n_local_conv - 1 else filters[i]
-                is_last = (i == n_local_conv - 1)
+                is_last = i == n_local_conv - 1
                 self.local_conv.append(
                     FiniteDifferenceLayer(
                         in_channels=in_ch,
@@ -883,27 +898,31 @@ class LatentNO(nn.Module):
     mechanisms to learn relationships between spatial coordinates and input features,
     projecting them through a learned latent representation before decoding back to
     the output space.
-    This implementation uses an adaptive LayerNorm that is conditioned by the current time step
 
     Args:
         in_channels (int): Number of input channels.
         out_channels (int): Number of output channels.
         d_model (int, optional): Dimension of the model representation. Defaults to 128.
-        modes (int, optional): Number of tokens used to represent the latent space. Defaults to 128.
-        num_heads (int, optional): Number of attention heads in transformer blocks. Defaults to 2.
+        modes (int, optional): Number of tokens used to represent the latent space. Defaults to 256.
+        num_heads (int, optional): Number of attention heads in transformer blocks. Defaults to 4.
         num_blocks (int, optional): Number of transformer blocks to stack. Defaults to 4.
-        mlp_layers (int, optional): Number of layers in MLP blocks. Defaults to 2.
-        mlp_dim (int, optional): Hidden dimension of MLP blocks. Defaults to 128.
+        mlp_layers (int, optional): Number of layers in MLP blocks. Defaults to 1.
+        mlp_dim (int, optional): Hidden dimension of MLP blocks. Defaults to 256.
         dropout (float, optional): Dropout rate. Defaults to 0.
         transformer_mlp_factor (int, optional): Multiplier for MLP dimension in transformer blocks. Defaults to 4.
         activation (Callable, optional): Activation function to use. Defaults to nn.GELU.
-        nonlinear: if True, concat the values to the coordinates so that the QK^T kernel is conditionned by the input function
         dim (int, optional): Spatial dimension (2 for 2D, 3 for 3D, etc.). Defaults to 2.
+        tau_ini (float, optional): Initial value of the learnable softmax temperatures (tau1/tau2) used in encode/decode. Defaults to 0.1.
+        pe (str, optional): Positional encoding method passed to PEBlock (e.g. "random_fourier", "adaptive"). Defaults to "random_fourier".
+        pe_param (float, optional): Frequency scale forwarded to PEBlock as ``max_freq_val``, only for Fourier-family methods ("random_fourier"/"random_ipe": Gaussian sigma; "fourier"/"ipe": max frequency). Not used with "adaptive" (frequencies are derived from the grid resolution), "siren" or "mlp". Defaults to 10.
+        cond_dim (Union[int, None], optional): Dimension of optional conditioning vector added to the branch output. Defaults to None.
+        std_init (float or None, optional): If not None, re-initializes all Linear/Embedding weights with this standard deviation. Defaults to None.
+        rmsnorm (bool, optional): Whether to use RMS normalization instead of layer norm in the MLP blocks. Defaults to True.
 
     Attributes:
         trunk_projector (MLPBlock): Projects spatial coordinates to d_model dimension.
         branch_projector (MLPBlock): Projects input features to d_model dimension.
-        attention_projector (MLPBlock): Projects trunk output to latent dimension for attention scores.
+        attention_projector_forward (MLPBlock): Projects trunk output to latent dimension for attention scores.
         ops (nn.ModuleList): Stack of transformer blocks for latent space processing.
         out_mlp (MLPBlock): Projects decoded output to out_channels dimension."""
 
@@ -946,14 +965,17 @@ class LatentNO(nn.Module):
                 activation=activation,
             )
 
+        # Only Fourier-family methods consume a fixed frequency scale; "adaptive"
+        # derives frequencies from the grid resolution (Nyquist), and "siren"/"mlp"
+        # don't use one at all.
+        pe_kwargs = {"max_freq_val": pe_param} if pe in ("random_fourier", "fourier", "ipe", "random_ipe") else {}
         self.pe = self.pelayer = PEBlock(
             dim,
             d_model,
             method=pe,
-            max_freq_val=pe_param,
-            mlp_layers=pe_param,
             mlp_dim=d_model,
             mlp_act=activation,
+            **pe_kwargs,
         )
 
         self.trunk_projector = MLPBlock(
