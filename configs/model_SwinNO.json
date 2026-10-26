@@ -1,0 +1,17 @@
+{
+    "name": "SwinNO",
+    "model": "SwinNO",
+    "params": {
+        "num_windows": 8,
+        "in_channels": 20,
+        "out_channels": 2,
+        "latent_dim": 256,
+        "num_blocks": 2,
+        "num_heads": 4,
+        "mlp_factor": 2,
+        "activation": "GELU",
+        "block_type": "swin",
+        "bc_mode": "circular",
+        "ndim": 2
+    }
+}

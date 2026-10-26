@@ -1,0 +1,25 @@
+{
+    "name": "ITLNO",
+    "model": "ITLNO",
+    "params": {
+        "in_channels": 20,
+        "out_channels": 2,
+        "modes": 16,
+        "num_blocks": 4,
+        "hidden_channels": 128,
+        "num_heads": 4,
+        "linear_kernel": false,
+        "mlp_layers": 2,
+        "mlp_dim": 128,
+        "mlp_factor": 2,
+        "activation": "GELU",
+        "mlp_act": "GELU",
+        "ndim": 2,
+        "orthogonal_init": true,
+        "rmsnorm": true,
+        "basis_mode": "free",
+        "std_init": 1e-1,
+        "pe": "adaptive",
+        "local_filters": null
+    }
+}

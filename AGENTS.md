@@ -35,7 +35,7 @@ itérative, sur la branche `dev`.
 | **Blocs communs** | `pynop/core/blocks.py`, `pynop/core/ops.py` | Blocs Swin déplacés ici ; **`TransformerBlock` unifié** avec option RoPE (`AdaptiveRoPE2D`) (§9, §10) |
 | **Blocs IT** | `pynop/core/blocks.py` | ✅ `SepLITBlock`/`SepNLITBlock`/`LITBlock` vérifiés — 3 bugs corrigés (§12) ; **`IAETBlock`** (style IAE-Net) vérifié contre l'implémentation officielle — 4 bugs corrigés (§16) |
 | **Training (Lightning)** | `pynop/training/lightning_model.py` | ✅ Réécrit : `predict_derivative` (sortie dérivée **ou** absolue), derivative-loss configurable, base unique `MultiStepLightningBase`, compat. tous les modèles du dépôt, `DeepONetModel` dédié ; wrappers AE/`CausalNO` supprimés (§15) |
-| **Driver CLI d'entraînement** | `pynop/training/train.py`, `configs/` | ✅ Réécrit : driver config-driven (`ModelConfig.json` + `TrainingConfig.json`, flag `--pretrain`) reproduisant le protocole 2 phases des notebooks PDEBench ; dataset PDEBench seul pour l'instant ; checkpoints `last` (chaque époque) / best (dès max pas AR atteint) ; `--resume`/`--init-from` (§18) |
+| **Driver CLI d'entraînement** | `pynop/training/train.py`, `configs/` | ✅ Réécrit : driver config-driven (`ModelConfig.json` + `TrainingConfig.json`, flag `--pretrain`) reproduisant le protocole 2 phases des notebooks PDEBench ; dataset PDEBench seul pour l'instant ; checkpoints `last` (chaque époque) / best (dès max pas AR atteint) ; `--resume`/`--init-from` (§18). **Configs complètes** : un `model_<name>.json` par modèle des notebooks (10 fichiers) + 1 `training_PDEBench.json` partagé, tous validés build+forward+backward (§20) |
 | **Eval CLI + métriques** | `pynop/training/eval.py`, `pynop/training/metrics.py` | ✅ Nouveau : évaluation d'un checkpoint par **rollout autorégressif de la trajectoire complète** (protocole notebooks PDEBench) sur des simulations **non utilisées en entraînement** (split val par défaut, ou split test = pool inutilisé) ; métriques de champ MSE/RMSE/**nRMSE = relative L2**/MAE/max-err/**R²** + bandes spectrales radiales style PDEBench (unités d'index bin FFT), **courbes d'erreur par pas de temps** (RMSE/MAE/R²/nRMSE + spectre) et graphiques PNG en anglais ; `eval_results_<split>.json` auto-contenu (§19) |
 
 ---
@@ -89,6 +89,19 @@ itérative, sur la branche `dev`.
   l'ancien notebook : il était niché sous `"pdebench"`).
 - Logs : `/run/media/jlux/SSD2/PDETraining/PDEBENCH/<phase>/<model>/10steps_<timestamp>` — le montage
   est passé de `/media/jlux` à `/run/media/jlux`.
+
+### Configs JSON PDEBench (`configs/`, §20)
+- **Un `model_<name>.json` par modèle des notebooks** (10 au total : FNOvanilla, tuckerFNO, ITLNO, LNO,
+  LatentGalerkin, SwinNO, MSSwinNO_1stage, MSSwinNO, Transolver_linear, Transolver3) + **un seul
+  `training_PDEBench.json` partagé** (mêmes params d'entraînement pour tous). Usage :
+  `python -m pynop.training.train configs/model_<name>.json configs/training_PDEBench.json [--pretrain]`.
+- Conventions : `in_channels = 2 × input_steps(10) = 20` matérialisé ; `"activation": "GELU"` en string
+  (résolu par `build_model`) ; tuples → listes ; **`verbose` omis** pour ITLNO/LatentGalerkin
+  (`build_model` le désactive alors, comme les notebooks avant fit). Le champ `"name"` = nom d'exécution
+  des notebooks → même arborescence de logs.
+- **Gotcha `MSSwinNO_1stage`** : `dec_num_windows=[(16,16)]` sur grille 16×16 = fenêtres **1×1**
+  (attention par pixel au décodeur). C'est la config d'origine (ancien "OSSwinNO", `dec_windows` était
+  déjà un nombre de fenêtres/axe — vérifié git) ; conservé pour fidélité, signalé à l'utilisateur.
 
 ### FNO (§14)
 - Ordre du bloc aligné sur neuralop / Li et al. 2021 : `[norm] → spectral_conv → [activation] →

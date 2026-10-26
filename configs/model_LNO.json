@@ -1,0 +1,24 @@
+{
+    "name": "LNO",
+    "model": "LatentNO",
+    "params": {
+        "in_channels": 20,
+        "out_channels": 2,
+        "d_model": 128,
+        "modes": 256,
+        "num_heads": 4,
+        "num_blocks": 4,
+        "mlp_layers": 1,
+        "rmsnorm": true,
+        "mlp_dim": 256,
+        "dropout": 0,
+        "transformer_mlp_factor": 2,
+        "activation": "GELU",
+        "dim": 2,
+        "tau_ini": 0.1,
+        "pe": "adaptive",
+        "pe_param": 10,
+        "cond_dim": null,
+        "std_init": 0.02
+    }
+}

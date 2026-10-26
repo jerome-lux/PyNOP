@@ -4,14 +4,32 @@
     "params": {
         "in_channels": 20,
         "out_channels": 2,
-        "modes": [32, 32],
-        "hidden_channels": [20, 20, 20, 20],
-        "blocks": ["FNO", "FNO", "FNO", "FNO"],
+        "modes": [
+            32,
+            32
+        ],
+        "hidden_channels": [
+            20,
+            20,
+            20,
+            20,
+            20
+        ],
+        "blocks": [
+            "FNO",
+            "FNO",
+            "FNO",
+            "FNO",
+            "FNO"
+        ],
         "spectral_layer_type": "standard",
         "spectral_compression_factor": null,
         "trainable_pos_encoding": false,
         "fixed_pos_encoding": false,
-        "trainable_pos_encoding_modes": [16, 16],
+        "trainable_pos_encoding_modes": [
+            16,
+            16
+        ],
         "trainable_pos_encoding_dims": 8
     }
 }

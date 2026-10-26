@@ -1,0 +1,49 @@
+{
+    "name": "MSSwinNO",
+    "model": "MultiscaleSWINNO",
+    "params": {
+        "in_channels": 20,
+        "out_channels": 2,
+        "grid_resolutions": [
+            [
+                32,
+                32
+            ],
+            [
+                16,
+                16
+            ]
+        ],
+        "enc_num_windows": [
+            [
+                8,
+                8
+            ],
+            null
+        ],
+        "dec_num_windows": [
+            [
+                8,
+                8
+            ],
+            [
+                8,
+                8
+            ]
+        ],
+        "model_dim": [
+            128,
+            192,
+            256
+        ],
+        "num_heads": 4,
+        "mlp_factor": 2,
+        "activation": "GELU",
+        "rmsnorm": true,
+        "enc_repeats": [
+            1,
+            2
+        ],
+        "dec_repeats": 1
+    }
+}

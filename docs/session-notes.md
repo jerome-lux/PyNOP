@@ -1016,3 +1016,58 @@ python -m pynop.training.eval MODEL_CONFIG.json TRAINING_CONFIG.json --checkpoin
   mapping temps absolu vérifié, PNG écrits.
 - Validation multi-chunks dédiée : 2 trajectoires × 38 pas avec `batch_size=1` (2 chunks) → pooling par pas
   correct entre chunks ; identité globale `RMSE = sqrt(mean_k(RMSE_k²))` et `nRMSE = mean_k(nRMSE_k)` vérifiées.
+
+### 20. Configs JSON pour tous les modèles PDEBench (`configs/`)
+
+**Contexte** : demande utilisateur — maintenant que `train.py` (§18) est fonctionnel, créer les configs
+associées à **chaque modèle** des notebooks `/run/media/jlux/SSD2/pyNOP/training_*_PDEBench.ipynb` :
+un fichier de config modèle par modèle + **un seul** fichier training partagé (mêmes paramètres
+d'entraînement pour tous).
+
+**Fichiers créés** (`configs/model_<name>.json`, `name` = nom d'exécution des notebooks, donc le même
+répertoire de logs `<root>/<experiment>/<phase>/<name>/10steps_*`) :
+
+| Fichier | Classe | Notebook source | Particularité |
+|---|---|---|---|
+| `model_FNOvanilla.json` | `FNO` | training_FNOvanilla_PDEBench.ipynb | modes (32,32), **5 blocs** / hidden 20×5 — écart volontaire au notebook (4 blocs/1.64 M → 2.05 M), spectral standard |
+| `model_tuckerFNO.json` | `FNO` | training_tuckerFNO_PDEBench.ipynb | modes (24,24), hidden 48×4, **tucker** factor 2 |
+| `model_ITLNO.json` | `ITLNO` | training_ITLNO_PDEBench.ipynb | modes 16, basis "free", pe random_ipe(10) |
+| `model_LNO.json` | `LatentNO` | training_LNO_PDEBench.ipynb | d_model/modes 256, pe random_fourier(10), std_init 0.02 |
+| `model_LatentGalerkin.json` | `LatentGalerkin` | training_LatentGalerkin_PDEBench.ipynb | modes 256, latent_attention "vanilla", **pe null** |
+| `model_SwinNO.json` | `SwinNO` | training_SwinNO_PDEBench.ipynb | num_windows 8 (ancien winsize=16 @128²), latent_dim 256, 2 blocs |
+| `model_MSSwinNO_1stage.json` | `MultiscaleSWINNO` | idem (`name = "MSSwinNO_1stage"`) | 1 stage 16×16, enc global / dec (16,16) — voir gotcha ci-dessous |
+| `model_MSSwinNO.json` | `MultiscaleSWINNO` | training_MSSwinNO_PDEBench.ipynb | 2 stages (32²→16²), model_dim [128,192,256] |
+| `model_Transolver_linear.json` | `Transolver` | training_Transolver_linear_PDEBench.ipynb | mode "linear", n_hidden 128 |
+| `model_Transolver3.json` | `Transolver` | training_Transolver3_PDEBench.ipynb | mode "t3", n_hidden 256 |
+
+**Conventions de transcription** (notebook → JSON) :
+- `in_channels = input_channels × input_steps = 2 × 10 = 20` **matérialisé en 20** dans les configs
+  (le JSON ne fait pas d'arithmétique) ; cohérent avec le `model_FNOvanilla.json` existant.
+- `"activation": "GELU"` en string — résolu par `_resolve_activation` de `build_model` (§18).
+- Tuples → listes (`modes: [32, 32]`, `grid_resolutions: [[32,32],[16,16]]`).
+- **`verbose` omis** pour ITLNO/LatentGalerkin : les notebooks passent `verbose=True` au constructeur
+  puis font `model.verbose = False` avant le fit ; en omettant la clé, `build_model` applique exactement
+  ce comportement (silence pendant l'entraînement).
+- **Training partagé** : `configs/training_PDEBench.json` *(existant)* — vérifié champ par champ contre
+  les 9 notebooks (dataset, shared_params, losses DWMSE/Spectral(β=2)/Sobolev, AdamW wd 5e-4 β (0.9,0.99),
+  OneCycleLR div 1e3/fdiv 1e2/pct_start 0.02, clip norm 1.0, phases prétraining/fulltraining) → **aucun
+  changement nécessaire** ; un seul fichier pour tous les modèles comme demandé.
+
+**Gotcha — `MSSwinNO_1stage` : attention par pixel au décodeur.** `dec_num_windows=[(16,16)]` sur une
+grille 16×16 donne des fenêtres de **1×1** (attention auto d'un seul token = projection linéaire par
+pixel, aucun mélange spatial). Vérifié dans l'historique git (`0ba79ea~1`) : l'ancienne clé
+`dec_windows=(16,16)` du notebook original (entrée "OSSwinNO") était **déjà** un nombre de fenêtres par
+axe (`win_h = h // nw_h`), donc le renommage `windows → num_windows` (§3) est sémantiquement fidèle —
+c'est la config d'origine qui a cette propriété, pas une régression. Signalé à l'utilisateur ; conservé
+tel quel (fidélité aux notebooks).
+
+**Vérifié** (env. conda `pytorch`) :
+- Les 10 configs passent `build_model` + forward + backward (grille 32², sauf MSSwinNO_1stage en 16² —
+  l'entrée de MultiscaleSWINNO doit matcher `grid_resolutions[0]`). Comptages de paramètres cohérents :
+  SwinNO **1.19 M** / MSSwinNO_1stage **1.37 M** (valeurs documentées §3), MSSwinNO 2 stages 3.02 M,
+   Transolver3 3.07 M, FNOvanilla **2.05 M** (5 blocs — écart volontaire au notebook), tuckerFNO 1.36 M, ITLNO 0.82 M, LatentGalerkin 0.73 M, LNO 0.65 M,
+  Transolver_linear 1.00 M.
+- Smoke test end-to-end `python -m pynop.training.train configs/model_FNOvanilla.json <training minimal>
+  --pretrain --device cpu` (1 époque, 4 sims, t∈[0,15]) : dataset split 3/1, losses + régulariseur de
+  dérivée calculés, OneCycleLR (token `$total_steps`) OK, rollout val par pas (`step_1`/`step_2`),
+  `last.ckpt` + configs sauvegardées + logs CSV/TB écrits dans le layout `<root>/<exp>/<phase>/<name>/`.

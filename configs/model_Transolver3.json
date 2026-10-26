@@ -1,0 +1,18 @@
+{
+    "name": "Transolver3",
+    "model": "Transolver",
+    "params": {
+        "in_ch": 20,
+        "out_ch": 2,
+        "slice_num": 128,
+        "n_layers": 4,
+        "n_hidden": 256,
+        "dropout": 0.05,
+        "n_head": 4,
+        "mode": "t3",
+        "activation": "GELU",
+        "mlp_ratio": 2,
+        "dim": 2,
+        "cond_dim": null
+    }
+}
