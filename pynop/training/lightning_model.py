@@ -170,15 +170,32 @@ class TrainingConfig:
 
 
 class CurriculumCheckpoint(ModelCheckpoint):
-    """ModelCheckpoint that only starts monitoring after ``start_epoch``."""
+    """ModelCheckpoint that only starts saving after ``start_epoch``.
 
-    def __init__(self, start_epoch, **kwargs):
+    Used to defer best-model selection until the AR curriculum reaches its
+    target (e.g. the maximum number of autoregressive steps), when per-epoch
+    metrics become comparable across epochs.
+
+    The gate is applied in :meth:`_should_skip_saving_checkpoint`, the single
+    choke point shared by every save hook (train-batch-end, train-epoch-end —
+    which is where Lightning 2.x saves by default with ``val_check_interval=1``
+    — and validation-end), so no checkpoint can be written before
+    ``start_epoch`` through any path. The on-exception crash-recovery save is
+    gated as well.
+    """
+
+    def __init__(self, start_epoch: int, **kwargs):
         super().__init__(**kwargs)
         self.start_epoch = start_epoch
 
-    def on_validation_end(self, trainer, pl_module):
+    def _should_skip_saving_checkpoint(self, trainer) -> bool:  # type: ignore[override]
+        if trainer.current_epoch < self.start_epoch:
+            return True
+        return super()._should_skip_saving_checkpoint(trainer)
+
+    def on_exception(self, trainer, pl_module, exception):  # type: ignore[override]
         if trainer.current_epoch >= self.start_epoch:
-            super().on_validation_end(trainer, pl_module)
+            super().on_exception(trainer, pl_module, exception)
 
 
 # ---------------------------------------------------------------------------
@@ -197,12 +214,16 @@ class MultiStepLightningBase(pl.LightningModule):
 
     Subclasses only implement :meth:`_forward_window`, i.e. the mapping
     ``window (B, n*C, H, W) -> (B, C, H, W)``.
+
+    The optimizer may be omitted when the module is used for inference /
+    evaluation only (e.g. :mod:`pynop.training.eval`): in that case
+    :meth:`configure_optimizers` must not be called through a trainer.
     """
 
     def __init__(
         self,
         model: torch.nn.Module,
-        optimizer: torch.optim.Optimizer,
+        optimizer: Optional[torch.optim.Optimizer] = None,
         train_config: Optional[TrainingConfig] = None,
         scheduler_config: Optional[list] = None,
     ):
@@ -397,11 +418,25 @@ class MultiStepLightningBase(pl.LightningModule):
             time = time.unsqueeze(-1)
         return time
 
-    def _rollout(self, inputs, time_idx, cond, training: bool) -> dict:
+    def _rollout(self, inputs, time_idx, cond, training: bool, store_fields: bool = False) -> dict:
         """Run the teacher-forcing / AR rollout over the time axis.
 
-        Returns a dict with the accumulated (unnormalized) losses, the RMSE,
-        the per-AR-step RMSEs and bookkeeping.
+        Args:
+            inputs: Window tensor ``(B, T, C, H, W)``.
+            time_idx: Starting time index of each window (see :meth:`_time_arg`).
+            cond: Optional conditioning field (or ``None``).
+            training: If True apply the AR curriculum, temporal weighting and
+                input noise; if False run the full rollout with ground-truth
+                teacher forcing for the first prediction only.
+            store_fields: If True also collect the detached per-step
+                predictions and targets (lists of ``(B, C, H, W)`` in step
+                order) under ``"preds"`` / ``"targets"`` — used by the
+                evaluation driver to compute field-level metrics.
+
+        Returns:
+            Dict with the accumulated (unnormalized) losses, the RMSE, the
+            per-AR-step RMSEs and bookkeeping; plus ``"preds"``/``"targets"``
+            when ``store_fields`` is set.
         """
         B, T, C, H, W = inputs.shape
         n = self.n_slices
@@ -417,6 +452,8 @@ class MultiStepLightningBase(pl.LightningModule):
         derivative_loss = 0.0
         RMSE = 0.0
         step_rmses = []
+        stored_preds: list = []
+        stored_targets: list = []
         preds = None
         current_input = None
         AR_preds = 0
@@ -449,6 +486,10 @@ class MultiStepLightningBase(pl.LightningModule):
 
             targets_t = inputs[:, t + 1, ...]
 
+            if store_fields:
+                stored_preds.append(preds.detach())
+                stored_targets.append(targets_t.detach())
+
             # ------------------------------------------------------------------ losses
             step_loss, step_indiv = self._weighted_losses(preds, targets_t, weighting)
             loss = loss + step_loss
@@ -476,7 +517,7 @@ class MultiStepLightningBase(pl.LightningModule):
             if AR_preds > 0 and self.detach_every_k > 0 and AR_preds % self.detach_every_k == 0:
                 preds = preds.detach()
 
-        return {
+        result = {
             "loss": loss,
             "indiv_losses": indiv_losses,
             "derivative_loss": derivative_loss,
@@ -486,6 +527,10 @@ class MultiStepLightningBase(pl.LightningModule):
             "AR_steps": AR_count,
             "num_predictions": num_predictions,
         }
+        if store_fields:
+            result["preds"] = stored_preds
+            result["targets"] = stored_targets
+        return result
 
     # ------------------------------------------------------------------
     # Lightning steps
@@ -579,7 +624,7 @@ class MultiStepNOModel(MultiStepLightningBase):
     def __init__(
         self,
         model: torch.nn.Module,
-        optimizer: torch.optim.Optimizer,
+        optimizer: Optional[torch.optim.Optimizer] = None,
         train_config: Optional[TrainingConfig] = None,
         scheduler_config: Optional[list] = None,
     ):

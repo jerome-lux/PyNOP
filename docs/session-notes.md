@@ -827,7 +827,161 @@ M, température clampée `[0.1, 5]` vérifiée aux deux bornes, assert `dim == H
 rejet des modes inconnus, shapes forward des 3 modes ± conditionnement, flux de gradient vers tous les
 paramètres (aucun param mort), grad non nul sur `ln1` (`TransolverBlock`), dropout réellement sur le
 chemin, `SlicingBlock` conforme et distinct de l'ordre buggé, équivalence deslice, attention linéaire
-manuelle pour `LinearNOBlock`, propagation dropout/activation dans les 3 modes, aucune mutation d'état
-entre résolutions 16×16 / 24×20.
+ manuelle pour `LinearNOBlock`, propagation dropout/activation dans les 3 modes, aucune mutation d'état
+ entre résolutions 16×16 / 24×20.
 
-> ✅ `pynop` est installé en mode éditable (`pip install -e .`) — les modifications source sont vues immédiatement.
+ > ✅ `pynop` est installé en mode éditable (`pip install -e .`) — les modifications source sont vues immédiatement.
+
+### 18. `train.py` — driver d'entraînement CLI, réécriture complète (`pynop/training/train.py`, `configs/`, `tests/test_train_cli.py`)
+
+**Contexte** : l'ancien `pynop/training/train.py` (boucles torch brutes `train_step` /
+`train_unrolled` / `CoDANO_training` + TensorBoard) ne reproduisait pas le protocole des
+notebooks PDEBench (curriculum AR, losses multiples pondérées, régulariseur de dérivée,
+checkpoints conditionnés). Rien n'importait ces fonctions (vérifié par grep) → remplacement
+total. Le nouveau module est un **driver config-driven** qui réutilise `MultiStepNOModel` /
+`DeepONetModel` (§15) — aucune logique de rollout dupliquée, pas de visualisation/évaluation :
+entraînement uniquement.
+
+**CLI** :
+```bash
+python -m pynop.training.train MODEL_CONFIG.json TRAINING_CONFIG.json [--pretrain] \
+    [--device auto|cuda|cpu] [--output-root DIR] [--resume CKPT] [--init-from CKPT]
+```
+- `--pretrain` → section `"pretraining"` de TrainingConfig ; sans le flag → `"fulltraining"`.
+- `MODEL_CONFIG.json` : `{name?, model, params}` — `model` = classe de `pynop.models` (ou
+  chemin pointé) ; les chaînes d'activation (`"GELU"`, …) sont résolues en classes `nn.*`.
+- `TRAINING_CONFIG.json` : `input_steps` + section **`dataset`** (type, path, batch_size,
+  num_workers, load_in_ram, shift/scale, split_ratio, random_seed — pour l'instant
+  `"pdebench"` uniquement) + `shared_params` (timestep, loss_weights, temporal_weighting,
+  detach_grad_steps, derivative_loss_weight, predict_derivative, noise_level,
+  time_normalization) + `losses` (liste `{name, params}` résolue dans `core.loss` puis
+  `torch.nn`) + `optimizer` / `scheduler` + `trainer` (clip grad, log_every_n_steps) +
+  `output` (root/experiment) + `loggers` (`csv`, `tensorboard`) + les deux sections de phase.
+- Phases : `delta_ts`, `min_id`/`max_id`, `n_samples`, `lr`, `max_epochs`, `start_AR` /
+  `final_AR`, `min_AR_steps` / `max_AR_steps` (+ override optionnel `scheduler`). La fenêtre est
+  dérivée : `window_size = max_AR_steps + input_steps + 1`. Le split train/val se fait sur les
+  **IDs de simulation** (shuffle seedé, troncature à `n_samples`, ratio) — identique aux
+  notebooks → les deux phases partagent le même sous-ensemble.
+- Scheduler : tokens `"$total_steps"` / `"$steps_per_epoch"` remplacés par
+  `max_epochs * len(train_loader)` / `len(train_loader)` ; OneCycleLR sans `max_lr` → `lr` de la
+  phase (comme les notebooks). Format dict transmis tel quel à `configure_optimizers`.
+
+**Politique de checkpoints** (répertoire
+`<root>/<experiment>/<logdir phase>/<name modèle>/<input_steps>steps_<timestamp>/`) :
+- `last.ckpt` — sauvegardé **à chaque époque dès la première** (écrasé) : on a toujours les
+  poids de la dernière époque (reprise après crash, warm-start phase 2 ← `last.ckpt` phase 1).
+- `best_RMSE.ckpt` / `best_val_RMSE.ckpt` (top-k=2, fichiers secondaires `-vN`) — le monitoring
+  ne démarre qu'**à l'époque où le rollout atteint le max de pas AR** (`epoch >= final_AR`) :
+  pendant la rampe du curriculum les métriques d'époques successives ne sont pas comparables.
+  Si `final_AR >= max_epochs`, aucun best n'est écrit (warning affiché au démarrage).
+
+**Bugs corrigés en route** :
+1. **`CurriculumCheckpoint` contourné sous Lightning 2.x** (`training/lightning_model.py`) :
+   l'ancienne implé ne gérait que `on_validation_end`, mais avec PL ≥ 2 (ici 2.6) et
+   `val_check_interval=1` (défaut), la sauvegarde se fait dans **`on_train_epoch_end`** → le gate
+   était inopérant (best écrits dès l'époque 0). Fix : le gate est appliqué dans
+   `_should_skip_saving_checkpoint`, le point de passage commun à tous les hooks de sauvegarde
+   (+ `on_exception`), et les checkpoints du driver passent `save_on_train_epoch_end=False` pour
+   épingler la sauvegarde en fin de validation (les deux métriques `RMSE`/`val_RMSE` y sont
+   disponibles).
+2. Ancien module : boucles non utilisées par le protocole NO multi-étapes — supprimées
+   (`train_step`, `test_step`, `train`, `adversarial_train`, `train_unrolled`,
+   `CoDANO_training`) ; récupérables dans l'historique git si besoin.
+
+**Vérifié** (env. conda `pytorch`, torch 2.14 / PL 2.6) :
+- `pytest tests/` → **262/262 OK**, dont 15 nouveaux (`tests/test_train_cli.py`) : parsing CLI,
+  sélection de phase, builders (losses/optimizer/scheduler/tokens), split déterministe des IDs,
+  et 4 runs end-to-end CPU sur un HDF5 PDEBench synthétique — politique de checkpoints vérifiée
+  dans les deux sens (gate atteint → best présents ; gate non atteint → `last.ckpt` seul) +
+  warm-start `--init-from`.
+- Smoke test GPU sur le vrai dataset (`133017.hdf5`, FNOvanilla 1.64 M params, 8 sims,
+  fenêtre 21) : losses DWMSE+Spectral+Sobolev (poids 1e4), dérivée `NormalizedTimeDerivativeMSE`,
+  OneCycleLR (div_factor 1e3 → pic à lr phase), RMSE par pas AR loggés (`step_1..step_10`),
+  `last.ckpt`/`best_RMSE.ckpt`/`best_val_RMSE.ckpt` + configs et `run_info.json` écrits.
+- Reprise après crash : run 2 époques interrompu (SIGINT) à ~52 % de l'époque 1 →
+  `--resume last.ckpt` avec la même config reprend exactement à l'époque 1 et termine.
+  ⚠️ Limite inhérente au protocole : un resume OneCycleLR exige le **même nombre total de pas**
+  (on ne peut pas augmenter `max_epochs` après coup — le schedule est figé).
+
+**Exemples** : `configs/model_FNOvanilla.json` + `configs/training_PDEBench.json` reproduisent à
+l'identique les paramètres des notebooks (`/run/media/jlux/SSD2/pyNOP`) — prétraining 40 sims /
+t∈[0,50] / stride 2 / lr 2e-4 / 300 époques / AR 2→10 sur [0,200], fulltraining 400 sims / tout t /
+stride 4 / lr 1e-4 / 100 époques / AR fixe 10.
+
+ ### 19. `eval.py` — driver d'évaluation CLI + métriques de champ (`pynop/training/eval.py`, `pynop/training/metrics.py`, `tests/test_eval_cli.py`)
+
+**Contexte** : demande utilisateur — un module compagnon de `train.py` (§18) qui charge un
+checkpoint entraîné et évalue sur des **échantillons non utilisés pendant l'entraînement**, avec
+des métriques par bande spectrale (style PDEBench), MSE/nMSE et autres. Point de vigilance soulevé :
+la pertinence de la normalisation du nMSE quand le dataset est recentré à moyenne nulle → arbitrage
+documenté ci-dessous.
+
+**Choix des métriques** (`pynop/training/metrics.py`) — toutes calculées sur les champs en
+**espace modèle** (après `(x + shift) * scale` du dataset), tenseurs channels-first `(..., C, H, W)` :
+- **nRMSE = relative L2** (le « normalized RMSE » de PDEBench, `pdebench/models/metrics.py::metric_func`) :
+  par échantillon ET canal `‖pred − target‖₂ / ‖target‖₂` (normes sur les dims spatiales), moyenné.
+  **Invariante d'échelle** ; pour des champs normalisés à moyenne nulle `(x−μ)/σ`, le dénominateur est
+  exactement l'écart-type du champ → métrique toujours significative (c'est ainsi que PDEBench l'utilise).
+  Les normalisations par `mean(target)²` dégénèrent sur les champs à moyenne nulle → **délibérément non utilisées**.
+- **R²** par échantillon/canal : `1 − ‖err‖² / ‖target − mean_spatial(target)‖²`, centrage **spatial
+  uniquement** (pas global). Invariante à toute rénormalisation affine (translation ET échelle) → la plus
+  sûre pour les datasets à moyenne nulle ; identité exacte par unité : `R²_{i,c} = 1 − nRMSE²_{i,c}` quand
+  le champ est à moyenne nulle par canal.
+- **Bande spectrale** : `rfftn` orthonormale sur `(H, W)`, énergie d'erreur groupée par coquilles radiales
+  en **unités d'index de bin FFT** (`k = sqrt(iy² + ix²)`, `iy = min(k, h−k)` — l'ordre fft), bandes par
+  défaut `[0,4) / [4,12) / [12,+∞)` = `iLow=4`/`iHigh=12` de PDEBench. Par défaut **relative**
+  (`‖F(err)_bande‖₂ / ‖F(target)_bande‖₂` par unité, moyenné — généralisation spectrale du nRMSE, donc
+  invariante d'échelle) ; mode absolu (énergie brute, plus proche de l'erreur Fourier raw de PDEBench) via
+  `relative_spectral=False`. ⚠️ Les bornes sont des indices de coquille **dépendants de la résolution**
+  (comme chez PDEBench), pas des fréquences physiques.
+- **`FieldMetricAccumulator`** : accumulation incrémentale par batch (mémoire constante) avec
+  **pooling exact** sur toutes les unités (fenêtre, pas[, canal]) — jamais une moyenne de moyennes ;
+  courbe **par pas AR** (RMSE + nRMSE à chaque index de pas, poolés entre batches) = le diagnostic clé de
+  croissance d'erreur du rollout. `compute_field_metrics` = wrapper one-shot équivalent.
+
+**Driver CLI** (`pynop/training/eval.py`) :
+```bash
+python -m pynop.training.eval MODEL_CONFIG.json TRAINING_CONFIG.json --checkpoint PATH \
+    [--split val|test] [--n-test N] [--pretrain] [--device auto|cuda|cpu] \
+    [--batch-size B] [--max-windows W] [--output-dir DIR]
+```
+- Mêmes configs que l'entraînement ; la section de phase fournit le protocole de fenêtres (stride,
+  plage t, `window_size = max_AR_steps + input_steps + 1`) — identique à celui de l'entraînement.
+- **Sélection du jeu d'évaluation** (`select_eval_ids`) :
+  - `--split val` (défaut) : le split validation du protocole — disjoint de l'entraînement par construction.
+    Si un `run_info.json` (§18) est trouvé à côté du checkpoint, ses `train_ids`/`val_ids` stockés sont la
+    **source de vérité** (robuste au drift de config après entraînement).
+  - `--split test` : les premières `n_test` IDs du **pool inutilisé** — IDs jamais dans aucune phase
+    (au-delà de `n_samples` dans l'ordre du shuffle seedé, même protocole RNG que `train.py`). Repli sur le
+    split val (avec warning) si le pool est vide (toutes les sims du fichier ont été consommées).
+  - Garde-fou : tout chevauchement eval/train lève une `RuntimeError`.
+- **Inférence** : wrapper Lightning sans optimizer (`optimizer` rendu optionnel dans
+  `MultiStepLightningBase.__init__`), `TrainingConfig` d'inférence (losses désactivées → liste vide,
+  bruit 0, BPTT off, `predict_derivative`/`dt`/normalisation temporelle repris de `shared_params`).
+  Rollout **AR complet** via `_rollout(..., training=False, store_fields=True)` — nouveau flag qui
+  collecte les prédictions/cibles détachées par pas (liste `(B, C, H, W)`) sans rien changer au chemin
+  d'entraînement. `DeepONetModel` vs `MultiStepNOModel` choisi via `_is_deeponet`.
+- **Sortie** : table formatée sur stdout + `eval_results_<split>.json` (à côté du checkpoint ou
+  `--output-dir`) auto-contenu : toutes les métriques scalaires, bandes spectrales, courbe par pas AR,
+  bookkeeping complet (checkpoint, phase, split effectif, source des IDs, IDs évalués + train_ids en audit).
+- Section optionnelle `"eval"` de TrainingConfig : `spectral_bands` (défaut PDEBench),
+  `spectral_relative` (défaut true), `n_test` (taille du split test).
+
+**Bugs corrigés en route** :
+1. `radial_frequency_grid` initialement en **cycles/échantillon** (`fftfreq`) → les bornes de bandes
+   PDEBench (4, 12) n'avaient plus le même sens ; remplacé par l'**index de bin FFT** (coquilles de
+   PDEBench), docstrings alignés.
+2. `r_squared` initialement centrée globalement → refaite **par (échantillon, canal)** avec centrage
+   spatial uniquement (même unité que le nRMSE ; identité `R² = 1 − nRMSE²` vérifiée numériquement).
+3. `pynop/training/__init__.py` : import mort `from .callbacks import *` supprimé (module retiré au §15) ;
+   `from .eval import *` ajouté.
+
+**Vérifié** (env. conda `pytorch`) :
+- `pytest tests/` → **282/282 OK**, dont 20 nouveaux (`tests/test_eval_cli.py`) : invariances des
+  métriques (nRMSE d'échelle, R² affine, bandes spectrales relatives), identité par unité
+  `R² = 1 − nRMSE²` sur données à moyenne nulle, propriétés du grid radial (forme, symétrie fft, rayon max),
+  équivalence one-shot ≡ accumulation incrémentale (pooling exact) + courbe par pas ; sélection des splits
+  (config / `run_info.json` / repli test→val / pool inutilisé / split inconnu) ; dataloader d'évaluation
+  (protocole de fenêtres, shapes, cap `max_windows`) ; et **3 runs end-to-end CPU** sur HDF5 synthétique :
+  1 époque de prétraining → évaluation du split val (IDs pris dans le `run_info.json` du run), du split test
+  (disjoint de train ET val) et via l'entrée CLI `main()`.

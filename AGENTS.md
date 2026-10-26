@@ -35,6 +35,8 @@ itérative, sur la branche `dev`.
 | **Blocs communs** | `pynop/core/blocks.py`, `pynop/core/ops.py` | Blocs Swin déplacés ici ; **`TransformerBlock` unifié** avec option RoPE (`AdaptiveRoPE2D`) (§9, §10) |
 | **Blocs IT** | `pynop/core/blocks.py` | ✅ `SepLITBlock`/`SepNLITBlock`/`LITBlock` vérifiés — 3 bugs corrigés (§12) ; **`IAETBlock`** (style IAE-Net) vérifié contre l'implémentation officielle — 4 bugs corrigés (§16) |
 | **Training (Lightning)** | `pynop/training/lightning_model.py` | ✅ Réécrit : `predict_derivative` (sortie dérivée **ou** absolue), derivative-loss configurable, base unique `MultiStepLightningBase`, compat. tous les modèles du dépôt, `DeepONetModel` dédié ; wrappers AE/`CausalNO` supprimés (§15) |
+| **Driver CLI d'entraînement** | `pynop/training/train.py`, `configs/` | ✅ Réécrit : driver config-driven (`ModelConfig.json` + `TrainingConfig.json`, flag `--pretrain`) reproduisant le protocole 2 phases des notebooks PDEBench ; dataset PDEBench seul pour l'instant ; checkpoints `last` (chaque époque) / best (dès max pas AR atteint) ; `--resume`/`--init-from` (§18) |
+| **Eval CLI + métriques** | `pynop/training/eval.py`, `pynop/training/metrics.py` | ✅ Nouveau : évaluation d'un checkpoint sur des échantillons **non utilisés en entraînement** (split val par défaut, ou split test = pool inutilisé) ; métriques de champ MSE/RMSE/**nRMSE = relative L2**/MAE/max-err/**R²** + bandes spectrales radiales style PDEBench (unités d'index bin FFT) + courbe d'erreur par pas AR ; `eval_results_<split>.json` auto-contenu (§19) |
 
 ---
 
@@ -124,6 +126,38 @@ itérative, sur la branche `dev`.
 - DeepONet exige **`DeepONetModel`** (paradigme branch/trunk) — `MultiStepNOModel` le refuse
   explicitement avec un message pointant vers la bonne classe.
 
+### Driver CLI d'entraînement (`pynop/training/train.py`, §18)
+- Usage : `python -m pynop.training.train MODEL_CONFIG.json TRAINING_CONFIG.json [--pretrain]` —
+  `--pretrain` = section `"pretraining"`, sinon `"fulltraining"`. Exemples dans `configs/`
+  (protocole notebooks à l'identique). Pas de visualisation : entraînement + logs + checkpoints.
+- **Checkpoints** : `last.ckpt` **chaque époque dès la première** (poids toujours disponibles) ;
+  `best_RMSE`/`best_val_RMSE` (top-k=2) seulement **dès que le rollout atteint le max de pas AR**
+  (`epoch >= final_AR`) — pendant la rampe du curriculum les métriques ne sont pas comparables.
+- **Gotcha Lightning 2.x** : sous PL ≥ 2, `ModelCheckpoint` sauvegarde par défaut dans
+  `on_train_epoch_end` (pas `on_validation_end`) → le gate de `CurriculumCheckpoint` est appliqué
+  dans `_should_skip_saving_checkpoint` (choke point commun) et les checkpoints du driver passent
+  `save_on_train_epoch_end=False`. Ne pas régresser vers un override de hook unique.
+- Scheduler : tokens `"$total_steps"`/`"$steps_per_epoch"` ; OneCycleLR sans `max_lr` → lr de la
+  phase. ⚠️ Resume OneCycleLR = **même total de pas** (on ne change pas `max_epochs` après coup).
+- Split train/val sur les IDs de simulation (shuffle seedé + troncature `n_samples`) : identique aux
+  notebooks → phases cohérentes entre elles.
+
+### Évaluation (`pynop/training/eval.py`, `metrics.py`) (§19)
+- **nRMSE = relative L2** par échantillon/canal (le « normalized RMSE » de PDEBench) : invariante
+  d'échelle, et toujours significative sur données à moyenne nulle (dénominateur = écart-type du
+  champ). Normalisation par `mean(target)²` **non utilisée** (dégénère sur champs à moyenne nulle).
+- **R²** centrée spatialement uniquement, par échantillon/canal → invariante à toute rénormalisation
+  affine ; identité exacte sur données à moyenne nulle : `R²_{i,c} = 1 − nRMSE²_{i,c}`.
+- **Bandes spectrales** : coquilles radiales en **unités d'index bin FFT** (bornes PDEBench
+  iLow=4/iHigh=12), dépendantes de la résolution comme chez PDEBench ; relatives par défaut
+  (invariantes d'échelle), mode absolu via `"eval": {"spectral_relative": false}`.
+- Jeu d'évaluation : split **val** par défaut — IDs pris dans le `run_info.json` à côté du checkpoint
+  s'il existe, sinon re-déduits de la config ; `--split test` = pool inutilisé (au-delà de
+  `n_samples`, même shuffle seedé que l'entraînement) avec repli sur val si vide ; chevauchement
+  eval/train → `RuntimeError`.
+- `_rollout(store_fields=True)` collecte les prédictions/cibles détachées par pas pour les métriques
+  sans toucher au chemin d'entraînement ; l'optimizer du wrapper Lightning est optionnel (inférence).
+
 ---
 
 ## Prochaines étapes (session suivante)
@@ -135,7 +169,7 @@ itérative, sur la branche `dev`.
 3. [ ] Vérifier les classes restantes de `pynop/core/blocks.py` et `pynop/core/ops.py`.
 
 > Historique des étapes terminées (DeepONet, SwinNO, UNet, UNO, Resnet unifiée, blocs IT, FNO,
-> lightning_model, IAETBlock, Transolver, …) : voir `docs/session-notes.md`.
+> lightning_model, IAETBlock, Transolver, driver CLI train.py, …) : voir `docs/session-notes.md`.
 
 ## Conventions
 - Environnement : conda `pytorch` (Python 3.12, Linux).
