@@ -102,6 +102,10 @@ itérative, sur la branche `dev`.
 - **Gotcha `MSSwinNO_1stage`** : `dec_num_windows=[(16,16)]` sur grille 16×16 = fenêtres **1×1**
   (attention par pixel au décodeur). C'est la config d'origine (ancien "OSSwinNO", `dec_windows` était
   déjà un nombre de fenêtres/axe — vérifié git) ; conservé pour fidélité, signalé à l'utilisateur.
+- **Configs volatiles** : les params des `model_*.json` sont modifiés régulièrement par l'utilisateur
+  (tests de configurations différentes) — au moment du commit, prendre les valeurs telles qu'elles sont,
+  sans « corriger » un écart avec les notebooks ni s'étonner d'un drift ; resynchroniser la doc §20
+  (table + comptages de params) quand on y touche.
 
 ### FNO (§14)
 - Ordre du bloc aligné sur neuralop / Li et al. 2021 : `[norm] → spectral_conv → [activation] →
