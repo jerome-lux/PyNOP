@@ -1032,11 +1032,11 @@ répertoire de logs `<root>/<experiment>/<phase>/<name>/10steps_*`) :
 | `model_FNOvanilla.json` | `FNO` | training_FNOvanilla_PDEBench.ipynb | modes (32,32), **5 blocs** / hidden 20×5 — écart volontaire au notebook (4 blocs/1.64 M → 2.05 M), spectral standard |
 | `model_tuckerFNO.json` | `FNO` | training_tuckerFNO_PDEBench.ipynb | modes (24,24), hidden 48×4, **tucker** factor 2 |
 | `model_ITLNO.json` | `ITLNO` | training_ITLNO_PDEBench.ipynb | modes 16, basis "free", pe random_ipe(10) |
-| `model_LNO.json` | `LatentNO` | training_LNO_PDEBench.ipynb | d_model/modes 256, pe random_fourier(10), std_init 0.02 |
-| `model_LatentGalerkin.json` | `LatentGalerkin` | training_LatentGalerkin_PDEBench.ipynb | modes 256, latent_attention "vanilla", **pe null** |
+| `model_LNO.json` | `LatentNO` | training_LNO_PDEBench.ipynb | d_model 128 / modes 256, **pe "adaptive"** (notebook : random_fourier(10)), mlp_layers 1, transformer_mlp_factor 2, std_init 0.02 |
+| `model_LatentGalerkin.json` | `LatentGalerkin` | training_LatentGalerkin_PDEBench.ipynb | modes 256, latent_attention "vanilla", **pe "adaptive"** (notebook : None), std_init 0.1 |
 | `model_SwinNO.json` | `SwinNO` | training_SwinNO_PDEBench.ipynb | num_windows 8 (ancien winsize=16 @128²), latent_dim 256, 2 blocs |
 | `model_MSSwinNO_1stage.json` | `MultiscaleSWINNO` | idem (`name = "MSSwinNO_1stage"`) | 1 stage 16×16, enc global / dec (16,16) — voir gotcha ci-dessous |
-| `model_MSSwinNO.json` | `MultiscaleSWINNO` | training_MSSwinNO_PDEBench.ipynb | 2 stages (32²→16²), model_dim [128,192,256] |
+| `model_MSSwinNO.json` | `MultiscaleSWINNO` | training_MSSwinNO_PDEBench.ipynb | 2 stages (32²→16²), model_dim [128,192,256], enc_repeats [1,2] / dec_repeats 1 |
 | `model_Transolver_linear.json` | `Transolver` | training_Transolver_linear_PDEBench.ipynb | mode "linear", n_hidden 128 |
 | `model_Transolver3.json` | `Transolver` | training_Transolver3_PDEBench.ipynb | mode "t3", n_hidden 256 |
 
@@ -1064,9 +1064,9 @@ tel quel (fidélité aux notebooks).
 **Vérifié** (env. conda `pytorch`) :
 - Les 10 configs passent `build_model` + forward + backward (grille 32², sauf MSSwinNO_1stage en 16² —
   l'entrée de MultiscaleSWINNO doit matcher `grid_resolutions[0]`). Comptages de paramètres cohérents :
-  SwinNO **1.19 M** / MSSwinNO_1stage **1.37 M** (valeurs documentées §3), MSSwinNO 2 stages 3.02 M,
-   Transolver3 3.07 M, FNOvanilla **2.05 M** (5 blocs — écart volontaire au notebook), tuckerFNO 1.36 M, ITLNO 0.82 M, LatentGalerkin 0.73 M, LNO 0.65 M,
-  Transolver_linear 1.00 M.
+   SwinNO **1.19 M** / MSSwinNO_1stage **1.37 M** (valeurs documentées §3), MSSwinNO 2 stages **3.55 M**,
+   Transolver3 3.07 M, FNOvanilla **2.05 M** (5 blocs — écart volontaire au notebook), tuckerFNO 1.36 M, ITLNO 0.82 M, LatentGalerkin **0.78 M**, LNO **0.72 M**,
+   Transolver_linear 1.00 M (comptages sur l'état final des configs — ajustés après la validation initiale : pe "adaptive" pour LNO/LatentGalerkin, enc_repeats [1,2] pour MSSwinNO).
 - Smoke test end-to-end `python -m pynop.training.train configs/model_FNOvanilla.json <training minimal>
   --pretrain --device cpu` (1 époque, 4 sims, t∈[0,15]) : dataset split 3/1, losses + régulariseur de
   dérivée calculés, OneCycleLR (token `$total_steps`) OK, rollout val par pas (`step_1`/`step_2`),
