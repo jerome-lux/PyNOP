@@ -1975,7 +1975,7 @@ class PEBlock(nn.Module):
                 self.pe = AdaptiveFourierEmbedding(
                     in_features=in_features,
                     out_features=out_features,
-                    base_max_freq=kwargs.get("max_freq", kwargs.get("max_freq_val", 128.0)),
+                    base_max_freq=kwargs.get("max_freq", kwargs.get("max_freq_val", 256.0)),
                 )
             case None:
                 self.pe = nn.Identity()
@@ -2278,9 +2278,7 @@ class TransolverBlockv3(nn.Module):
 
         # Standard attention among the slice tokens of each head.
         q, k, v = self.to_q(s), self.to_k(s), self.to_v(s)
-        s_out = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=self.out_dropout.p if self.training else 0.0
-        )
+        s_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.out_dropout.p if self.training else 0.0)
 
         # Faster deslicing: project the slices, scatter with w, concatenate heads.
         s_out = self.slice_linear3(s_out)  # [B, H, M, D]
