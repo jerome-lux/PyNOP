@@ -1715,9 +1715,27 @@ class TransformerBlock(nn.Module):
 
 
 class TransolverBlock(nn.Module):
-    """
-    Base block for Transolver++
-    see https://github.com/thuml/Transolver_plus/blob/b2f656d382d0c8454415f004f1c7af1436f90c42/models/Transolver_plus.py#L16
+    """Physics-Attention block of Transolver / Transolver++.
+
+    Grid points are softly assigned to ``slice_num`` physical slices per head via a
+    Gumbel-Softmax weight matrix, standard attention is run on the (few) slice tokens,
+    and the result is desliced back with the same weights. Follows the official
+    implementation: https://github.com/thuml/Transolver_plus/blob/b2f656d382d0c8454415f004f1c7af1436f90c42/models/Transolver_plus.py
+
+    The block is pre-normalized, mirroring the official
+    ``fx = Attn(ln_1(fx)) + fx`` / ``fx = mlp(ln_2(fx)) + fx`` structure: ``ln1`` is
+    applied to the input *before* the attention sub-layer and ``ln2`` before the MLP
+    projection.
+
+    Args:
+        dim: Input/output feature dimension (the residual stream width).
+        heads: Number of attention heads.
+        dim_head: Dimension per head; the attention inner dim is ``heads * dim_head``.
+        dropout: Dropout rate applied to the projected attention output before the
+            residual addition.
+        slice_num: Number of physical slices K per head.
+        mlp_ratio: Expansion ratio of the output MLP (hidden = ``mlp_ratio * dim``).
+        activation: Activation class used in the temperature MLP and the output MLP.
     """
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64, mlp_ratio=2, activation=nn.GELU):
@@ -1744,13 +1762,20 @@ class TransolverBlock(nn.Module):
         self.proj = MLPBlock(inner_dim, dim, hidden_dim=mlp_ratio * dim, activation=activation)
 
     def forward(self, x):
+        """Forward pass.
+
+        Args:
+            x: Token sequence of shape ``[B, N, C]`` with ``C == dim``.
+
+        Returns:
+            Tensor of shape ``[B, N, C]`` (residual connection included).
+        """
         # input B N C
         B, N, C = x.shape
 
-        x_mid = self.ln1(x)
-        # --- Physic Attention block
+        # --- Physics Attention block (pre-norm: ln1 before the projection)
         x_mid = (
-            self.in_project_x(x).reshape(B, N, self.heads, self.dim_head).permute(0, 2, 1, 3).contiguous()
+            self.in_project_x(self.ln1(x)).reshape(B, N, self.heads, self.dim_head).permute(0, 2, 1, 3).contiguous()
         )  # B H N C
 
         temperature = self.proj_temperature(x_mid) + self.bias
@@ -1768,17 +1793,30 @@ class TransolverBlock(nn.Module):
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
 
-        # --- End of Physic Attention block
+        # --- End of Physics Attention block
 
-        out_x = self.proj(self.ln2(out_x)) + x
+        out_x = self.dropout(self.proj(self.ln2(out_x))) + x
 
         return out_x
 
 
 class LinearNOBlock(nn.Module):
-    """
-    Implementation of LinearNO.
-    Ref: "Transolver Is a Linear Transformer: Revisiting Physics-Attention..." (2026)
+    """Canonical linear attention block — the LinearNO formulation of physics attention.
+
+    Reference: "Transolver is a Linear Transformer: Revisiting Physics-Attention
+    through the Lens of Linear Attention" (Hu, Liu, Qiao, Sun & Dou, arXiv:2511.06294).
+
+    Instead of an explicit soft assignment matrix ``w`` with diagonal normalization
+    (the Transolver family mechanism — see :class:`TransolverBlock` and
+    :class:`TransolverBlockv3`), this block rewrites physics attention as canonical
+    linear attention with *asymmetric* kernel normalizations (paper Eqs. 8-9):
+
+        phi(Q)   = softmax over the slice dim M  (per grid point, per head)
+        psi(K)^T = softmax over the grid dim N   (per slice, per head)
+        out      = phi(Q) @ (psi(K)^T @ V)       # O(N·M + M·N·D), no N×N attention
+
+    The block is pre-normalized: ``x += dropout(out_proj(Attn(norm1(x))))`` followed
+    by an MLP sublayer ``x += mlp(norm2(x))``.
     """
 
     def __init__(
@@ -1997,252 +2035,270 @@ class PEBlock(nn.Module):
         return self.pe(x)
 
 
-class MHSlicingBlock(nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        num_slices: int,
-        num_heads: int,
-        temp: float = 1.0,
-        use_gumbel: bool = False,
-    ):
-        """
-        Multi-Head Slicing Block inspired by Transolver.
-        in_features:  Dimension C of input features from mesh points
-        out_features: Total hidden dimension (must be divisible by num_heads)
-        num_slices:   Number of physical states/slices M per head
-        num_heads:    Number of heads H
-        """
-        super().__init__()
-        self.M = num_slices
-        self.H = num_heads
-        self.d_k = out_features // num_heads
-        self.gumbel = use_gumbel
-
-        assert out_features % num_heads == 0, "out_features must be divisible by num_heads"
-
-        # Separate projections for weights per head: H * M outputs
-        self.weight_proj = nn.Linear(in_features, self.H * self.M)
-
-        temp_ini = torch.log(torch.exp(torch.tensor(temp)) - 1.0)
-        self.temp = nn.Parameter(temp_ini)
-
-        # Projection of input features before slicing
-        self.linear1 = nn.Linear(in_features, out_features)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        """
-        x: [B, N, C] - Input tensor from mesh points
-        Returns:
-            s: [B, M, out_features] - Sliced physics tokens with combined heads
-        """
-        B, N, C = x.shape
-
-        # --- 1. COMPUTE MULTI-HEAD SLICE WEIGHTS (w) AND DIAGONAL (d) ---
-        # Project and reshape to isolate heads: [B, N, H, M]
-        weight_logits = self.weight_proj(x).view(B, N, self.H, self.M)
-        temp = F.softplus(self.temp) + 0.05
-        if self.gumbel:
-            w = gumbel_softmax(weight_logits, temp, dim=-1)
-        else:
-            w = torch.softmax(weight_logits / temp, dim=-1)
-
-        # d represents the sum of weights per slice per head
-        # Sum over N -> [B, 1, H, M]
-        d = w.sum(dim=1, keepdim=True)
-
-        # --- 2. PREPARE SLICE INPUT AND PROJECTION ---
-        # Apply linear1 and reshape to separate heads: [B, N, H, d_k]
-        # Then permute to [B, H, N, d_k] for batch matrix multiplication
-        x_projected = self.linear1(x).view(B, N, self.H, self.d_k).permute(0, 2, 1, 3)
-
-        # Permute w to [B, H, M, N]
-        w_t = w.permute(0, 2, 3, 1)
-
-        # Slicing via batch matrix multiplication: [B, H, M, N] @ [B, H, N, d_k]
-        s_raw = torch.matmul(w_t, x_projected)  # Shape: [B, H, M, d_k]
-
-        # --- 3. FASTER SLICE WITH MULTI-HEAD DIAGONAL INVERSION ---
-        # Permute d from [B, 1, H, M] to [B, H, M, 1] to align with s_raw
-        d_inv = 1.0 / (d.permute(0, 2, 3, 1) + 1e-8)
-
-        # Scale sliced tokens per head
-        s_heads = s_raw * d_inv  # Shape: [B, H, M, d_k]
-
-        # --- 4. COMBINE HEADS FOR DOWNSTREAM ATTENTION BLOCKS ---
-        # [B, H, M, d_k] -> [B, M, H, d_k] -> [B, M, out_features]
-        s = s_heads.permute(0, 2, 1, 3).contiguous().view(B, self.M, -1)
-
-        return s, w
-
-
-class MHDeslicingBlock(nn.Module):
-    def __init__(self, in_features: int, out_features: int, num_slices: int, num_heads: int):
-        """
-        Args:
-            in_features: Latent dimension D [B, M, D], must be divisible by num_heads.
-            out_features: Output physical dimension C.
-            num_slices: Number of slices M.
-            num_heads: Number of heads H.
-        """
-        super().__init__()
-        self.M = num_slices
-        self.H = num_heads
-        self.d_k = in_features // num_heads
-        assert in_features % num_heads == 0, "in_features must be divisible by num_heads"
-
-        # Per-head projection: d_k -> d_k (reduced space, symmetric to linear1)
-        self.linear3 = nn.Linear(self.d_k, self.d_k)
-        # Final projection after head recombination: D -> out_features
-        self.linear_out = nn.Linear(in_features, out_features)
-
-    def forward(self, s: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            s: Latent tokens from attention layers [B, M, D].
-            w: Slicing weights from SlicingBlock [B, N, H, M].
-        Returns:
-            x_out: Output tensor [B, N, out_features].
-        """
-        B, M, D = s.shape
-
-        # --- 1. SPLIT INTO HEADS AND PROJECT ---
-        # [B, M, D] -> [B, M, H, d_k] -> [B, H, M, d_k]
-        s_heads = s.view(B, M, self.H, self.d_k).permute(0, 2, 1, 3)
-        # Per-head projection (Faster Deslice)
-        s_heads = self.linear3(s_heads)  # [B, H, M, d_k]
-
-        # --- 2. PER-HEAD SPATIAL RECONSTRUCTION ---
-        # [B, N, H, M] -> [B, H, N, M]
-        w_deslice = w.permute(0, 2, 1, 3)
-        # [B, H, N, M] @ [B, H, M, d_k] -> [B, H, N, d_k]
-        x_out_heads = torch.matmul(w_deslice, s_heads)
-
-        # --- 3. HEAD RECOMBINATION ---
-        # [B, H, N, d_k] -> [B, N, H, d_k] -> [B, N, D]
-        x_out = x_out_heads.permute(0, 2, 1, 3).contiguous().view(B, -1, D)
-
-        # --- 4. FINAL PROJECTION ---
-        x_out = self.linear_out(x_out)  # [B, N, out_features]
-
-        return x_out
-
-
 class SlicingBlock(nn.Module):
+    """Slicing operator of the Transolver family (single weight-set form).
+
+    Softly assigns the ``N`` grid points to ``M`` slices with a temperature-scaled
+    softmax weight matrix and computes each slice as the *diagonally normalized*
+    weighted average of the input features:
+
+        s_j = linear1( sum_i w_ij x_i / d_j ),   d_j = sum_i w_ij
+
+    This is the "faster slicing" mechanism of Transolver-3 (arXiv:2602.04940, Sec. 3;
+    physics attention originally from arXiv:2402.02366): the weighted average is taken
+    in the mesh domain and the linear projection only touches the ``M`` slices. Because
+    each row of ``w / d`` sums to 1, projecting before or after the weighted sum is
+    mathematically identical (the bias is added once per slice either way); this class
+    projects first.
+
+    The full Transolver-3 block uses one weight set *per head* — see
+    :class:`TransolverBlockv3`. This single-set variant is used by
+    ``LatentTransolver`` (``pynop/models/LNO.py``), which processes the ``M`` slice
+    tokens with its own attention stack.
+
+    Note: "Transolver Is a Linear Transformer" (arXiv:2511.06294) reinterprets this
+    physics-attention slicing as canonical linear attention; that formulation is
+    implemented by :class:`LinearNOBlock`, not here.
+
+    Args:
+        in_features: Input feature dimension C.
+        out_features: Projected (slice) feature dimension D.
+        num_slices: Number of slices M.
+        temp: Initial temperature; the effective one is ``softplus(param) + 0.05``.
+    """
+
     def __init__(self, in_features: int, out_features: int, num_slices: int, temp: float = 1.0):
         super().__init__()
         self.M = num_slices
-        self.weight_proj = nn.Linear(in_features, num_slices)  # ? w ? R^{N�M}
+        self.weight_proj = nn.Linear(in_features, num_slices)  # w : R^{N x M}
         self.linear1 = nn.Linear(in_features, out_features)  # x_proj
         temp_ini = torch.log(torch.exp(torch.tensor(temp)) - 1.0)
         self.temp = nn.Parameter(temp_ini)
 
     def forward(self, x):
+        """Slice the input tokens.
+
+        Args:
+            x: Input of shape ``[B, N, C]``.
+
+        Returns:
+            Tuple ``(s, w)`` with sliced tokens ``s`` of shape ``[B, M, D]`` and
+            slice weights ``w`` of shape ``[B, N, M]`` (rows sum to 1).
+        """
         B, N, C = x.shape
         temp = F.softplus(self.temp) + 0.05
 
-        # w ? [B, N, M]
+        # w : [B, N, M] — rows sum to 1 (softmax over the slice dimension)
         w = torch.softmax(self.weight_proj(x) / temp, dim=-1)
 
-        # d ? [B, M] � somme des poids par slice
+        # d : [B, M] — per-slice weight sums (diagonal normalization, Eq. 3)
         d = w.sum(dim=1)  # [B, M]
 
-        # s_raw = w? x_proj : [B, M, N] @ [B, N, D] ? [B, M, D]
-        s_raw = self.linear1(torch.bmm(w.permute(0, 2, 1), x))
+        # Project first, then slice: s_raw = W^T . x_proj  ([B, M, N] @ [B, N, D])
+        x_proj = self.linear1(x)
+        s_raw = torch.bmm(w.permute(0, 2, 1), x_proj)  # [B, M, D]
 
-        # Normalisation diagonale
+        # Diagonal normalization
         s = s_raw / (d.unsqueeze(-1) + 1e-8)  # [B, M, D]
 
         return s, w
 
 
 class DeslicingBlock(nn.Module):
+    """Deslicing operator of the Transolver family (single weight-set form).
+
+    Projects the ``M`` slice tokens to the output dimension and scatters them back
+    onto the ``N`` grid points with the slicing weights:
+
+        x_i = sum_j w_ij linear3(s'_j)
+
+    This is the "faster deslice" mechanism of Transolver-3 (arXiv:2602.04940, Sec. 3).
+    Because each row of ``w`` sums to 1, projecting the slices *before* deslicing is
+    exactly equivalent to deslicing first and then applying the same linear layer —
+    while only touching M tokens instead of N. The full Transolver-3 block applies a
+    per-head projection before scattering and concatenates the heads; see
+    :class:`TransolverBlockv3`.
+
+    Args:
+        in_features: Slice feature dimension D.
+        out_features: Output feature dimension C_out.
+    """
+
     def __init__(self, in_features: int, out_features: int):
         super().__init__()
 
         self.linear3 = nn.Linear(in_features, out_features)
 
     def forward(self, s_prime, w):
-        # s_prime : [B, M, D],  w : [B, N, M]
+        """Deslice the slice tokens back to mesh space.
 
-        # Faster deslice (Eq. 3)
+        Args:
+            s_prime: Slice tokens of shape ``[B, M, D]``.
+            w: Slicing weights of shape ``[B, N, M]`` (rows sum to 1).
+
+        Returns:
+            Tensor of shape ``[B, N, C_out]``.
+        """
+        # Faster deslice: project the M slices, then scatter with w
         s_out = self.linear3(s_prime)  # [B, M, C_out]
 
-        # Reprojection vers N : w @ s_out ? [B, N, M] @ [B, M, C_out]
+        # Reprojection onto N : w @ s_out — [B, N, M] @ [B, M, C_out]
         x_out = torch.bmm(w, s_out)  # [B, N, C_out]
 
         return x_out
 
 
 class TransolverBlockv3(nn.Module):
+    """Transolver-3 encoder block: per-head physics attention in the slice domain.
+
+    Reference: "Transolver-3: Scaling Up Transformer Solvers to Industrial-Scale
+    Geometries" (arXiv:2602.04940), Sections 3.1-3.3, following the official
+    implementation https://github.com/lbruand-db/distributed-transolver3
+    (``PhysicsAttentionV3`` + ``Transolver3Block``).
+
+    Block composition (pre-norm, two residual sublayers):
+
+        fx = Attn(ln_1(fx)) + fx      # physics attention in the slice domain
+        fx = mlp(ln_2(fx))  + fx      # pointwise MLP sublayer
+
+    Physics attention operates on ``M`` *slices* per head instead of the ``N`` mesh
+    tokens. Each head owns an **independent** soft assignment of the grid points to
+    its slices (this is what distinguishes it from the single-weight-set
+    :class:`SlicingBlock` used by LatentTransolver):
+
+        w_h  = softmax(in_project_slice(x)[:, :, h, :] / T_h, dim=M)   # [B, N, M]
+        s_h  = slice_linear1( sum_n w_h[n, m] x_n / d_h[m] )           # [B, H, M, D]
+        s'_h = SDPA(to_q(s_h), to_k(s_h), to_v(s_h))                   # attention over the M slices
+        out  = concat_h( sum_m w_h[n, m] slice_linear3(s'_h[m]) )      # [B, N, C], C = H * D
+
+    The linear projections live in the slice domain (``M`` tokens) rather than the
+    mesh domain (``N`` tokens): the "faster slicing / deslicing" of the paper.
+    Because each row of ``w / d`` sums to 1, aggregating the raw features before
+    projecting is mathematically identical to projecting first (the bias is added
+    once per slice either way).
+
+    The geometry-slice tiling and physical-state caching of the reference are
+    intentionally **not** implemented here: they are memory / inference
+    optimizations that are mathematically identical to this standard path.
+
+    Note: ``in_project_slice`` is orthogonally initialized, mirroring the
+    reference; when used inside :class:`~pynop.models.transolver.Transolver` the
+    wrapper's global truncated-normal init overwrites it (same as in the
+    reference model).
+
+    Args:
+        dim: Residual stream width C. Must equal ``heads * dim_head`` because the
+            per-head outputs are concatenated back to C without a final projection.
+        heads: Number of attention heads H.
+        dim_head: Per-head dimension D (defaults to ``dim // heads``).
+        slice_num: Number of slices M per head.
+        mlp_ratio: Expansion ratio of the MLP sublayer (hidden = ``dim * mlp_ratio``);
+            the reference model uses 1.
+        dropout: Dropout rate applied inside the scaled-dot-product attention
+            (training only) and to the desliced output before the residual addition.
+        activation: Activation class used in the MLP sublayer.
+    """
+
     def __init__(
         self,
-        in_features: int,
-        hidden_features: int,
-        num_slices: int,
-        num_heads: int = 4,
-        num_layers: int = 1,
-        dim_feedforward: Optional[int] = None,
-        dropout: float = 0.1,
-        temp: float = 1.0,
+        dim: int,
+        heads: int = 8,
+        dim_head: Optional[int] = None,
+        slice_num: int = 64,
+        mlp_ratio: int = 1,
+        dropout: float = 0.0,
+        activation: Callable = nn.GELU,
     ):
-        """
-        Complete Transolver3 Block combining Slicing, L Attention Layers, and Deslicing.
-        in_features:     Input/output physical channels per mesh point (C)
-        hidden_features: Latent dimension for attention layers (D)
-        num_slices:      Number of physical slices M
-        num_heads:       Number of heads H
-        num_layers:      Number of attention layers L
-        dim_feedforward: Hidden dimension of FFN (defaults to 4 * hidden_features)
-        """
         super().__init__()
-        if dim_feedforward is None:
-            dim_feedforward = 4 * hidden_features
+        if dim_head is None:
+            dim_head = dim // heads
+        assert dim == heads * dim_head, (
+            f"Transolver-3 requires dim == heads * dim_head ({dim} != {heads} * {dim_head}): "
+            "per-head outputs are concatenated back to the residual stream without a final projection."
+        )
+        self.dim = dim
+        self.heads = heads
+        self.dim_head = dim_head
+        self.slice_num = slice_num
 
-        self.norm = nn.LayerNorm(in_features)
+        # --- Physics attention (slice domain) -----------------------------------
+        # Per-head soft assignment of the N grid points to M slices.
+        self.in_project_slice = nn.Linear(dim, heads * slice_num)
+        nn.init.orthogonal_(self.in_project_slice.weight)  # as in the reference
+        # Learnable per-head temperature, clamped to [0.1, 5] (paper).
+        self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
 
-        # Slicing: Mesh space [B, N, C] -> Slice space [B, M, D]
-        self.slicing = SlicingBlock(
-            in_features=in_features,
-            out_features=hidden_features,
-            num_slices=num_slices,
-            temp=temp,
+        # "Faster slicing": aggregate the raw features first, then project the M slices.
+        self.slice_linear1 = nn.Linear(dim, dim_head)
+        # Attention over the M slice tokens; q/k/v shared across heads (standard MHA layout).
+        self.to_q = nn.Linear(dim_head, dim_head, bias=False)
+        self.to_k = nn.Linear(dim_head, dim_head, bias=False)
+        self.to_v = nn.Linear(dim_head, dim_head, bias=False)
+        # "Faster deslicing": project the M slices back to per-head features before scattering.
+        self.slice_linear3 = nn.Linear(dim_head, dim_head)
+        self.out_dropout = nn.Dropout(dropout)
+
+        # --- Block sublayers (pre-norm + residual, as in Transolver3Block) ------
+        self.ln_1 = nn.LayerNorm(dim)
+        self.ln_2 = nn.LayerNorm(dim)
+        self.mlp = MLPBlock(in_ch=dim, out_ch=dim, hidden_dim=dim * mlp_ratio, num_layers=2, activation=activation)
+
+    def _slice_weights(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-head slice weights.
+
+        Args:
+            x: Input of shape ``[B, N, C]``.
+
+        Returns:
+            Tensor ``w`` of shape ``[B, H, N, M]``; each row sums to 1 over the
+            slice dimension (a grid point distributes its mass across slices).
+        """
+        B, N, _ = x.shape
+        logits = self.in_project_slice(x).reshape(B, N, self.heads, self.slice_num)
+        logits = logits.permute(0, 2, 1, 3).contiguous()  # [B, H, N, M]
+        temp = torch.clamp(self.temperature, min=0.1, max=5.0)
+        return torch.softmax(logits / temp, dim=-1)
+
+    def _physics_attention(self, x: torch.Tensor) -> torch.Tensor:
+        """Physics attention in the slice domain (paper Eqs. 3-4).
+
+        Args:
+            x: Input of shape ``[B, N, C]`` (already normalized by ``ln_1``).
+
+        Returns:
+            Tensor of shape ``[B, N, C]`` (dropout applied, residual **not** added).
+        """
+        B, N, _ = x.shape
+        w = self._slice_weights(x)  # [B, H, N, M]
+        d = w.sum(dim=2)  # [B, H, M] — per-slice mass (diagonal normalization)
+
+        # Faster slicing: aggregate the raw features (O(N·M·C)), then project the M slices.
+        s_raw = torch.einsum("bhnm,bnc->bhmc", w, x)  # [B, H, M, C]
+        s = self.slice_linear1(s_raw / (d.unsqueeze(-1) + 1e-5))  # [B, H, M, D]
+
+        # Standard attention among the slice tokens of each head.
+        q, k, v = self.to_q(s), self.to_k(s), self.to_v(s)
+        s_out = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.out_dropout.p if self.training else 0.0
         )
-        # L Layers of Transformer Attention on slice space
-        self.attention_layers = nn.ModuleList(
-            [
-                TransformerBlock(
-                    dim=hidden_features,
-                    n_heads=num_heads,
-                    mlp_dim=dim_feedforward,
-                    dropout=dropout,
-                    activation=nn.GELU,
-                )
-                for _ in range(num_layers)
-            ]
-        )
-        # Deslicing: Slice space [B, M, D] -> Mesh space [B, N, C]
-        self.deslicing = DeslicingBlock(
-            in_features=hidden_features,
-            out_features=in_features,
-        )
+
+        # Faster deslicing: project the slices, scatter with w, concatenate heads.
+        s_out = self.slice_linear3(s_out)  # [B, H, M, D]
+        x_out = torch.matmul(w, s_out)  # [B, H, N, D]
+        return rearrange(x_out, "b h n d -> b n (h d)")  # [B, N, C]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B, N, C] - Input mesh tensor
-        Returns: [B, N, C] - Output mesh tensor
-        """
-        # Pre-norm + r�siduelle
-        residual = x
-        x = self.norm(x)
+        """Forward pass.
 
-        s, w = self.slicing(x)
-        for layer in self.attention_layers:
-            s = layer(s)
-        x_out = self.deslicing(s, w)
+        Args:
+            x: Input mesh tensor of shape ``[B, N, C]`` with ``C == dim``.
 
-        return residual + x_out
+        Returns:
+            Output mesh tensor of shape ``[B, N, C]`` (residuals included).
+        """
+        fx = self._physics_attention(self.ln_1(x)) + x
+        fx = self.mlp(self.ln_2(fx)) + fx
+        return fx
 
 
 class IAETBlock(nn.Module):

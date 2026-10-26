@@ -1,16 +1,41 @@
-import math
-from functools import partial
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Union, Sequence, Callable, Optional
-from pynop.core.blocks import MLPBlock, TransolverBlock, LinearNOBlock, TransformerBlock, TransolverBlockv3
-from pynop.core.norm import AdaptiveLayerNorm, AdaRMSNorm
-from pynop.core.activations import Sine, TaylorSoftmax, gumbel_softmax
-from pynop.core.utils import print_stats
+from typing import Union, Callable, Optional
+from pynop.core.blocks import MLPBlock, TransolverBlock, LinearNOBlock, TransolverBlockv3
 
 
 class Transolver(nn.Module):
+    """Transolver family of transformer neural operators on a 2-D grid.
+
+    The input field is lifted to ``n_hidden`` channels, mixed with an MLP-encoded
+    positional encoding (plus a learnable placeholder offset), and processed by
+    ``n_layers`` blocks selected by ``mode``:
+
+    - ``"linear"``: :class:`~pynop.core.blocks.LinearNOBlock` — canonical linear
+      attention with asymmetric softmax kernels, "Transolver is a Linear Transformer"
+      (arXiv:2511.06294);
+    - ``"t3"``: :class:`~pynop.core.blocks.TransolverBlockv3` — Transolver-3
+      (arXiv:2602.04940): per-head physics attention with faster slicing / deslicing
+      in the slice domain;
+    - ``"physics"``: :class:`~pynop.core.blocks.TransolverBlock` — original
+      Gumbel-Softmax Physics-Attention of Transolver / Transolver++.
+
+    Args:
+        in_ch: Number of input channels.
+        out_ch: Number of output channels.
+        slice_num: Number of slices M (latent tokens) per head.
+        n_layers: Number of blocks.
+        n_hidden: Hidden dimension.
+        dropout: Dropout rate forwarded to the blocks.
+        n_head: Number of attention heads (must divide ``n_hidden``).
+        activation: Activation class used in the PE/projection MLPs and the blocks.
+        mode: Block family, one of ``"linear"``, ``"t3"``, ``"physics"``.
+        mlp_ratio: MLP expansion ratio inside the blocks.
+        dim: Spatial dimension (the positional encoding expects a 2-D grid).
+        cond_dim: Optional conditioning channel count; when set, a condition field
+            of shape ``[B, cond_dim, H, W]`` is concatenated to the input channels.
+    """
+
     def __init__(
         self,
         in_ch: int,
@@ -27,7 +52,7 @@ class Transolver(nn.Module):
         cond_dim: Optional[int] = None,
     ):
         super(Transolver, self).__init__()
-        assert n_hidden % n_head == 0, "Hidden dim must be divisible by the number o fheads"
+        assert n_hidden % n_head == 0, "Hidden dim must be divisible by the number of heads"
         input_channels = in_ch if cond_dim is None else cond_dim + in_ch
         self.lifting = nn.Linear(input_channels, n_hidden)
         self.pe = MLPBlock(dim, n_hidden, hidden_dim=n_hidden // 2, num_layers=1, activation=activation)
@@ -54,21 +79,21 @@ class Transolver(nn.Module):
                     for _ in range(n_layers)
                 ]
             )
-        elif "t3":
+        elif mode == "t3":
             self.blocks = nn.ModuleList(
                 [
                     TransolverBlockv3(
-                        in_features=n_hidden,
-                        hidden_features=n_hidden,
-                        num_heads=n_head,
-                        num_layers=1,
-                        num_slices=slice_num,
-                        dim_feedforward=mlp_ratio * n_hidden,
+                        dim=n_hidden,
+                        heads=n_head,
+                        slice_num=slice_num,
+                        mlp_ratio=mlp_ratio,
+                        dropout=dropout,
+                        activation=activation,
                     )
                     for _ in range(n_layers)
                 ]
             )
-        else:
+        elif mode == "physics":
             self.blocks = nn.ModuleList(
                 [
                     TransolverBlock(
@@ -83,15 +108,21 @@ class Transolver(nn.Module):
                     for _ in range(n_layers)
                 ]
             )
+        else:
+            raise ValueError(f"Unknown Transolver mode '{mode}'. Expected one of 'linear', 't3' or 'physics'.")
+
         self.projection = MLPBlock(
             n_hidden, out_ch=out_ch, hidden_dim=n_hidden * mlp_ratio, num_layers=1, activation=activation
         )
         self.initialize_weights()
 
     def initialize_weights(self):
+        """Apply the reference truncated-normal init to all sub-modules."""
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
+        """Truncated-normal (std 0.02) for linears, identity for norms — as in the
+        official Transolver / LinearNO implementations."""
         if isinstance(m, nn.Linear):
             nn.init.trunc_normal_(m.weight, mean=0.0, std=0.02, a=-0.04, b=0.04)
             if isinstance(m, nn.Linear) and m.bias is not None:
@@ -101,7 +132,17 @@ class Transolver(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x, cond=None, **kwargs):
+        """Run the operator on a 2-D field.
 
+        Args:
+            x: Input field of shape ``[B, in_ch, H, W]``.
+            cond: Optional condition field of shape ``[B, cond_dim, H, W]``; requires
+                ``cond_dim`` to have been set at construction time.
+            **kwargs: Accepted for API compatibility with the training wrappers.
+
+        Returns:
+            Output field of shape ``[B, out_ch, H, W]``.
+        """
         # cond MUST be [B, cond_dim, H, W]
 
         B = x.shape[0]
