@@ -218,9 +218,10 @@ class MultiStepLightningBase(pl.LightningModule):
     Subclasses only implement :meth:`_forward_window`, i.e. the mapping
     ``window (B, n*C, H, W) -> (B, C, H, W)``.
 
-    At the end of every epoch (once validation has run), a single line prefixed
-    ``[Epoch k]`` is printed with the per-batch average losses of both splits —
-    total loss, each weighted component and the derivative regularizer.
+    All metrics are reported through ``self.log``: per-batch values with
+    ``on_step=True`` and epoch averages with ``on_step=False, on_epoch=True``,
+    so the progress bar and the loggers (CSV / TensorBoard / Aim) stay in sync
+    without any raw printing that would disturb the tqdm cursor.
 
     The optimizer may be omitted when the module is used for inference /
     evaluation only (e.g. :mod:`pynop.training.eval`): in that case
@@ -241,11 +242,6 @@ class MultiStepLightningBase(pl.LightningModule):
         self.optimizer = optimizer
         self.scheduler_config = scheduler_config
         self.train_loss_avg = MeanMetric()
-        # Per-epoch running sums used by the end-of-epoch loss summary printout.
-        self._train_sums: dict[str, float] = {}
-        self._val_sums: dict[str, float] = {}
-        self._n_train_batches = 0
-        self._n_val_batches = 0
 
         # --- losses -----------------------------------------------------
         raw_loss = train_config.loss_fn
@@ -375,13 +371,9 @@ class MultiStepLightningBase(pl.LightningModule):
         return self.optimizer
 
     def on_train_epoch_start(self):
+        # ``train_loss_avg`` is logged through its ``.compute()`` value (a plain
+        # tensor), so Lightning does not track/reset it — do it explicitly.
         self.train_loss_avg.reset()
-        self._train_sums = {}
-        self._n_train_batches = 0
-
-    def on_validation_epoch_start(self):
-        self._val_sums = {}
-        self._n_val_batches = 0
 
     # ------------------------------------------------------------------
     # To be implemented by the subclasses
@@ -593,25 +585,12 @@ class MultiStepLightningBase(pl.LightningModule):
             self.log(f"{prefix}nMSEdt", terms["derivative_loss"], on_step=True, on_epoch=True, prog_bar=True)
         self.log(f"{prefix}RMSE", terms["rmse"], on_step=True, on_epoch=True, prog_bar=True)
 
-    def _accumulate_terms(self, sums: dict[str, float], terms: dict) -> None:
-        """Add one batch's normalized ``terms`` to the per-epoch running sums."""
-        loss = terms["loss"]
-        sums["loss"] = sums.get("loss", 0.0) + (loss.item() if torch.is_tensor(loss) else float(loss))
-        for i, v in enumerate(terms["indiv_losses"]):
-            key = f"loss_{i}"
-            sums[key] = sums.get(key, 0.0) + float(v)
-        if self.derivative_loss_weight > 0:
-            d = terms["derivative_loss"]
-            sums["derivative_loss"] = sums.get("derivative_loss", 0.0) + (d.item() if torch.is_tensor(d) else float(d))
-
     def training_step(self, batch, batch_idx):
         inputs, time_idx, cond = self._unpack_batch(batch)
         res = self._rollout(inputs, time_idx, cond, training=True)
         terms = self._finalize(res, inputs.device)
 
         self.train_loss_avg.update(terms["loss"])
-        self._accumulate_terms(self._train_sums, terms)
-        self._n_train_batches += 1
 
         # Per-AR-step RMSEs: always logged (CSV/TB/Aim), shown on the progress
         # bar only when ``show_step_rmse`` is enabled.
@@ -620,10 +599,15 @@ class MultiStepLightningBase(pl.LightningModule):
         self._log_terms(terms, prefix="")
         self.log("AR_steps", int(res["AR_steps"]), prog_bar=True)
         self.log("loss", terms["loss"], on_step=True, on_epoch=True, prog_bar=True)
+        # Both flags: the running mean updates live on the progress bar
+        # (``avg_loss_step``) and Lightning also records the per-epoch average
+        # (``avg_loss_epoch``). With ``on_epoch`` only, the value is computed
+        # after the train bar has already been closed for the epoch, so it
+        # would never be displayed.
         self.log(
             "avg_loss",
             self.train_loss_avg.compute(),
-            on_step=False,
+            on_step=True,
             on_epoch=True,
             prog_bar=True,
             logger=True,
@@ -636,51 +620,9 @@ class MultiStepLightningBase(pl.LightningModule):
         res = self._rollout(inputs, time_idx, cond, training=False)
         terms = self._finalize(res, inputs.device)
 
-        self._accumulate_terms(self._val_sums, terms)
-        self._n_val_batches += 1
-
         self._log_terms(terms, prefix="val_")
         self.log("val_loss", terms["loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return terms["loss"]
-
-    def on_train_epoch_end(self):
-        """Print the per-epoch average losses for train and validation.
-
-        Called by Lightning once both loops of the epoch have completed, so a
-        single line reports the mean (over batches) total loss, each weighted
-        component and the derivative regularizer for both splits.
-
-        This hook is deliberately ``on_train_epoch_end`` and not
-        ``on_validation_epoch_end``: in the fit loop the validation loop runs
-        *before* the train-epoch-end hooks, while the TQDM progress bar stays
-        open throughout validation (it is only closed by the callback's
-        ``on_train_epoch_end``, which fires just before this module hook). A
-        raw ``print()`` while a bar is still open corrupts tqdm's cursor
-        bookkeeping — the text lands on the frozen train-bar line and the bar's
-        final renders are displaced onto an extra duplicate line. Printing here,
-        after every bar has been closed, keeps the summary on its own clean
-        line. The per-epoch sums are still valid at this point (they are reset
-        in ``on_train_epoch_start`` / ``on_validation_epoch_start``).
-        """
-        trainer = getattr(self, "_trainer", None)  # `self.trainer` raises when detached
-        if trainer is not None and not trainer.is_global_zero:
-            return  # DDP: print once only
-        if not self._train_sums or not self._val_sums:
-            return
-
-        def fmt(sums: dict[str, float], n_batches: int) -> str:
-            parts = [f"loss={sums['loss'] / n_batches:.4e}"]
-            for i in range(len(self.loss_fn)):
-                parts.append(f"loss_{i}={sums.get(f'loss_{i}', 0.0) / n_batches:.3e}")
-            if self.derivative_loss_weight > 0:
-                parts.append(f"nMSEdt={sums['derivative_loss'] / n_batches:.3e}")
-            return " ".join(parts)
-
-        print(
-            f"[Epoch {self.current_epoch}] Average: "
-            f"train ({self._n_train_batches} batches): {fmt(self._train_sums, self._n_train_batches)} | "
-            f"val ({self._n_val_batches} batches): {fmt(self._val_sums, self._n_val_batches)}"
-        )
 
 
 # ---------------------------------------------------------------------------
