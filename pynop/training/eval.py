@@ -26,6 +26,9 @@ Usage
 
     python -m pynop.training.eval MODEL_CONFIG.json TRAINING_CONFIG.json --checkpoint PATH [options]
 
+Running the file directly (``python pynop/training/eval.py ...``) works as well,
+from any working directory — the package context is restored automatically.
+
 The model / training configs are the same files used for training (the phase
 section — ``--pretrain`` selects ``"pretraining"``, otherwise ``"fulltraining"``
 — provides the time range: ``min_id`` / ``max_id``).
@@ -81,6 +84,7 @@ import argparse
 import datetime
 import json
 import random
+import sys
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
@@ -88,6 +92,23 @@ import h5py
 import numpy as np
 import torch
 from tqdm import tqdm
+
+# ---------------------------------------------------------------------------
+# Direct-script execution support
+# ---------------------------------------------------------------------------
+# The canonical entry point is ``python -m pynop.training.eval ...`` (or the
+# installed ``pynop-eval`` script). When this file is executed directly
+# instead — e.g. ``python pynop/training/eval.py ...`` from ``configs/`` —
+# Python gives it no package context and the relative imports below would fail
+# with "attempted relative import with no known parent package". Restore the
+# package context (and make sure the repository root is importable) so both
+# invocation styles work from any working directory.
+if __package__ in (None, ""):
+    _pkg_dir = Path(__file__).resolve().parents[1]  # .../PyNOP/pynop
+    _repo_root = str(_pkg_dir.parent)               # .../PyNOP
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    __package__ = f"{_pkg_dir.name}.training"
 
 from .lightning_model import (
     DeepONetModel,
