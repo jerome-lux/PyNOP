@@ -1071,3 +1071,60 @@ tel quel (fidélité aux notebooks).
   --pretrain --device cpu` (1 époque, 4 sims, t∈[0,15]) : dataset split 3/1, losses + régulariseur de
   dérivée calculés, OneCycleLR (token `$total_steps`) OK, rollout val par pas (`step_1`/`step_2`),
   `last.ckpt` + configs sauvegardées + logs CSV/TB écrits dans le layout `<root>/<exp>/<phase>/<name>/`.
+
+### 21. Intégration Aim — callback d'entraînement + import des logs existants (`pynop/training/aim_logger.py`, `import_logs.py`)
+
+**Contexte** : demande utilisateur — remplacer TensorBoard par **Aim** (déjà installé, v3.29.1) pour
+visualiser/comparer les entraînements, et pouvoir importer les runs déjà réalisés (logs CSV/TB existants)
+dans la même interface.
+
+**Fichiers créés** :
+- `pynop/training/aim_logger.py` — `AimCallback(pl.Callback)` : miroir des métriques Lightning vers un run
+  Aim. Import lazy de `aim` ; toute erreur Aim → warning + désactivation (l'entraînement ne crash jamais).
+  Rank global 0 uniquement ; nécessite une boucle de validation (toujours présente dans le driver).
+- `pynop/training/import_logs.py` — CLI :
+  `python -m pynop.training.import_logs ROOT [--experiment N] [--aim-home P] [--source auto|csv|tb] [--force] [--dry-run]`.
+  Découvre les run dirs (layout `lightning_logs/version_*/metrics.csv` et/ou
+  `tb_logs/lightning_logs/version_*/events.*`), un run Aim par dir nommé `<phase>/<model>/<rundir>`, params
+  depuis `run_info.json`/`model_config.json`. Sidecar `.aim_import.json` (hash + home) → re-run idempotent ;
+  skip seulement si le run existe encore **dans le même home** (importer vers un autre home ne masque jamais
+  des données déjà importées).
+
+**Convention d'axes x (identique live et import)** — vérifiée contre les CSV réels :
+- `*_step` (train) → x = global step. Le "step" du CSV == `_batches_that_stepped` == `trainer.global_step`
+  au moment de `on_train_batch_end` (pas d'off-by-one).
+- `val_*_step` → x = compteur **cumulatif** de batches val (0..N, ne reset pas entre époques — c'est ce que
+  le CSVLogger écrit pour les lignes val) ; reproduit par un compteur dans `on_validation_batch_end`.
+- `*_epoch` → x = epoch.
+- Le reste (`avg_loss`, `AR_steps`, `lr`, `lr-AdamW`, `step_k`) → x = position d'enregistrement (global step).
+  Les entrées "brutes" que Lightning garde en plus des variantes suffixées (`loss` à côté de `loss_step`/
+  `loss_epoch`) sont **exclues** — le CSV n'a pas ces colonnes.
+
+**Gotchas aim 3.29 découverts** :
+- Le repo par défaut d'aim est **basé sur le CWD** (`.aim/` dans le dossier de lancement, ou le plus proche
+  en remontant) → notre intégration default à `~/.aim` explicitement (config `"aim": {"home": ...}` /
+  `--aim-home`). Voir avec `aim up --repo ~/.aim`.
+- Les runs écrivent dans des **shards par run** (`<home>/.aim/meta/chunks/<hash>/`) ; l'index unifié
+  (`meta/index/`) est construit par le index manager que **`aim up` démarre automatiquement**. En lecture SDK
+  cross-process sans `aim up`, il faut appeler `repo._recreate_index()` (utilisé dans les tests).
+- API de lecture : pas de `.params` ni `.tracked_scalars` en 3.29 → params via `run["key"]`, métriques via
+  `run.get_metric(name, context=Context({})).dataframe()`. Nom d'affichage du run : `run.name = "..."`
+  (persisté dans la sqlite `run_metadata.sqlite`).
+
+**Wiring driver** (`train.py`) : `"loggers": ["csv", "aim"]` — l'entrée aim installe le callback (pas un
+logger Lightning) ; section optionnelle `"aim": {"experiment", "home"}` (défauts : `output.experiment`,
+`~/.aim`). Le hash du run est réécrit dans `run_info.json` après fit (`"aim_run"`). Config partagée
+`configs/training_PDEBench.json` passée de `["csv","tensorboard"]` à `["csv","aim"]`.
+
+**Fix collatéral** : le print de fin d'époque de `lightning_model.py` passe à `[Epoch k] Average: ...` — les
+3 tests du commit `9d82257` attendaient ce préfixe et échouaient avant (état rouge préexistant, non lié à Aim).
+
+**Vérifié** (env. conda `pytorch`) :
+- 9 nouveaux tests (`tests/test_aim_logger.py`) : hooks du callback (sélection step/epoch, exclusion des
+  `val_*` stalés en train et des doublons bruts), discovery, import CSV (règle d'axes + params + sidecar +
+  `--force`), import TB — lecture back via `_recreate_index`. Suite complète : **299 passed**.
+- Smoke end-to-end : entraînement TinyFNO 2 époques CPU avec `["csv","aim"]` → run nommé
+  `pretraining/TinyFNO/...`, params + séries correctes dans le repo, hash dans `run_info.json`.
+- Import des **runs réels** SwinNO + MSSwinNO (300 époques chacun) : 33 084 points/run, valeurs
+  RMSE_epoch / val_RMSE_step / lr-AdamW identiques au CSV source (premier+dernier point), params cohérents
+  (SwinNO 1.19 M / MSSwinNO 3.55 M). Sidecars de vérification supprimés des run dirs réels.

@@ -37,6 +37,7 @@ itérative, sur la branche `dev`.
 | **Training (Lightning)** | `pynop/training/lightning_model.py` | ✅ Réécrit : `predict_derivative` (sortie dérivée **ou** absolue), derivative-loss configurable, base unique `MultiStepLightningBase`, compat. tous les modèles du dépôt, `DeepONetModel` dédié ; wrappers AE/`CausalNO` supprimés (§15) |
 | **Driver CLI d'entraînement** | `pynop/training/train.py`, `configs/` | ✅ Réécrit : driver config-driven (`ModelConfig.json` + `TrainingConfig.json`, flag `--pretrain`) reproduisant le protocole 2 phases des notebooks PDEBench ; dataset PDEBench seul pour l'instant ; checkpoints `last` (chaque époque) / best (dès max pas AR atteint) ; `--resume`/`--init-from` (§18). **Configs complètes** : un `model_<name>.json` par modèle des notebooks (10 fichiers) + 1 `training_PDEBench.json` partagé, tous validés build+forward+backward (§20) |
 | **Eval CLI + métriques** | `pynop/training/eval.py`, `pynop/training/metrics.py` | ✅ Nouveau : évaluation d'un checkpoint par **rollout autorégressif de la trajectoire complète** (protocole notebooks PDEBench) sur des simulations **non utilisées en entraînement** (split val par défaut, ou split test = pool inutilisé) ; métriques de champ MSE/RMSE/**nRMSE = relative L2**/MAE/max-err/**R²** + bandes spectrales radiales style PDEBench (unités d'index bin FFT), **courbes d'erreur par pas de temps** (RMSE/MAE/R²/nRMSE + spectre) et graphiques PNG en anglais ; `eval_results_<split>.json` auto-contenu (§19) |
+| **Aim (logging)** | `pynop/training/aim_logger.py`, `pynop/training/import_logs.py` | ✅ Nouveau : `AimCallback` (métriques live → run Aim, mêmes noms/axes que le CSV) + CLI d'**import des logs CSV/TB existants** dans le même experiment pour comparer modèles anciens/nouveaux dans l'UI (`aim up --repo ~/.aim`) ; home par défaut `~/.aim` (le défaut CWD d'aim 3.x polluerait le repo git) (§21) |
 
 ---
 
@@ -156,8 +157,12 @@ itérative, sur la branche `dev`.
   `save_on_train_epoch_end=False`. Ne pas régresser vers un override de hook unique.
 - Scheduler : tokens `"$total_steps"`/`"$steps_per_epoch"` ; OneCycleLR sans `max_lr` → lr de la
   phase. ⚠️ Resume OneCycleLR = **même total de pas** (on ne change pas `max_epochs` après coup).
-- Split train/val sur les IDs de simulation (shuffle seedé + troncature `n_samples`) : identique aux
-  notebooks → phases cohérentes entre elles.
+ - Split train/val sur les IDs de simulation (shuffle seedé + troncature `n_samples`) : identique aux
+   notebooks → phases cohérentes entre elles.
+ - **Loggers** : `"loggers": ["csv", "aim"]` dans la config partagée PDEBench (TensorBoard remplacé par
+   Aim, §21). L'entrée `aim` installe un *callback* (pas un logger Lightning) ; section optionnelle
+   `"aim": {"experiment", "home"}`. Les runs importés (`import_logs`) et les runs live partagent la même
+   convention d'axes x — ne pas la changer sans resynchroniser les deux.
 
 ### Évaluation (`pynop/training/eval.py`, `metrics.py`) (§19)
 - **Protocole = rollout autorégressif de la trajectoire complète** (cellules `## Multi-step model eval`

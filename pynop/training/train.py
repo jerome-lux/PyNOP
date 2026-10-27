@@ -91,10 +91,21 @@ TrainingConfig.json
             "root":       "/run/media/jlux/SSD2/PDETraining",
             "experiment": "PDEBENCH"
         },
-        "loggers": ["csv", "tensorboard"],   # optional, default as shown
+        "loggers": ["csv", "aim"],         # optional, default ["csv", "tensorboard"]
+        "aim": {                           # optional; only used if "aim" is in loggers
+            "experiment": "PDEBENCH",      # Aim experiment (default: output.experiment)
+            "home":       null             # Aim repo path (default: ~/.aim)
+        },
         "pretraining":  { ...phase params... },
         "fulltraining": { ...phase params... }
     }
+
+Logger names: ``"csv"``, ``"tensorboard"``/``"tb"`` and ``"aim"``. The Aim entry
+installs an :class:`~pynop.training.aim_logger.AimCallback` (not a Lightning
+logger) that mirrors the same metrics to an Aim run — per-batch ``*_step``
+metrics at ``x = global_step``, epoch-level metrics at ``x = epoch`` — so runs
+can be compared in the Aim UI (``aim up``). Existing runs can be imported into
+the same experiment with :mod:`pynop.training.import_logs`.
 
 Phase parameters (both sections use the same keys):
 
@@ -177,6 +188,7 @@ if __package__ in (None, ""):
     __package__ = f"{_pkg_dir.name}.training"
 
 from ..dataloader.h5_dataloader import PDEBenchDataSet
+from .aim_logger import AimCallback
 from .lightning_model import (
     CurriculumCheckpoint,
     DeepONetModel,
@@ -194,6 +206,7 @@ __all__ = [
     "build_scheduler_config",
     "build_pdebench_dataloaders",
     "select_phase",
+    "build_aim_callback",
 ]
 
 PathLike = Union[str, Path]
@@ -662,12 +675,14 @@ def make_callbacks(logdir: Path, start_monitoring: int) -> list:
 
 
 def make_loggers(logdir: Path, names: Optional[Sequence[str]]) -> list:
-    """Build the loggers from a list of names.
+    """Build the Lightning loggers from a list of names.
 
     Args:
         logdir: Run directory (CSV is written there, TensorBoard under ``tb_logs``).
         names: Iterable of logger names among ``"csv"`` and ``"tensorboard"``/``"tb"``.
             If None, both are enabled (notebook default); an empty list disables logging.
+            ``"aim"`` is not a Lightning logger — it is filtered out by the caller
+            and handled through :func:`build_aim_callback` instead.
 
     Returns:
         List of Lightning loggers.
@@ -687,6 +702,58 @@ def make_loggers(logdir: Path, names: Optional[Sequence[str]]) -> list:
         else:
             raise ValueError(f"Unknown logger {name!r}. Available: 'csv', 'tensorboard'.")
     return loggers
+
+
+def build_aim_callback(
+    logdir: Path,
+    logger_names: Optional[Sequence[str]],
+    aim_cfg: dict,
+    *,
+    experiment: str,
+    model_name: str,
+    phase_name: str,
+    run_info: dict,
+) -> Optional[AimCallback]:
+    """Build the :class:`AimCallback` if ``"aim"`` is among the configured loggers.
+
+    Args:
+        logdir: Run directory (used for the default Aim run name).
+        logger_names: The config's ``"loggers"`` list (``None`` = csv+tensorboard
+            default, which does not include Aim).
+        aim_cfg: The optional config ``"aim"`` section (``experiment``, ``home``).
+        experiment: The config's ``output.experiment`` — default Aim experiment.
+        model_name: Run name of the model config.
+        phase_name: Selected training phase (``pretraining``/``fulltraining``).
+        run_info: Bookkeeping dict written to ``run_info.json`` (source of the
+            parameters stored with the Aim run).
+
+    Returns:
+        The callback, or ``None`` if Aim is not requested.
+    """
+    names = [str(n).lower() for n in logger_names] if logger_names is not None else []
+    if "aim" not in names:
+        return None
+
+    aim_cfg = dict(aim_cfg or {})
+    # Aim 3.x's own default repository is CWD-based (it would create a .aim/ in
+    # whatever directory the driver is launched from) — default to ~/.aim instead.
+    home = str(Path(aim_cfg["home"]).expanduser()) if aim_cfg.get("home") else str(Path.home() / ".aim")
+    params = {
+        "model_class": run_info["model"]["class"],
+        "n_params": run_info["model"]["params"],
+        "phase": phase_name,
+        "lr": run_info["lr"],
+        "max_epochs": run_info["max_epochs"],
+        "input_steps": run_info["input_steps"],
+        "window_size": run_info["window_size"],
+        "seed": run_info["seed"],
+    }
+    return AimCallback(
+        experiment=str(aim_cfg.get("experiment") or experiment),
+        name=f"{phase_name}/{model_name}/{Path(logdir).name}",
+        home=home,
+        params=params,
+    )
 
 
 def resolve_device(device: str) -> str:
@@ -867,8 +934,21 @@ def run_training(
 
     # ------------------------------------------------------------------ trainer
     trainer_cfg = training_cfg.get("trainer", {})
+    logger_names = training_cfg.get("loggers")
     callbacks = make_callbacks(logdir, start_monitoring=final_ar)
-    loggers = make_loggers(logdir, training_cfg.get("loggers"))
+    aim_cb = build_aim_callback(
+        logdir,
+        logger_names,
+        training_cfg.get("aim"),
+        experiment=experiment,
+        model_name=model_name,
+        phase_name=phase_name,
+        run_info=run_info,
+    )
+    if aim_cb is not None:
+        callbacks.append(aim_cb)
+    other_logger_names = None if logger_names is None else [n for n in logger_names if str(n).lower() != "aim"]
+    loggers = make_loggers(logdir, other_logger_names)
 
     trainer_kwargs = dict(
         max_epochs=max_epochs,
@@ -899,6 +979,16 @@ def run_training(
         val_dataloaders=val_loader,
         ckpt_path=ckpt_path,
     )
+
+    # Record the Aim run hash in run_info.json for traceability (aim up / import_logs).
+    if aim_cb is not None and aim_cb.run_hash is not None:
+        try:
+            info = json.loads((logdir / "run_info.json").read_text(encoding="utf-8"))
+            info["aim_run"] = {"hash": aim_cb.run_hash, "experiment": aim_cb.experiment}
+            (logdir / "run_info.json").write_text(json.dumps(info, indent=4), encoding="utf-8")
+        except Exception as e:  # noqa: BLE001 - bookkeeping only
+            print(f"WARNING: could not record the Aim run hash in run_info.json ({type(e).__name__}: {e})")
+
     return logdir
 
 

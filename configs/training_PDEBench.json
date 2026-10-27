@@ -47,7 +47,10 @@
         "root": "/run/media/jlux/SSD2/PDETraining",
         "experiment": "PDEBENCH"
     },
-    "loggers": ["csv", "tensorboard"],
+    "loggers": ["csv", "aim"],
+    "aim": {
+        "experiment": "PDEBENCH"
+    },
     "pretraining": {
         "delta_ts": 2,
         "min_id": 0,
