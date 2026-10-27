@@ -136,6 +136,10 @@ class TrainingConfig:
         n_slices: Number of consecutive input slices used to predict the next one.
         temporal_weighting: ``gamma`` — the loss of the ``k``-th AR step is
             weighted by ``gamma ** k`` (training only).
+        show_step_rmse: Whether the per-AR-step RMSEs (``step_1``, ``step_2``, ...)
+            are shown on the progress bar. They are always logged to the loggers
+            (CSV / TensorBoard / Aim) regardless of this flag; it only controls
+            the on-screen display, which is off by default to keep the bar short.
     """
 
     dt: float = 1.0
@@ -153,6 +157,7 @@ class TrainingConfig:
     time_normalization: float = 1.0
     n_slices: int = 2  # number of input slices used to predict the next one
     temporal_weighting: float = 1.2  # gamma: AR-step loss weight = gamma ** k
+    show_step_rmse: bool = False  # per-AR-step RMSEs on the progress bar (always logged)
 
     def to_json_dict(self):
         return _config_to_json_dict(self)
@@ -213,9 +218,9 @@ class MultiStepLightningBase(pl.LightningModule):
     Subclasses only implement :meth:`_forward_window`, i.e. the mapping
     ``window (B, n*C, H, W) -> (B, C, H, W)``.
 
-    At the end of every epoch (once validation has run), a single line is
-    printed with the per-batch average losses of both splits — total loss,
-    each weighted component and the derivative regularizer.
+    At the end of every epoch (once validation has run), a single line prefixed
+    ``[Epoch k]`` is printed with the per-batch average losses of both splits —
+    total loss, each weighted component and the derivative regularizer.
 
     The optimizer may be omitted when the module is used for inference /
     evaluation only (e.g. :mod:`pynop.training.eval`): in that case
@@ -279,6 +284,8 @@ class MultiStepLightningBase(pl.LightningModule):
         self.dt = float(train_config.dt)
         self.predict_derivative = bool(train_config.predict_derivative)
         self.detach_every_k = train_config.detach_grad_steps
+        # Display only: per-AR-step RMSEs are always logged, this gates the pbar.
+        self.show_step_rmse = bool(train_config.show_step_rmse)
 
         # Derivative regularizer: configurable, skippable with weight 0.
         self.derivative_loss_fn = (
@@ -606,8 +613,10 @@ class MultiStepLightningBase(pl.LightningModule):
         self._accumulate_terms(self._train_sums, terms)
         self._n_train_batches += 1
 
+        # Per-AR-step RMSEs: always logged (CSV/TB/Aim), shown on the progress
+        # bar only when ``show_step_rmse`` is enabled.
         for i, rmse in enumerate(terms["step_rmses"]):
-            self.log(f"step_{i + 1}", rmse, on_step=False, on_epoch=True, prog_bar=True)
+            self.log(f"step_{i + 1}", rmse, on_step=False, on_epoch=True, prog_bar=self.show_step_rmse)
         self._log_terms(terms, prefix="")
         self.log("AR_steps", int(res["AR_steps"]), prog_bar=True)
         self.log("loss", terms["loss"], on_step=True, on_epoch=True, prog_bar=True)
@@ -634,12 +643,24 @@ class MultiStepLightningBase(pl.LightningModule):
         self.log("val_loss", terms["loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return terms["loss"]
 
-    def on_validation_epoch_end(self):
+    def on_train_epoch_end(self):
         """Print the per-epoch average losses for train and validation.
 
         Called by Lightning once both loops of the epoch have completed, so a
         single line reports the mean (over batches) total loss, each weighted
         component and the derivative regularizer for both splits.
+
+        This hook is deliberately ``on_train_epoch_end`` and not
+        ``on_validation_epoch_end``: in the fit loop the validation loop runs
+        *before* the train-epoch-end hooks, while the TQDM progress bar stays
+        open throughout validation (it is only closed by the callback's
+        ``on_train_epoch_end``, which fires just before this module hook). A
+        raw ``print()`` while a bar is still open corrupts tqdm's cursor
+        bookkeeping — the text lands on the frozen train-bar line and the bar's
+        final renders are displaced onto an extra duplicate line. Printing here,
+        after every bar has been closed, keeps the summary on its own clean
+        line. The per-epoch sums are still valid at this point (they are reset
+        in ``on_train_epoch_start`` / ``on_validation_epoch_start``).
         """
         trainer = getattr(self, "_trainer", None)  # `self.trainer` raises when detached
         if trainer is not None and not trainer.is_global_zero:
@@ -656,7 +677,7 @@ class MultiStepLightningBase(pl.LightningModule):
             return " ".join(parts)
 
         print(
-            f" | Average: "
+            f"[Epoch {self.current_epoch}] Average: "
             f"train ({self._n_train_batches} batches): {fmt(self._train_sums, self._n_train_batches)} | "
             f"val ({self._n_val_batches} batches): {fmt(self._val_sums, self._n_val_batches)}"
         )

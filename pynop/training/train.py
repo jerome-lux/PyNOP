@@ -63,7 +63,9 @@ TrainingConfig.json
             "derivative_loss_weight": 1.0,  # 0 disables the derivative regularizer
             "predict_derivative":   true,   # output is du/dt -> u_{t+dt} = u_t + dt*out
             "noise_level":          0.0,    # teacher-forcing input noise
-            "time_normalization":   101     # divisor for models accepting `time`
+            "time_normalization":   101,    # divisor for models accepting `time`
+            "show_step_rmse":       false   # per-AR-step RMSEs on the progress bar
+                                            # (always logged to CSV/TB/Aim anyway)
         },
         "losses": [                      # ordered list; weights match by position
             {"name": "DWMSELoss"},
@@ -614,6 +616,7 @@ def build_training_config(shared: dict, losses: list, input_steps: int, phase_cf
         time_normalization=float(shared.get("time_normalization", 1.0)),
         n_slices=input_steps,
         temporal_weighting=float(shared.get("temporal_weighting", 1.2)),
+        show_step_rmse=bool(shared.get("show_step_rmse", False)),
     )
 
 

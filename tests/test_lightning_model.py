@@ -452,7 +452,7 @@ def test_noise_applied_in_training_only():
 
 
 def test_epoch_loss_summary_print(capsys):
-    """on_validation_epoch_end prints the per-batch average losses (train + val)."""
+    """on_train_epoch_end prints the per-batch average losses (train + val)."""
     model = make_fno()
     lm = make_multistep(model, derivative_loss_weight=0.0)  # single loss, no regularizer
 
@@ -460,7 +460,7 @@ def test_epoch_loss_summary_print(capsys):
     train_losses = [lm.training_step(batch, i).item() for i in range(2)]
     val_losses = [lm.validation_step(batch, i).item() for i in range(3)]
 
-    lm.on_validation_epoch_end()
+    lm.on_train_epoch_end()
     out = capsys.readouterr().out
 
     expected_train = sum(train_losses) / len(train_losses)
@@ -477,7 +477,7 @@ def test_epoch_loss_summary_print_all_components(capsys):
         lm.training_step(batch, 0)
         lm.validation_step(batch, 0)
 
-    lm.on_validation_epoch_end()
+    lm.on_train_epoch_end()
     out = capsys.readouterr().out
 
     assert "loss_1=" in out and "nMSEdt=" in out
@@ -491,7 +491,7 @@ def test_epoch_loss_summary_print_no_validation(capsys):
     lm = make_multistep(make_fno())
     lm.training_step(make_batch(), 0)
 
-    lm.on_validation_epoch_end()
+    lm.on_train_epoch_end()
     assert "[Epoch" not in capsys.readouterr().out
 
 
@@ -505,13 +505,49 @@ def test_epoch_loss_summary_resets_each_epoch(capsys):
         lm.training_step(batch, 0)
         lm.on_validation_epoch_start()
         lm.validation_step(batch, 0)
-        lm.on_validation_epoch_end()
+        lm.on_train_epoch_end()
 
     out = capsys.readouterr().out
     lines = [l for l in out.splitlines() if "[Epoch" in l]
     assert len(lines) == 2
     # both epochs saw exactly one train and one val batch
     assert all("train (1 batches):" in l and "val (1 batches):" in l for l in lines)
+
+
+def test_show_step_rmse_gates_progress_bar_only(monkeypatch):
+    """Per-AR-step RMSEs are always logged; ``show_step_rmse`` only gates the pbar.
+
+    With T=5, n_slices=2 and max_autoregressive_steps=1 the rollout has 3
+    predictions of which the last is autoregressive, so exactly ``step_1`` is
+    produced by one training step.
+    """
+    model = make_fno()
+    lm = make_multistep(
+        model,
+        derivative_loss_weight=0.0,
+        start_autoregressive=0,
+        final_autoregressive=0,
+        max_autoregressive_steps=1,
+    )
+    assert lm.show_step_rmse is False  # default: hidden from the progress bar
+
+    logged = {}
+    orig_log = lm.log
+
+    def spy(name, *args, **kwargs):
+        if str(name).startswith("step_"):
+            logged[name] = kwargs.get("prog_bar")
+        return orig_log(name, *args, **kwargs)
+
+    monkeypatch.setattr(lm, "log", spy)
+    lm.training_step(make_batch(), 0)
+    assert list(logged) == ["step_1"]
+    assert logged["step_1"] is False  # logged but not shown on the bar
+
+    lm.show_step_rmse = True
+    logged.clear()
+    lm.training_step(make_batch(), 0)
+    assert logged["step_1"] is True  # same metric, now visible on the bar
 
 
 # ---------------------------------------------------------------------------
