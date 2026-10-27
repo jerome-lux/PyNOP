@@ -13,7 +13,11 @@
     },
     "shared_params": {
         "timestep": 5e-2,
-        "loss_weights": [1e4, 1e4, 1e4],
+        "loss_weights": [
+            1e4,
+            1e4,
+            1e4
+        ],
         "temporal_weighting": 1.1,
         "detach_grad_steps": 40,
         "derivative_loss_weight": 1.0,
@@ -22,14 +26,30 @@
         "time_normalization": 101
     },
     "losses": [
-        {"name": "DWMSELoss"},
-        {"name": "SpectralLoss", "params": {"beta": 2}},
-        {"name": "SobolevLoss", "params": {"l1": 1.0, "l2": 1.0}}
+        {
+            "name": "DWMSELoss"
+        },
+        {
+            "name": "SpectralLoss",
+            "params": {
+                "beta": 2
+            }
+        },
+        {
+            "name": "SobolevLoss",
+            "params": {
+                "l1": 1.0,
+                "l2": 1.0
+            }
+        }
     ],
     "optimizer": {
         "name": "AdamW",
         "weight_decay": 5e-4,
-        "betas": [0.9, 0.99]
+        "betas": [
+            0.9,
+            0.99
+        ]
     },
     "scheduler": {
         "name": "OneCycleLR",
@@ -47,9 +67,13 @@
         "root": "/run/media/jlux/SSD2/PDETraining",
         "experiment": "PDEBENCH"
     },
-    "loggers": ["csv", "aim"],
+    "loggers": [
+        "csv",
+        "aim"
+    ],
     "aim": {
-        "experiment": "PDEBENCH"
+        "experiment": "PDEBENCH",
+        "home": "/run/media/jlux/SSD2/PDETraining"
     },
     "pretraining": {
         "delta_ts": 2,

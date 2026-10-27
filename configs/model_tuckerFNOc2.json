@@ -1,0 +1,33 @@
+{
+    "name": "tuckerFNO",
+    "model": "FNO",
+    "params": {
+        "in_channels": 20,
+        "out_channels": 2,
+        "modes": [
+            30,
+            30
+        ],
+        "hidden_channels": [
+            48,
+            48,
+            48,
+            48
+        ],
+        "blocks": [
+            "FNO",
+            "FNO",
+            "FNO",
+            "FNO"
+        ],
+        "spectral_layer_type": "tucker",
+        "spectral_compression_factor": 2,
+        "trainable_pos_encoding": false,
+        "fixed_pos_encoding": false,
+        "trainable_pos_encoding_modes": [
+            16,
+            16
+        ],
+        "trainable_pos_encoding_dims": 8
+    }
+}

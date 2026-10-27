@@ -2,7 +2,7 @@
     "name": "SwinNO",
     "model": "SwinNO",
     "params": {
-        "num_windows": 8,
+        "num_windows": 16,
         "in_channels": 20,
         "out_channels": 2,
         "latent_dim": 256,

@@ -4,7 +4,7 @@
     "params": {
         "in_channels": 20,
         "out_channels": 2,
-        "d_model": 128,
+        "d_model": 256,
         "modes": 256,
         "num_heads": 4,
         "num_blocks": 4,
