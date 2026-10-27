@@ -17,6 +17,9 @@ Usage
 
     python -m pynop.training.train MODEL_CONFIG.json TRAINING_CONFIG.json [--pretrain] [options]
 
+Running the file directly (``python pynop/training/train.py ...``) works as well,
+from any working directory — the package context is restored automatically.
+
 ``--pretrain`` selects the ``"pretraining"`` section of the training config;
 without it the ``"fulltraining"`` section is used.
 
@@ -144,6 +147,7 @@ import datetime
 import importlib
 import json
 import random
+import sys
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
@@ -154,6 +158,23 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, TQ
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 from torch import nn
 from torch.utils.data import DataLoader
+
+# ---------------------------------------------------------------------------
+# Direct-script execution support
+# ---------------------------------------------------------------------------
+# The canonical entry point is ``python -m pynop.training.train ...`` (or the
+# installed ``pynop-train`` script). When this file is executed directly
+# instead — e.g. ``python pynop/training/train.py ...`` from ``configs/`` —
+# Python gives it no package context and the relative imports below would fail
+# with "attempted relative import with no known parent package". Restore the
+# package context (and make sure the repository root is importable) so both
+# invocation styles work from any working directory.
+if __package__ in (None, ""):
+    _pkg_dir = Path(__file__).resolve().parents[1]  # .../PyNOP/pynop
+    _repo_root = str(_pkg_dir.parent)               # .../PyNOP
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    __package__ = f"{_pkg_dir.name}.training"
 
 from ..dataloader.h5_dataloader import PDEBenchDataSet
 from .lightning_model import (
