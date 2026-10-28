@@ -447,71 +447,49 @@ def test_noise_applied_in_training_only():
 
 
 # ---------------------------------------------------------------------------
-# End-of-epoch loss summary printout
+# Epoch-level logging (no raw printing: the progress bar must stay clean)
 # ---------------------------------------------------------------------------
 
 
-def test_epoch_loss_summary_print(capsys):
-    """on_train_epoch_end prints the per-batch average losses (train + val)."""
-    model = make_fno()
-    lm = make_multistep(model, derivative_loss_weight=0.0)  # single loss, no regularizer
+def test_no_print_during_training(capsys):
+    """Training/validation steps and epoch hooks never print to stdout.
 
-    batch = make_batch()
-    train_losses = [lm.training_step(batch, i).item() for i in range(2)]
-    val_losses = [lm.validation_step(batch, i).item() for i in range(3)]
-
-    lm.on_train_epoch_end()
-    out = capsys.readouterr().out
-
-    expected_train = sum(train_losses) / len(train_losses)
-    expected_val = sum(val_losses) / len(val_losses)
-    assert f"train (2 batches): loss={expected_train:.4e}" in out
-    assert f"val (3 batches): loss={expected_val:.4e}" in out
-
-
-def test_epoch_loss_summary_print_all_components(capsys):
-    """With several losses + the derivative regularizer, every term is reported."""
-    lm = make_multistep(make_fno(), loss_fn=[nn.MSELoss(), nn.L1Loss()], loss_weights=[1.0, 2.0])
-    batch = make_batch()
-    for _ in range(2):
-        lm.training_step(batch, 0)
-        lm.validation_step(batch, 0)
-
-    lm.on_train_epoch_end()
-    out = capsys.readouterr().out
-
-    assert "loss_1=" in out and "nMSEdt=" in out
-    # both splits are reported on the same line
-    line = next(l for l in out.splitlines() if "[Epoch" in l)
-    assert "train (2 batches):" in line and "val (2 batches):" in line
-
-
-def test_epoch_loss_summary_print_no_validation(capsys):
-    """No validation data this epoch -> no summary line."""
+    Raw prints while a tqdm bar is open corrupt its cursor bookkeeping; all
+    metrics go through ``self.log`` instead (progress bar + loggers).
+    """
     lm = make_multistep(make_fno())
-    lm.training_step(make_batch(), 0)
-
-    lm.on_train_epoch_end()
-    assert "[Epoch" not in capsys.readouterr().out
-
-
-def test_epoch_loss_summary_resets_each_epoch(capsys):
-    """The accumulators are reset at the start of each epoch."""
-    lm = make_multistep(make_fno(), derivative_loss_weight=0.0)
     batch = make_batch()
-
     for _ in range(2):
         lm.on_train_epoch_start()
         lm.training_step(batch, 0)
-        lm.on_validation_epoch_start()
         lm.validation_step(batch, 0)
-        lm.on_train_epoch_end()
 
     out = capsys.readouterr().out
-    lines = [l for l in out.splitlines() if "[Epoch" in l]
-    assert len(lines) == 2
-    # both epochs saw exactly one train and one val batch
-    assert all("train (1 batches):" in l and "val (1 batches):" in l for l in lines)
+    assert "[Epoch" not in out and "Average:" not in out
+
+
+def test_epoch_metrics_logged_not_printed(monkeypatch):
+    """Per-epoch averages are exposed through self.log (on_epoch=True)."""
+    lm = make_multistep(make_fno(), derivative_loss_weight=0.0)
+
+    logged = {}
+    orig_log = lm.log
+
+    def spy(name, *args, **kwargs):
+        logged.setdefault(str(name), []).append(kwargs.get("on_epoch"))
+        return orig_log(name, *args, **kwargs)
+
+    monkeypatch.setattr(lm, "log", spy)
+    batch = make_batch()
+    lm.on_train_epoch_start()
+    for _ in range(2):
+        lm.training_step(batch, 0)
+        lm.validation_step(batch, 0)
+
+    # epoch aggregates are logged (Lightning averages them over the batches)
+    assert all(v is True for v in logged["avg_loss"])
+    assert all(v is True for v in logged["RMSE"])
+    assert all(v is True for v in logged["val_RMSE"])
 
 
 def test_show_step_rmse_gates_progress_bar_only(monkeypatch):
@@ -663,10 +641,10 @@ def test_trainer_fit_end_to_end(capsys):
     assert trainer.state.finished
     # the scheduler was stepped / logged without error
     assert opt.param_groups[0]["lr"] > 0
-    # the end-of-epoch loss summary (train + val) was printed by Lightning's hook
+    # nothing is printed during fit: all metrics go through self.log (the tqdm
+    # bar must not be disturbed by raw stdout writes)
     out = capsys.readouterr().out
-    line = next(l for l in out.splitlines() if "[Epoch" in l)
-    assert "train (1 batches):" in line and "val (1 batches):" in line  # batch_size=2 over 2 samples -> 1 batch
+    assert "[Epoch" not in out and "Average:" not in out
 
 
 def test_top_level_exports():
