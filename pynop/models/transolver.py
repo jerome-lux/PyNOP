@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from typing import Union, Callable, Optional
 from pynop.core.blocks import MLPBlock, TransolverBlock, LinearNOBlock, TransolverBlockv3
 
@@ -34,6 +35,12 @@ class Transolver(nn.Module):
         dim: Spatial dimension (the positional encoding expects a 2-D grid).
         cond_dim: Optional conditioning channel count; when set, a condition field
             of shape ``[B, cond_dim, H, W]`` is concatenated to the input channels.
+        use_checkpoint: If True, each block is wrapped in gradient checkpointing
+            during training (recomputed in backward instead of keeping its
+            activations). The Transolver-3 reference uses the same mechanism inside
+            its tiled path; at large grids it cuts the per-step activation memory
+            by roughly an order of magnitude at the cost of one extra block
+            forward pass per step. Inference is unaffected.
     """
 
     def __init__(
@@ -50,6 +57,7 @@ class Transolver(nn.Module):
         mlp_ratio: int = 1,
         dim: int = 2,
         cond_dim: Optional[int] = None,
+        use_checkpoint: bool = False,
     ):
         super(Transolver, self).__init__()
         assert n_hidden % n_head == 0, "Hidden dim must be divisible by the number of heads"
@@ -64,6 +72,7 @@ class Transolver(nn.Module):
         self.in_ch = in_ch
         self.out_ch = out_ch
         self.dim_head = n_hidden // n_head
+        self.use_checkpoint = bool(use_checkpoint)
 
         if mode == "linear":
             self.blocks = nn.ModuleList(
@@ -121,10 +130,12 @@ class Transolver(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
-        """Truncated-normal (std 0.02) for linears, identity for norms — as in the
-        official Transolver / LinearNO implementations."""
+        """Truncated-normal (std 0.02, truncated at ±2σ) for linears, identity for
+        norms — as in the official Transolver / LinearNO implementations."""
         if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, mean=0.0, std=0.02, a=-0.04, b=0.04)
+            # NOTE: torch's a/b are in units of std, not absolute bounds — the
+            # reference (timm trunc_normal_, std=0.02) uses the default ±2σ.
+            nn.init.trunc_normal_(m.weight, mean=0.0, std=0.02, a=-2.0, b=2.0)
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d)):
@@ -167,8 +178,15 @@ class Transolver(nn.Module):
 
         x = x + self.placeholder[None, None, :]
 
-        for _, block in enumerate(self.blocks):
-            x = block(x)
+        for block in self.blocks:
+            if self.training and self.use_checkpoint:
+                # Gradient checkpointing (the reference's tiled path does the same
+                # internally): recompute the block in backward instead of keeping
+                # its activations — essential at large grids where each block saves
+                # the full per-head slice-weight matrix [B, H, N, M].
+                x = gradient_checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
 
         x = self.projection(x)
         x = x.reshape(B, H, W, self.out_ch).permute(0, 3, 1, 2).contiguous()

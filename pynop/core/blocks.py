@@ -2273,7 +2273,8 @@ class TransolverBlockv3(nn.Module):
         d = w.sum(dim=2)  # [B, H, M] — per-slice mass (diagonal normalization)
 
         # Faster slicing: aggregate the raw features (O(N·M·C)), then project the M slices.
-        s_raw = torch.einsum("bhnm,bnc->bhmc", w, x)  # [B, H, M, C]
+        # Per-head matmul with broadcast (official FIX #2): avoids materializing (B, H, N, C).
+        s_raw = torch.matmul(w.transpose(2, 3), x.unsqueeze(1))  # [B,H,M,N] @ [B,1,N,C] -> [B,H,M,C]
         s = self.slice_linear1(s_raw / (d.unsqueeze(-1) + 1e-5))  # [B, H, M, D]
 
         # Standard attention among the slice tokens of each head.
@@ -2283,7 +2284,8 @@ class TransolverBlockv3(nn.Module):
         # Faster deslicing: project the slices, scatter with w, concatenate heads.
         s_out = self.slice_linear3(s_out)  # [B, H, M, D]
         x_out = torch.matmul(w, s_out)  # [B, H, N, D]
-        return rearrange(x_out, "b h n d -> b n (h d)")  # [B, N, C]
+        x_out = rearrange(x_out, "b h n d -> b n (h d)")  # [B, N, C]
+        return self.out_dropout(x_out)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
