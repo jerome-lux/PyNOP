@@ -1,5 +1,5 @@
 {
-    "name": "SwinNO",
+    "name": "SwinNOx2",
     "model": "SwinNO",
     "params": {
         "num_windows": 16,

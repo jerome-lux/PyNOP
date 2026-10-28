@@ -13,6 +13,7 @@
         "activation": "GELU",
         "mlp_ratio": 2,
         "dim": 2,
-        "cond_dim": null
+        "cond_dim": null,
+        "use_checkpoint": false
     }
 }
