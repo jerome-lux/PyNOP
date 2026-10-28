@@ -81,6 +81,10 @@ class AimCallback(pl.Callback):
             explicit path (defaulting to ``~/.aim``) instead.
         params: Optional dict of parameters/hyper-parameters stored with the
             run (shown in the Aim UI parameter table for cross-run comparison).
+            Values may be nested dicts: Aim stores them as trees, so e.g. a
+            full JSON config passed under one key is browsable as an expandable
+            tree in the run-detail "Parameters" tab and addressable leaf by
+            leaf from search queries (``run.model_config.params.modes == 8``).
 
     Notes:
         All Aim interactions are guarded: any Aim error is reported once and

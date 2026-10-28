@@ -7,8 +7,9 @@ Covers:
   Aim repository;
 * :func:`import_logs.discover_runs` on a synthetic log tree;
 * CSV import (axis rule: ``_epoch`` columns at x=epoch, others at x=step),
-  parameters from ``run_info.json``/``model_config.json``, and the idempotency
-  sidecar;
+  parameters from ``run_info.json`` plus the full nested configs
+  (``model_config.json``/``training_config.json`` stored verbatim), and the
+  idempotency sidecar;
 * TensorBoard event-file import.
 
 Reading back uses the same index mechanism as the Aim UI (``aim up`` builds it
@@ -73,7 +74,13 @@ def _fake_trainer(callback_metrics=None, global_step=0, current_epoch=0, log_dir
 
 def test_aim_callback_run_content(tmp_path):
     home = tmp_path / "aimdb"
-    cb = AimCallback(experiment="TEST", name="phase/model/run1", home=str(home), params={"lr": 1e-3, "model_class": "FNO"})
+    model_config = {"name": "FNOvanilla", "model": "FNO", "params": {"modes": 8, "hidden_channels": 64}}
+    cb = AimCallback(
+        experiment="TEST",
+        name="phase/model/run1",
+        home=str(home),
+        params={"lr": 1e-3, "model_class": "FNO", "model_config": model_config},
+    )
 
     trainer = _fake_trainer(
         callback_metrics={
@@ -117,6 +124,10 @@ def test_aim_callback_run_content(tmp_path):
     assert run.name == "phase/model/run1"
     assert run.get("lr") == pytest.approx(1e-3)
     assert run.get("model_class") == "FNO"
+    # Nested params: stored as a tree — the whole dict comes back under its key,
+    # and individual leaves are addressable by tuple path (as in search queries).
+    assert run.get("model_config") == model_config
+    assert run.get(("model_config", "params")) == {"modes": 8, "hidden_channels": 64}
 
     # Per-batch training series: only non-val *_step keys, at their global steps.
     assert _metric_frame(run, "loss_step") == [(42, 0.5), (91, 0.3)]
@@ -154,27 +165,44 @@ def test_build_aim_callback_selection():
         "window_size": 5,
         "seed": 42,
     }
+    model_cfg = {"name": "FNOvanilla", "model": "FNO", "params": {"modes": 8, "hidden_channels": 64}}
+    training_cfg = {"input_steps": 10, "dataset": {"path": "/x.h5"}, "pretraining": {"lr": 1e-3}}
 
     cb = build_aim_callback(
-        logdir, ["csv", "aim"], {"experiment": "PDEBENCH"}, experiment="PDEBENCH", model_name="FNO", phase_name="pretraining", run_info=run_info
+        logdir,
+        ["csv", "aim"],
+        {"experiment": "PDEBENCH"},
+        experiment="PDEBENCH",
+        model_name="FNO",
+        phase_name="pretraining",
+        run_info=run_info,
+        model_cfg=model_cfg,
+        training_cfg=training_cfg,
     )
     assert isinstance(cb, AimCallback)
     assert cb.experiment == "PDEBENCH"
     assert cb.name == "pretraining/FNO/10steps_20260101-000000"
     assert cb.params["model_class"] == "FNO"
+    # Full configs stored verbatim as nested params (browsable trees in the UI).
+    assert cb.params["model_config"] is model_cfg
+    assert cb.params["training_config"] is training_cfg
 
     # Default experiment comes from output.experiment; home defaults to ~/.aim
     # (aim 3.x's own CWD-based default would pollute the launch directory).
-    cb = build_aim_callback(logdir, ["aim"], {}, experiment="PDEBENCH", model_name="FNO", phase_name="pretraining", run_info=run_info)
+    cb = build_aim_callback(
+        logdir, ["aim"], {}, experiment="PDEBENCH", model_name="FNO", phase_name="pretraining", run_info=run_info, model_cfg=model_cfg, training_cfg=training_cfg
+    )
     assert cb.experiment == "PDEBENCH" and Path(cb.home) == Path.home() / ".aim"
 
     # An explicit home is honored (and expanded).
-    cb = build_aim_callback(logdir, ["aim"], {"home": "~/mydb"}, experiment="E", model_name="m", phase_name="p", run_info=run_info)
+    cb = build_aim_callback(
+        logdir, ["aim"], {"home": "~/mydb"}, experiment="E", model_name="m", phase_name="p", run_info=run_info, model_cfg=model_cfg, training_cfg=training_cfg
+    )
     assert Path(cb.home) == Path("~/mydb").expanduser()
 
     # Not requested -> None (including the csv+tb default when loggers is omitted).
-    assert build_aim_callback(logdir, ["csv"], {}, experiment="E", model_name="m", phase_name="p", run_info=run_info) is None
-    assert build_aim_callback(logdir, None, {}, experiment="E", model_name="m", phase_name="p", run_info=run_info) is None
+    assert build_aim_callback(logdir, ["csv"], {}, experiment="E", model_name="m", phase_name="p", run_info=run_info, model_cfg=model_cfg, training_cfg=training_cfg) is None
+    assert build_aim_callback(logdir, None, {}, experiment="E", model_name="m", phase_name="p", run_info=run_info, model_cfg=model_cfg, training_cfg=training_cfg) is None
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +237,10 @@ def _synthetic_tree(root: Path) -> dict:
     (run_a / "run_info.json").write_text(
         json.dumps({"model": {"class": "ModelA", "params": 100}, "phase": "pretraining", "lr": 1e-3, "max_epochs": 2, "seed": 42})
     )
+    (run_a / "model_config.json").write_text(
+        json.dumps({"name": "ModelA", "model": "ModelA", "params": {"hidden_dim": 32}})
+    )
+    (run_a / "training_config.json").write_text(json.dumps({"input_steps": 10, "dataset": {"path": "/x.h5"}}))
 
     run_b = root / "fulltraining" / "ModelB" / "10steps_20260102-000000"
     _write_csv(
@@ -262,10 +294,14 @@ def test_import_csv_end_to_end(tmp_path):
     assert _metric_frame(run, "avg_loss") == [(49, 0.95)]
     assert _metric_frame(run, "lr-AdamW") == [(49, pytest.approx(1e-3))]
     assert _metric_frame(run, "loss_epoch") == [(0, 0.9)]
-    # Parameters from run_info.json.
+    # Flat parameters from run_info.json.
     assert run.get("model_class") == "ModelA"
     assert run.get("n_params") == 100
     assert run.get("phase") == "pretraining"
+    # Full configs stored verbatim as nested params (same keys as live runs).
+    assert run.get("model_config") == {"name": "ModelA", "model": "ModelA", "params": {"hidden_dim": 32}}
+    assert run.get(("model_config", "params")) == {"hidden_dim": 32}
+    assert run.get("training_config") == {"input_steps": 10, "dataset": {"path": "/x.h5"}}
 
     # Sidecar written; a plain re-run skips the import (idempotent).
     assert (refs["run_a"] / ".aim_import.json").is_file()

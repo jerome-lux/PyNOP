@@ -26,8 +26,11 @@ Conventions (identical to the live :class:`~pynop.training.aim_logger.AimCallbac
 * metric names are kept as logged (``loss_step``, ``RMSE_epoch``, ...);
 * x-axis: columns ending in ``_epoch`` use the row's ``epoch`` value, every
   other column uses the row's ``step`` value — exactly what the CSV records;
-* parameters from ``run_info.json`` / ``model_config.json`` are stored with the
-  run for cross-run comparison.
+* parameters from ``run_info.json`` are stored with the run for cross-run
+  comparison, plus the full ``model_config.json`` / ``training_config.json``
+  verbatim as nested parameters (``model_config``, ``training_config``) — the
+  same keys the live :class:`~pynop.training.aim_logger.AimCallback` writes, so
+  imported and live runs stay directly comparable in the UI.
 
 Re-importing a run directory creates an additional Aim run (the previous one is
 kept); a sidecar file ``.aim_import.json`` records the last import and makes
@@ -253,15 +256,27 @@ def import_run_tb(run_dir: Path, aim_run) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _load_json_dict(path: Path) -> Optional[dict]:
+    """Load a JSON file expecting an object; ``None`` if missing or unreadable."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _load_params(run_dir: Path) -> dict:
-    """Collect comparison-friendly parameters from the run's bookkeeping files."""
+    """Collect comparison-friendly parameters from the run's bookkeeping files.
+
+    Mirrors :func:`pynop.training.train.build_aim_callback` for live runs: a few
+    flat convenience keys (from ``run_info.json``) plus the full model and
+    training configs stored verbatim as nested parameters (Aim renders them as
+    an expandable tree in the run-detail "Parameters" tab).
+    """
     params: dict = {}
     info_file = run_dir / "run_info.json"
     if info_file.is_file():
-        try:
-            info = json.loads(info_file.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            info = None
+        info = _load_json_dict(info_file)
         if isinstance(info, dict):
             model = info.get("model") or {}
             for key in ("phase", "lr", "max_epochs", "input_steps", "window_size", "seed"):
@@ -271,14 +286,11 @@ def _load_params(run_dir: Path) -> dict:
                 params["model_class"] = model["class"]
             if "params" in model:
                 params["n_params"] = model["params"]
-    cfg_file = run_dir / "model_config.json"
-    if cfg_file.is_file():
-        try:
-            cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
-            if isinstance(cfg, dict) and isinstance(cfg.get("params"), dict):
-                params["model_params"] = cfg["params"]
-        except (json.JSONDecodeError, OSError):
-            pass
+    # Full configs, verbatim (same keys as the live AimCallback).
+    for key, filename in (("model_config", "model_config.json"), ("training_config", "training_config.json")):
+        cfg = _load_json_dict(run_dir / filename)
+        if cfg is not None:
+            params[key] = cfg
     return params
 
 

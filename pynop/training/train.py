@@ -106,8 +106,11 @@ Logger names: ``"csv"``, ``"tensorboard"``/``"tb"`` and ``"aim"``. The Aim entry
 installs an :class:`~pynop.training.aim_logger.AimCallback` (not a Lightning
 logger) that mirrors the same metrics to an Aim run — per-batch ``*_step``
 metrics at ``x = global_step``, epoch-level metrics at ``x = epoch`` — so runs
-can be compared in the Aim UI (``aim up``). Existing runs can be imported into
-the same experiment with :mod:`pynop.training.import_logs`.
+can be compared in the Aim UI (``aim up``). The run also stores both full JSON
+configs as nested parameters (``model_config``, ``training_config``), browsable
+as an expandable tree in the run-detail "Parameters" tab. Existing runs can be
+imported into the same experiment with :mod:`pynop.training.import_logs` (which
+stores the same parameter keys).
 
 Phase parameters (both sections use the same keys):
 
@@ -716,6 +719,8 @@ def build_aim_callback(
     model_name: str,
     phase_name: str,
     run_info: dict,
+    model_cfg: dict,
+    training_cfg: dict,
 ) -> Optional[AimCallback]:
     """Build the :class:`AimCallback` if ``"aim"`` is among the configured loggers.
 
@@ -728,10 +733,23 @@ def build_aim_callback(
         model_name: Run name of the model config.
         phase_name: Selected training phase (``pretraining``/``fulltraining``).
         run_info: Bookkeeping dict written to ``run_info.json`` (source of the
-            parameters stored with the Aim run).
+            flat convenience parameters stored with the Aim run).
+        model_cfg: The raw parsed ``ModelConfig.json`` dict — stored verbatim as
+            the nested ``model_config`` parameter.
+        training_cfg: The raw parsed ``TrainingConfig.json`` dict — stored
+            verbatim as the nested ``training_config`` parameter.
 
     Returns:
         The callback, or ``None`` if Aim is not requested.
+
+    Notes:
+        Besides a few flat convenience keys (``lr``, ``seed``, ...), the full
+        model and training configs are stored as **nested** parameters: Aim keeps
+        them as trees, so the UI's run-detail "Parameters" tab renders them as an
+        expandable tree and search queries can address individual leaves
+        (e.g. ``run.model_config.params.modes == 8``). The same keys are written
+        by :mod:`pynop.training.import_logs` for imported runs, so live and
+        imported runs stay directly comparable in the UI.
     """
     names = [str(n).lower() for n in logger_names] if logger_names is not None else []
     if "aim" not in names:
@@ -750,6 +768,9 @@ def build_aim_callback(
         "input_steps": run_info["input_steps"],
         "window_size": run_info["window_size"],
         "seed": run_info["seed"],
+        # Full configs (raw JSON, verbatim) — browsable as nested trees in the UI.
+        "model_config": model_cfg,
+        "training_config": training_cfg,
     }
     return AimCallback(
         experiment=str(aim_cfg.get("experiment") or experiment),
@@ -947,6 +968,8 @@ def run_training(
         model_name=model_name,
         phase_name=phase_name,
         run_info=run_info,
+        model_cfg=model_cfg,
+        training_cfg=training_cfg,
     )
     if aim_cb is not None:
         callbacks.append(aim_cb)
