@@ -1148,3 +1148,50 @@ requêtes de recherche adressent les feuilles par chemin (`run.model_config.para
 
 Vérifié : suite complète **298 passed** ; smoke end-to-end TinyFNO 2 époques `["csv","aim"]` → les deux
 configs lues back du repo Aim, identiques aux fichiers JSON source.
+
+### 22. `Transolver3` — OOM dès le premier batch : diagnostic + re-vérification contre l'officiel (`pynop/models/transolver.py`, `pynop/core/blocks.py`)
+
+**Contexte** : série d'entraînements PDEBench lancée avec les configs par défaut — `Transolver3` plante en
+OOM dès le **premier batch** (aucun checkpoint, `metrics.csv` vide), alors que SwinNO passe. La grille est
+128×128 (**N = 16 384 tokens**), pas 16×16 : c'est ce qui change tout.
+
+**Diagnostic (mesure CPU, un batch complet = rollout + backward, B=5)** :
+- Le nombre de forward par pas d'entraînement n'est **pas** le nombre de pas AR courants : la fenêtre est
+  `T_unroll = max_AR_steps + input_steps + 1 = 21` → **toujours 11 prédictions** dans un seul graphe. Le
+  curriculum AR ne change que le feedback (teacher-forcing vs AR), pas la taille du graphe ; avec
+  `detach_grad_steps=40 > 11` il n'y a aucun BPTT. La mémoire par pas est donc **constante entre les
+  époques** — l'OOM au step 0 de l'époque 0 (AR=2) est attendu, ce n'est pas une fuite.
+- Sans checkpointing : RSS croît de **~6,7 GB par prédiction** (1,78 → 75,13 GB après 11 étapes). Par bloc :
+  matrice d'assignment `w [B,H,N,M]` (168 Mo) + ses logits `[B,N,H·M]` (168 Mo) + sorties LayerNorm/MLP sur
+  N tokens (~900 Mo). ~75 GB > 48 GB VRAM A6000 → OOM immédiat.
+- Avec `use_checkpoint=true` : **~1,1 GB/prédiction → pic 14,8 GB** — tient dans la carte.
+
+**Vérification contre l'officiel** (`lbruand-db/distributed-transolver3`, `PhysicsAttentionV3` +
+`Transolver3Block`) : le port est fidèle au chemin standard (w par tête via `in_project_slice` orthogonale,
+température clampée [0.1, 5], normalisation diagonale eps 1e-5, projections dans le domaine des M slices,
+q/k/v partagés sans biais, SDPA sur les M slices, deslice + concat des têtes, pre-norm `ln_1`/`ln_2` +
+résidus, MLP [Linear+act+Linear]). Deux écarts trouvés et corrigés :
+
+1. **`out_dropout` mort** — défini mais jamais appliqué ; l'officiel applique le dropout à la sortie
+   déslicée avant le résidu (`return self.out_dropout(x_out)`). Avec `dropout=0.05` en config, notre modèle
+   perdait ce régularisateur (le docstring du bloc le documentait déjà — c'était le code qui manquait).
+2. **Init tronquée ~43× trop petite** — `trunc_normal_(std=0.02, a=-0.04, b=0.04)` : torch interprète a/b en
+   unités de σ → troncature à ±0.04σ (std effectif ≈ 4,6e-4) au lieu des ±2σ de la référence (timm
+   `trunc_normal_(std=0.02)`). L'auteur visait les bornes absolues ±0.04 = ±2σ. Fix : `a=-2.0, b=2.0`.
+
+**Note mémoire / fidélité** : l'officiel documente lui-même que le chemin standard garde `w [B,H,N,M]` en
+O(N·M) par bloc ; ses optimisations mémoire sont le **tiling géométrique (Algorithme 1)** avec gradient
+checkpointing par tuile et le chunking MLP — non portés ici (documenté comme « mathématiquement identiques »,
+vrai pour le forward, mais ce sont précisément les solutions mémoire). Plutôt que de porter le tiling, on a
+ajouté l'équivalent minimal : `Transolver(use_checkpoint=...)` enveloppe chaque bloc dans
+`torch.utils.checkpoint` pendant l'entraînement (même mécanisme que le chemin tiled officiel), activé dans
+`configs/model_Transolver3.json`. Coût : recompute des blocs au backward (~+60 % de temps backward mesuré en
+CPU) ; inférence inchangée.
+
+**Vérifié** : 3 nouveaux tests (`test_t3block_out_dropout_is_used`,
+`test_t3block_checkpoint_matches_plain_forward_and_grads`, `test_init_trunc_normal_scale`) + suite complète
+**301 passed**. Mesure CPU un batch (B=5, T_unroll=21, 128×128) : pic RSS **75,3 GB → 14,8 GB** avec
+checkpointing.
+
+⚠️ À retenir : avec LM Studio ouvert (~40 GB VRAM), même le Transolver3 checkpointé (~15–18 GB) ne tient pas —
+fermer l'UI pendant les entraînements (ou baisser `batch_size`).

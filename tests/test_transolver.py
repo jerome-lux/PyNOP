@@ -307,6 +307,56 @@ def test_t3block_requires_dim_equals_heads_times_dim_head():
         TransolverBlockv3(dim=16, heads=4, dim_head=5)  # 4 * 5 != 16
 
 
+def test_t3block_out_dropout_is_used():
+    """out_dropout must sit on the forward path (the official applies it to the
+    desliced output before the residual; it was dead code before)."""
+    torch.manual_seed(0)
+    block = TransolverBlockv3(dim=16, heads=4, slice_num=5, dropout=1.0)  # training mode
+    x = torch.randn(2, 9, 16)
+
+    with torch.no_grad():
+        out = block(x)
+        # With p=1.0 the whole attention sublayer is dropped: only the MLP residual remains.
+        ref = block.mlp(block.ln_2(x)) + x
+
+    assert torch.allclose(out, ref, atol=1e-5)
+
+
+def test_t3block_checkpoint_matches_plain_forward_and_grads():
+    """use_checkpoint must be mathematically transparent (dropout off)."""
+    torch.manual_seed(0)
+    model = _make_model("t3", dropout=0.0, use_checkpoint=False)
+    x = torch.randn(2, 2, 16, 16)
+
+    y1 = model(x)
+    y1.pow(2).mean().backward()
+    g1 = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+
+    model.use_checkpoint = True
+    model.zero_grad(set_to_none=True)
+    y2 = model(x)
+    y2.pow(2).mean().backward()
+
+    assert torch.allclose(y1, y2, atol=1e-6)
+    for n, p in model.named_parameters():
+        if g1[n] is not None:
+            assert torch.allclose(p.grad, g1[n], atol=1e-5), f"gradient mismatch on {n}"
+
+
+def test_init_trunc_normal_scale():
+    """Linear weights must be initialized at the reference scale (std 0.02, ±2σ).
+
+    Regression: a=-0.04/b=0.04 was interpreted by torch as ±0.04*std, shrinking
+    every weight ~43x below the intended std of 0.02.
+    """
+    torch.manual_seed(0)
+    model = Transolver(in_ch=8, out_ch=1, slice_num=8, n_layers=2, n_hidden=64, n_head=4, mode="t3")
+
+    for name in ("lifting", "mixer"):
+        w = getattr(model, name).weight
+        assert abs(w.std().item() - 0.02) < 0.005, f"{name}.weight std={w.std().item():.4f}"
+
+
 # ---------------------------------------------------------------------------
 # Resolution behavior: no state mutation, works at multiple resolutions
 # ---------------------------------------------------------------------------

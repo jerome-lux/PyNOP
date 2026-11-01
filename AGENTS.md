@@ -28,7 +28,7 @@ itérative, sur la branche `dev`.
 | **ITLNO** | `pynop/models/LNO.py` | ✅ Analysé + bugs corrigés (§6) + **branche locale** ajoutée (§7) |
 | **LatentTransolver** | `pynop/models/LNO.py` | ✅ Vérifié (Transolver3 correct) + nettoyage + **branche locale** ajoutée (§7) |
 | **FNO** | `pynop/models/FNO.py` | ✅ Analysé + bugs corrigés (crash forward, Tucker, invariance rés.) ; bloc aligné sur la référence + **branche locale** `FiniteDifferenceLayer` (§14) |
-| **Transolver** | `pynop/models/transolver.py` | ✅ Analysé + bugs corrigés (dispatch mode, `ln1` morte, dropout non câblé) ; **`TransolverBlockv3` réécrit = port fidèle de Transolver-3** (arXiv:2602.04940 : poids par tête, température clampée, concat des têtes), sans tiling ; 3 modes `"linear"`/`"t3"`/`"physics"` (§17) |
+| **Transolver** | `pynop/models/transolver.py` | ✅ Analysé + bugs corrigés (dispatch mode, `ln1` morte, dropout non câblé) ; **`TransolverBlockv3` réécrit = port fidèle de Transolver-3** (arXiv:2602.04940 : poids par tête, température clampée, concat des têtes), sans tiling ; 3 modes `"linear"`/`"t3"`/`"physics"` (§17) ; **re-vérifié contre l'officiel + OOM corrigé** : `out_dropout` mort et init ~43× trop petite fixés, option `use_checkpoint` (gradient checkpointing des blocs, activée en config T3) → 75 GB → ~15 GB/pas (§22) |
 | **ITNet** | `pynop/models/ITNet.py` | ⏳ À analyser |
 | **UNet** (classique) | `pynop/models/unet.py` | ✅ Réécrit : U-Net classique (non-NO) validé — 4 blocs acceptés, PatchEmbed option, bottleneck transformer (PE **ou** RoPE) (§8) |
 | **Resnet** (classique) | `pynop/models/resnet.py` | ✅ Unifiée : `block_type="basic"`/`"bottleneck"` + `bottleneck_ratio` + `se` ; `Resnetb` supprimé ; `resnet18`/`34`/`50`/`resnext50` fonctionnent (§11) |
