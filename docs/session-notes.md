@@ -1195,3 +1195,88 @@ checkpointing.
 
 ⚠️ À retenir : avec LM Studio ouvert (~40 GB VRAM), même le Transolver3 checkpointé (~15–18 GB) ne tient pas —
 fermer l'UI pendant les entraînements (ou baisser `batch_size`).
+
+### 23. Dataloaders unifiés — classe de base + sous-classes par format (`pynop/dataloader/dataloader.py`, `pynop/training/train.py`, `pynop/training/eval.py`)
+
+**Contexte** : demande utilisateur — une classe de base et des classes spécifiques héritant d'elle pour
+chaque type de format (PDEBench, TheWell, ayz2, custom), afin d'unifier le traitement des loaders.
+Contrainte clé : conserver les fonctionnalités du protocole PDEBench ; pour les datasets avec train/val
+séparés il est impossible de faire exactement la même chose, mais il faut **accès aux IDs train/val** et
+pouvoir **fixer le nombre de train samples et val samples**.
+
+État trouvé en cours de route : `h5_dataloader.py` avait été supprimé dans le working tree (contenu déplacé
+dans `dataloader.py`, `RDDataSet`→`CustomDataset`) mais `train.py:195` importait encore
+`..dataloader.h5_dataloader` → **driver CLI cassé à l'import**. Corrigé.
+
+**Formats réels inspectés sur disque** (`/run/media/jlux/SSD2/datasets/`) :
+
+| Format | Structure | Splits natifs |
+|---|---|---|
+| PDEBench | groupes top-level = IDs sims, `data` `(T,H,W,C)` channels-last | ❌ → protocole shuffle+ratio |
+| Custom (réaction-diffusion) | `data` `(T,H,W,2)` + `porosity` `(T,H,W,1)` ; **attribut `split` par échantillon : 400 train / 50 val** | ✅ via l'attribut |
+| ayz2 (Burgers/NS/KolmFlow) | **un fichier par split** (`NS_1024.h5`=train, `NS_256.h5`=valid), groupe unique dedans ; `u` `(N,T,H,W)` + `x`,`t` + coefficients scalaires `(N,)` (Burgers : ax/ay/cx/cy/nu) **ou** champ spatial `a` `(N,H,W)` (NS) | ✅ fichiers séparés (ou groupes si ≥2 dans un fichier) |
+| TheWell | `data/{train,valid,test}/` = fichiers séparés ; `t0/t1/t2_fields` + attr `n_trajectories` | ✅ fichiers séparés |
+
+⚠️ Écart important : l'ancienne `NSH5Dataset` attendait `[split]/a` (champ spatial) — absent des fichiers
+Burgers (qui ont des coefficients scalaires), présent dans les fichiers NS. La version standalone utilisée
+(`datasets/NSH5Dataset.py`) ne lisait que `u`. Le nouveau loader gère **les deux sources de conditionnement**.
+
+**Design** :
+- **`TemporalWindowDataset`** (base) : validation params, `_prepare_transform`, génération des fenêtres —
+  boucle **bit-identique** à l'ancienne PDEBench (reproductibilité), `__len__`, template `__getitem__` →
+  `(fields, t0)` ou `(fields, t0, cond)`, handle h5py lazy par worker. Hooks abstraits :
+  `_discover_sample_ids()`, `_sample_lengths(ids)`, `_read_range(sid,t0,t1) -> (T,C,H,W)`,
+  `_load_to_ram()` (no-op défaut), `_extra_output(sid)` (cond statique, défaut None). Méthodes publiques
+  `load_trajectory(sid,min_id,max_id)` et `load_conditioning(sid)` — **une seule voie de lecture** pour
+  train ET eval. Classmethod `list_splits(path) -> {nom: [ids]}` par format.
+- **Sous-classes** : `PDEBenchDataSet` (signature inchangée), `CustomDataset` (+assert cohérence temporelle
+  data/porosity conservée), `Ayz2Dataset` (**renommée sans alias**, choix utilisateur ; `split=None` → auto si
+  groupe unique, sinon erreur listant les groupes ; coefficients scalaires auto-détectés = datasets 1D de
+  longueur N hors `{u,x,t}` ; champ `a` `(N,H,W)/(N,C,H,W)` toujours renvoyé si présent ; cond = concat des
+  canaux : `a` d'abord puis un champ constant par coefficient ; PDEs 1D `u (N,T,X)` → embed `(T,1,1,X)`),
+  `TheWellDataSet` (+`indexes`, +shift/scale — absents avant ; `-seed` param mort supprimé ; crop RAM
+  `[min_id,max_id]` conservé avec offset absolu), `npyPDEDataset` (RAM-only, binning temporel).
+- **Protocole de split unifié** `resolve_split_ids(ds_cfg, phase_cfg)` (dans le module dataloader) :
+  priorité (1) `train_ids`/`val_ids` explicites ; (2) splits natifs — fichiers séparés (`path`+`val_path`),
+  groupes HDF5, attribut `split` — pools tronquées par `n_train_samples`/`n_val_samples` puis `n_samples` de
+  la phase sur le pool train **dans l'ordre fichier stable** (nesting 2 phases préservé) ; (3) sinon protocole
+  PDEBench (shuffle seedé + `n_samples` + `split_ratio`) — **bit-identique** à l'ancien driver. Retour structuré :
+  `train/val {path, group, ids}` + `train_pool_order` (pool complet pré-troncature ; ordre shuffle pour le cas
+  protocole → compat pool inutilisé de eval) + `source`.
+- **`build_dataloaders(ds_cfg, phase_cfg, input_steps)`** déplacé de train.py dans le module dataloader :
+  registry type→classe (`DATASET_REGISTRY`, alias `get_dataset_class`), instanciation par split (kwargs
+  format-specifics : `split=`/`coefficients=` pour ayz2, `fields_list=` pour thewell), DataLoaders identiques à
+  l'ancien driver. `train.py` garde `build_pdebench_dataloaders` comme alias déprécié.
+
+**Intégration train/eval** :
+- `run_info.json` : clés plates `train_ids`/`val_ids` conservées + `dataset.type` et `dataset.val_path`
+  ajoutés (additif — `import_logs` non affecté). IDs de fichiers différents = **namespaces distincts** : pas de
+  comparaison d'overlap entre fichiers (ayz2 train `0..7` vs val `0..256`).
+- `eval.py` : `select_eval_ids` réécrit sur `resolve_split_ids` (supprime la copie du protocole) ;
+  **`test_path` explicite** dans la config dataset → `--split test` lit ce fichier directement (TheWell
+  `data/test/`, disjoint de train/val par construction — exigence utilisateur), sinon pool inutilisé comme avant.
+  Lecture des trajectoires via une instance disk-mode de la classe du format (`_make_reader`) au lieu de h5py en
+  direct ; **le cond est maintenant renvoyé au rollout** (`load_conditioning` → `_rollout(cond=...)`) — avant,
+  eval passait `cond=None` systématiquement : métriques silencieusement fausses pour les modèles entraînés avec
+  conditionnement (FNO `cond_dim=D`).
+
+**Vérifié** :
+- Protocole PDEBench **bit-identique** sur le vrai fichier `133017.hdf5` (n_samples ∈ {40, 400, None}) + ordre du
+  pool inutilisé identique (compat eval).
+- ayz2 sur vrais fichiers : NS_1024/NS_256 (fichiers séparés, `a` → cond `(1,H,W)`), Burgers_1024 (coefficients →
+  cond `(5,H,W)`, valeurs vérifiées contre le fichier), RAM==disk, `load_trajectory`, indices hors plage → warning +
+  pas de fenêtre (pas de crash HDF5 opaque), auto-split, erreurs explicites.
+- Custom : splits natifs par attribut (400/50), caps, concat data+porosity = 3 canaux, RAM==disk.
+- TheWell : protocole single-file, concat A+B, `fields_list`, crop RAM avec index absolus, hors plage.
+- Smoke end-to-end réel : entraînement 1 époque FNO(`cond_dim=5`) sur Burgers_1024 (train) + validation sur
+  Burgers_256 (fichier val séparé), puis eval `--split val` : rollout complet avec cond, résultats écrits.
+- Tests : **36 nouveaux** dans `tests/test_dataloader.py` (fenêtres vs boucle legacy, normalisation scalaire/par
+  canal, RAM==disk par format, protocole vs algorithme legacy verbatim, splits natifs/caps/explicites, erreurs) +
+  ajustements de `test_train_cli.py` / `test_eval_cli.py` (rejet des types **inconnus** au lieu de « tout sauf
+  pdebench », signatures reader). Suite complète : **337 passed**.
+
+⚠️ À retenir : les configs dataset sont volatiles (l'utilisateur teste des formats différents) — la section
+`"dataset"` du TrainingConfig accepte désormais `type/path/val_path/test_path/batch_size/num_workers/load_in_ram/
+shift/scale/random_seed/split_ratio/n_train_samples/n_val_samples/train_ids/val_ids/split/val_split` + extras
+format (`fields_list`, `coefficients`). Ne pas « corriger » une config ayz2 qui pointe vers des fichiers séparés :
+c'est le layout réel du dataset.

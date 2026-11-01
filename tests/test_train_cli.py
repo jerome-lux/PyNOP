@@ -272,10 +272,11 @@ def test_build_pdebench_dataloaders_split(pdebench_h5):
     assert fields.shape == (2, 5, C, H, W)
 
 
-def test_build_pdebench_dataloaders_rejects_other_types(pdebench_h5):
+def test_build_pdebench_dataloaders_rejects_unknown_types(pdebench_h5):
+    """Unknown dataset types are rejected (the four known formats are supported)."""
     ds_cfg = _training_config(pdebench_h5, Path("."))["dataset"]
-    ds_cfg["type"] = "thewell"
-    with pytest.raises(ValueError, match="only 'pdebench'"):
+    ds_cfg["type"] = "bogus_format"
+    with pytest.raises(ValueError, match="Unsupported dataset type"):
         build_pdebench_dataloaders(ds_cfg, {"max_AR_steps": 2}, input_steps=2)
 
 

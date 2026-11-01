@@ -44,16 +44,24 @@ TrainingConfig.json
 
     {
         "input_steps": 10,               # n_slices: past slices given to the network
-        "dataset": {                     # PDEBench dataset (only type supported so far)
-            "type":         "pdebench",
-            "path":         "/.../133017.hdf5",
+        "dataset": {                     # see pynop.dataloader for the formats
+            "type":         "pdebench",  # "pdebench" | "custom" | "ayz2" | "thewell" | "npy"
+            "path":         "/.../133017.hdf5",   # train file (or single file)
+            "val_path":     null,        # optional separate validation file (ayz2/TheWell split-per-file layouts)
             "batch_size":   5,
             "num_workers":  10,          # optional, default 0
             "load_in_ram":  true,        # optional, default false
             "shift":        0.0,         # optional normalization (x + shift) * scale
             "scale":        1.0,
-            "split_ratio":  0.9,         # train fraction of the simulation IDs
-            "random_seed":  42           # seeds ID shuffle + torch/PL RNGs
+            "split_ratio":  0.9,         # train fraction of the simulation IDs (single-pool protocol only)
+            "random_seed":  42,          # seeds ID shuffle + torch/PL RNGs
+            "n_train_samples": null,     # optional cap on the native train pool size
+            "n_val_samples":   null,     # optional cap on the native val pool size
+            "train_ids":      null,      # optional explicit ID lists (highest priority)
+            "val_ids":        null,
+            "split":          null,      # optional HDF5 group / attribute name for the train pool
+            "val_split":      null       # ... and for the val pool
+            // format extras: "fields_list" (thewell), "coefficients" (ayz2)
         },
         "shared_params": {               # common to both phases (notebook shared_params)
             "timestep":             5e-2,   # dt between slices
@@ -114,9 +122,11 @@ stores the same parameter keys).
 
 Phase parameters (both sections use the same keys):
 
-* ``delta_ts``      — window stride of :class:`~pynop.PDEBenchDataSet`.
+* ``delta_ts``      — window stride of the dataset.
 * ``min_id`` / ``max_id`` — time range kept for windows (``null`` = full).
-* ``n_samples``     — number of simulations used (``null`` = all).
+* ``n_samples``     — number of train simulations used (``null`` = all); with
+  native splits it truncates the train pool in stable file order, so two-phase
+  protocols keep their nesting property.
 * ``split_ratio``   — optional per-phase override of the dataset split.
 * ``lr``            — learning rate (OneCycleLR maximum LR, optimizer base LR).
 * ``max_epochs``    — number of epochs for this phase.
@@ -162,12 +172,10 @@ import argparse
 import datetime
 import importlib
 import json
-import random
 import sys
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
-import h5py
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, TQDMProgressBar
@@ -192,7 +200,7 @@ if __package__ in (None, ""):
         sys.path.insert(0, _repo_root)
     __package__ = f"{_pkg_dir.name}.training"
 
-from ..dataloader.h5_dataloader import PDEBenchDataSet
+from ..dataloader import build_dataloaders
 from .aim_logger import AimCallback
 from .lightning_model import (
     CurriculumCheckpoint,
@@ -502,88 +510,21 @@ def select_phase(training_cfg: dict, pretrain: bool) -> tuple:
 
 
 def build_pdebench_dataloaders(ds_cfg: dict, phase_cfg: dict, input_steps: int) -> tuple:
-    """Build train/val :class:`DataLoader` pairs for the PDEBench dataset.
+    """Deprecated alias for :func:`~pynop.dataloader.build_dataloaders`.
 
-    Reproduces the notebook protocol: all simulation IDs are shuffled with a
-    seeded RNG, truncated to ``n_samples``, then split by ``split_ratio`` on
-    the *simulation IDs* (so both phases share the same subset of simulations).
-    The window length is derived as ``max_AR_steps + input_steps + 1``.
+    Kept so that existing imports keep working; the implementation now lives in
+    the dataloader module and supports every dataset type (``"pdebench"``,
+    ``"custom"``, ``"ayz2"``, ``"thewell"``, ``"npy"``), not only PDEBench.
 
     Args:
-        ds_cfg: The ``"dataset"`` section of the training config. Requires
-            ``type == "pdebench"``, ``path`` and ``batch_size``; optional keys
-            are ``num_workers``, ``load_in_ram``, ``shift``, ``scale``,
-            ``split_ratio`` (default 0.9) and ``random_seed`` (default 42).
-        phase_cfg: The selected phase section (provides ``delta_ts``,
-            ``min_id``, ``max_id``, ``n_samples``, ``max_AR_steps``; an
-            optional per-phase ``split_ratio`` override).
+        ds_cfg: The ``"dataset"`` section of the training config.
+        phase_cfg: The selected phase section.
         input_steps: Number of past slices given to the network.
 
     Returns:
         Tuple ``(train_loader, val_loader, window_size)``.
-
-    Raises:
-        ValueError: If the dataset type is not supported or a required key is missing.
     """
-    ds_type = str(ds_cfg.get("type", "")).lower()
-    if ds_type != "pdebench":
-        raise ValueError(f"Unsupported dataset type {ds_cfg.get('type')!r}: only 'pdebench' is supported for now.")
-    if "path" not in ds_cfg:
-        raise KeyError('The "dataset" section requires a "path".')
-    if "batch_size" not in ds_cfg:
-        raise KeyError('The "dataset" section requires a "batch_size".')
-
-    path = Path(ds_cfg["path"])
-    window_size = int(phase_cfg["max_AR_steps"]) + input_steps + 1
-    delta_ts = phase_cfg.get("delta_ts")
-    min_id = int(phase_cfg.get("min_id", 0))
-    max_id = phase_cfg.get("max_id")
-    n_samples = phase_cfg.get("n_samples")
-    split_ratio = float(phase_cfg.get("split_ratio", ds_cfg.get("split_ratio", 0.9)))
-    seed = int(ds_cfg.get("random_seed", 42))
-
-    with h5py.File(path, "r") as f:
-        all_ids = list(f.keys())
-    rng = random.Random(seed)
-    rng.shuffle(all_ids)
-    if n_samples is not None:
-        all_sample_ids = all_ids[: min(len(all_ids), int(n_samples))]
-    else:
-        all_sample_ids = all_ids
-
-    n_train = int(len(all_sample_ids) * split_ratio)
-    train_ids, val_ids = all_sample_ids[:n_train], all_sample_ids[n_train:]
-    if not train_ids or not val_ids:
-        raise ValueError(
-            f"Empty split: {len(train_ids)} train / {len(val_ids)} valid simulations "
-            f"(n_samples={n_samples}, split_ratio={split_ratio}). Check the dataset config."
-        )
-
-    common = dict(
-        T_unroll=window_size,
-        step=int(delta_ts) if delta_ts is not None else None,
-        load_in_ram=bool(ds_cfg.get("load_in_ram", False)),
-        min_id=min_id,
-        max_id=max_id,
-        shift=float(ds_cfg.get("shift", 0.0)),
-        scale=float(ds_cfg.get("scale", 1.0)),
-    )
-    train_set = PDEBenchDataSet(path, indexes=train_ids, **common)
-    val_set = PDEBenchDataSet(path, indexes=val_ids, **common)
-
-    batch_size = int(ds_cfg["batch_size"])
-    num_workers = int(ds_cfg.get("num_workers", 0))
-    train_loader = DataLoader(train_set, shuffle=True, batch_size=batch_size, num_workers=num_workers)
-    val_kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())
-    if num_workers > 0:
-        val_kwargs["persistent_workers"] = True
-    val_loader = DataLoader(val_set, shuffle=False, **val_kwargs)
-
-    print(
-        f"Dataset '{path.name}': {len(train_ids)} train / {len(val_ids)} valid simulations, "
-        f"window_size={window_size}, stride={common['step']}, t in [{min_id}, {max_id if max_id is not None else 'end'}]"
-    )
-    return train_loader, val_loader, window_size
+    return build_dataloaders(ds_cfg, phase_cfg, input_steps)
 
 
 # ---------------------------------------------------------------------------
@@ -881,7 +822,7 @@ def run_training(
     print(f"Model: {type(model).__name__} ({n_params / 1e6:.2f} M params), run name '{model_name}', phase '{phase_name}'")
 
     # ------------------------------------------------------------------ data
-    train_loader, val_loader, window_size = build_pdebench_dataloaders(ds_cfg, phase_cfg, input_steps)
+    train_loader, val_loader, window_size = build_dataloaders(ds_cfg, phase_cfg, input_steps)
     max_epochs = int(phase_cfg["max_epochs"])
     total_steps = max_epochs * len(train_loader)
     steps_per_epoch = len(train_loader)
@@ -928,7 +869,10 @@ def run_training(
         "input_steps": input_steps,
         "window_size": window_size,
         "dataset": {
+            "type": str(ds_cfg.get("type", "")).lower(),
             "path": str(ds_cfg["path"]),
+            # Separate validation file (ayz2/TheWell split-per-file layouts); None = same file.
+            "val_path": str(ds_cfg["val_path"]) if ds_cfg.get("val_path") else None,
             "delta_ts": phase_cfg.get("delta_ts"),
             "min_id": phase_cfg.get("min_id", 0),
             "max_id": phase_cfg.get("max_id"),
@@ -1036,7 +980,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         prog="pynop.train",
         description=(
             "Train a PyNOP multi-step prediction model from JSON configs "
-            "(PDEBench dataset, two-phase protocol of the training notebooks)."
+            "(dataset types: pdebench/custom/ayz2/thewell/npy; two-phase protocol of the training notebooks)."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )

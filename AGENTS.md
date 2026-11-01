@@ -34,8 +34,9 @@ itérative, sur la branche `dev`.
 | **Resnet** (classique) | `pynop/models/resnet.py` | ✅ Unifiée : `block_type="basic"`/`"bottleneck"` + `bottleneck_ratio` + `se` ; `Resnetb` supprimé ; `resnet18`/`34`/`50`/`resnext50` fonctionnent (§11) |
 | **Blocs communs** | `pynop/core/blocks.py`, `pynop/core/ops.py` | Blocs Swin déplacés ici ; **`TransformerBlock` unifié** avec option RoPE (`AdaptiveRoPE2D`) (§9, §10) |
 | **Blocs IT** | `pynop/core/blocks.py` | ✅ `SepLITBlock`/`SepNLITBlock`/`LITBlock` vérifiés — 3 bugs corrigés (§12) ; **`IAETBlock`** (style IAE-Net) vérifié contre l'implémentation officielle — 4 bugs corrigés (§16) |
+| **Dataloaders unifiés** | `pynop/dataloader/dataloader.py` | ✅ Réécrit : classe de base `TemporalWindowDataset` (fenêtres, normalisation, RAM/disk, contrat batch `(fields, t0[, cond])`) + 5 sous-classes par format — `PDEBenchDataSet`, `CustomDataset` (data+porosity, split natif par attribut), `Ayz2Dataset` (ex-NSH5 : fichiers séparés train/val, coefficients scalaires **et** champ spatial `a` → cond toujours renvoyé si présent), `TheWellDataSet` (+indexes/+shift/scale), `npyPDEDataset` ; protocole de split unifié `resolve_split_ids` (IDs explicites → splits natifs avec `n_train_samples`/`n_val_samples` → protocole PDEBench bit-identique) + `build_dataloaders` partagé train/eval (§23) |
 | **Training (Lightning)** | `pynop/training/lightning_model.py` | ✅ Réécrit : `predict_derivative` (sortie dérivée **ou** absolue), derivative-loss configurable, base unique `MultiStepLightningBase`, compat. tous les modèles du dépôt, `DeepONetModel` dédié ; wrappers AE/`CausalNO` supprimés (§15) |
-| **Driver CLI d'entraînement** | `pynop/training/train.py`, `configs/` | ✅ Réécrit : driver config-driven (`ModelConfig.json` + `TrainingConfig.json`, flag `--pretrain`) reproduisant le protocole 2 phases des notebooks PDEBench ; dataset PDEBench seul pour l'instant ; checkpoints `last` (chaque époque) / best (dès max pas AR atteint) ; `--resume`/`--init-from` (§18). **Configs complètes** : un `model_<name>.json` par modèle des notebooks (10 fichiers) + 1 `training_PDEBench.json` partagé, tous validés build+forward+backward (§20) |
+| **Driver CLI d'entraînement** | `pynop/training/train.py`, `configs/` | ✅ Réécrit : driver config-driven (`ModelConfig.json` + `TrainingConfig.json`, flag `--pretrain`) reproduisant le protocole 2 phases des notebooks PDEBench ; **tous les types de dataset** via `build_dataloaders` (pdebench/custom/ayz2/thewell/npy) (§18, §23) ; checkpoints `last` (chaque époque) / best (dès max pas AR atteint) ; `--resume`/`--init-from`. **Configs complètes** : un `model_<name>.json` par modèle des notebooks (10 fichiers) + 1 `training_PDEBench.json` partagé, tous validés build+forward+backward (§20) |
 | **Eval CLI + métriques** | `pynop/training/eval.py`, `pynop/training/metrics.py` | ✅ Nouveau : évaluation d'un checkpoint par **rollout autorégressif de la trajectoire complète** (protocole notebooks PDEBench) sur des simulations **non utilisées en entraînement** (split val par défaut, ou split test = pool inutilisé) ; métriques de champ MSE/RMSE/**nRMSE = relative L2**/MAE/max-err/**R²** + bandes spectrales radiales style PDEBench (unités d'index bin FFT), **courbes d'erreur par pas de temps** (RMSE/MAE/R²/nRMSE + spectre) et graphiques PNG en anglais ; `eval_results_<split>.json` auto-contenu (§19) |
 | **Aim (logging)** | `pynop/training/aim_logger.py`, `pynop/training/import_logs.py` | ✅ Nouveau : `AimCallback` (métriques live → run Aim, mêmes noms/axes que le CSV) + CLI d'**import des logs CSV/TB existants** dans le même experiment pour comparer modèles anciens/nouveaux dans l'UI (`aim up --repo ~/.aim`) ; home par défaut `~/.aim` (le défaut CWD d'aim 3.x polluerait le repo git) ; **configs complètes stockées en params imbriqués** `model_config`/`training_config` (live + import, mêmes clés) (§21) |
 
@@ -143,6 +144,36 @@ itérative, sur la branche `dev`.
 - `predict_derivative=True` : sortie = dérivée → `preds = u_t + dt·out` ; `False` : sortie absolue.
 - DeepONet exige **`DeepONetModel`** (paradigme branch/trunk) — `MultiStepNOModel` le refuse
   explicitement avec un message pointant vers la bonne classe.
+
+### Dataloaders unifiés (`pynop/dataloader/dataloader.py`, §23)
+- **Base `TemporalWindowDataset`** : génération de fenêtres (boucle **bit-identique** à l'ancienne
+  PDEBench → reproductibilité des runs existants), normalisation `(x+shift)*scale` (scalaire ou
+  par-canal), modes RAM/disk, contrat batch `(fields [T,C,H,W], t0)` ou `(+ cond [D,H,W])`.
+  Hooks par sous-classe : `_discover_sample_ids`, `_sample_lengths`, `_read_range(sid,t0,t1)`,
+  `_load_to_ram`, `_extra_output` ; méthodes publiques `load_trajectory` / `load_conditioning`
+  (utilisées par eval.py — **une seule voie de lecture** pour tous les formats).
+- **Formats** : `"pdebench"` (`PDEBenchDataSet`), `"custom"` (`CustomDataset` : data+porosity concat
+  canaux, split natif via attribut HDF5 `split` par échantillon — fichier réel : 400 train/50 val),
+  `"ayz2"` (`Ayz2Dataset`, ex-NSH5 **renommé sans alias**), `"thewell"` (`TheWellDataSet`), `"npy"`
+  (legacy RAM-only). Registry `DATASET_REGISTRY` + `get_dataset_class`.
+- **ayz2** : un fichier par split en pratique (`NS_1024.h5`=train, `NS_256.h5`=valid) → config
+  `path` + `val_path`. IDs = indices entiers dans le groupe. Conditionnement **toujours renvoyé si
+  présent** (choix utilisateur) : champ spatial `a` `(N,H,W)` (fichiers NS) et/ou coefficients
+  scalaires `(N,)` auto-détectés (Burgers : ax/ay/cx/cy/nu), broadcast en champs constants →
+  triplet batch ; modèle doit accepter `cond=` (FNO avec `cond_dim=D`). PDEs 1D (`u` 3D) → embed
+  `(T,1,1,X)`.
+- **Protocole de split unifié** `resolve_split_ids(ds_cfg, phase_cfg)` : (1) `train_ids`/`val_ids`
+  explicites ; (2) splits natifs — fichiers séparés (`path`/`val_path`), groupes HDF5 ou attribut
+  `split` — pools tronquées par `n_train_samples`/`n_val_samples` puis `n_samples` de la phase sur le
+  pool train (ordre fichier stable → nesting 2 phases préservé) ; (3) sinon protocole PDEBench
+  (shuffle seedé + `n_samples` + `split_ratio`) **bit-identique** à l'ancien driver. Retour :
+  `train/val {path, group, ids}` + `train_pool_order` (ordre du pool complet — shuffle pour le cas
+  protocole) + `source`.
+- **TheWell** : splits = fichiers séparés (`data/train|valid|test`) ; le test set reste structuré
+  disjoint via `"test_path"` dans la config dataset (utilisé par eval `--split test`).
+- **run_info.json** : clés plates `train_ids`/`val_ids` conservées + `dataset.type` et
+  `dataset.val_path` ajoutés. IDs de fichiers différents = namespaces distincts (pas de comparaison
+  d'overlap entre fichiers — ex. ayz2 train `0..7` vs val `0..255`).
 
 ### Driver CLI d'entraînement (`pynop/training/train.py`, §18)
 - Usage : `python -m pynop.training.train MODEL_CONFIG.json TRAINING_CONFIG.json [--pretrain]` —

@@ -16,7 +16,8 @@ pynop/
 ├── core/          # shared building blocks (attention, spectral convs, norms, losses, ...)
 ├── models/        # one file per model family (see below)
 ├── training/      # Lightning wrappers + CLI drivers (train.py, eval.py, metrics.py)
-└── dataloader/    # HDF5 datasets: PDEBenchDataSet, NSH5Dataset, RDDataSet, TheWellDataSet, ...
+└── dataloader/    # unified time-windowed loaders (TemporalWindowDataset base):
+                   #   PDEBenchDataSet, CustomDataset, Ayz2Dataset, TheWellDataSet, npyPDEDataset
 configs/           # ready-to-run JSON configs (one per model + one shared training config)
 tests/             # pytest suite
 ```
@@ -56,8 +57,11 @@ python -m pynop.training.train configs/model_FNOvanilla.json configs/training_PD
   String activation names (e.g. `"GELU"`) are resolved automatically; tuples may be written as lists.
   One ready-made file exists per model of the notebooks (FNOvanilla, tuckerFNO, ITLNO, LNO,
   LatentGalerkin, SwinNO, MSSwinNO_1stage, MSSwinNO, Transolver_linear, Transolver3).
-* **Training config** (`configs/training_PDEBench.json`): dataset (PDEBench HDF5 path, batch size,
-  normalization `shift`/`scale`, seeded train/val split), shared multi-step parameters
+* **Training config** (`configs/training_PDEBench.json`): dataset section with a `"type"` key —
+  `"pdebench"`, `"custom"`, `"ayz2"`, `"thewell"` or `"npy"` (see `pynop/dataloader/`) — plus path,
+  batch size, normalization `shift`/`scale` and the split protocol: explicit `train_ids`/`val_ids`,
+  native splits (`path` + optional `val_path`, HDF5 groups or per-sample `split` attributes, capped by
+  `n_train_samples`/`n_val_samples`) or the seeded shuffle+ratio PDEBench protocol; shared multi-step parameters
   (`timestep`, `predict_derivative`, derivative regularizer weight, temporal weighting, BPTT
   truncation, input noise), ordered loss list with weights (e.g. DWMSE + spectral + Sobolev),
   optimizer/scheduler (OneCycleLR with `$total_steps` / `$steps_per_epoch` tokens), trainer

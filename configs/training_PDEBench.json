@@ -3,7 +3,7 @@
     "dataset": {
         "type": "pdebench",
         "path": "/run/media/jlux/SSD2/datasets/pdebench/2d_reaction_diffusion/133017.hdf5",
-        "batch_size": 5,
+        "batch_size": 4,
         "num_workers": 10,
         "load_in_ram": true,
         "shift": 0.0,
@@ -73,7 +73,7 @@
     ],
     "aim": {
         "experiment": "PDEBENCH",
-        "home": "/run/media/jlux/SSD2/PDETraining"
+        "home": "/run/media/jlux/SSD2/PDETraining/PDEBENCH"
     },
     "pretraining": {
         "delta_ts": 2,

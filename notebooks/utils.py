@@ -4,6 +4,45 @@ import numpy as np
 import matplotlib.pyplot as plt
 import h5py
 from matplotlib.animation import FuncAnimation
+import h5py
+from typing import Union
+
+
+def inspect_hdf5(file_or_path: Union[str, h5py.File]) -> None:
+    """Recursively explores an HDF5 file and prints its structure, keys, shapes, and attributes.
+
+    Parameters
+    ----------
+    file_or_path : Union[str, h5py.File]
+        The path to the HDF5 file or an already opened h5py.File object.
+    """
+
+    def _visitor(name: str, node: Union[h5py.Group, h5py.Dataset]) -> None:
+        # Calculate indentation based on hierarchy depth
+        indent = "  " * name.count("/")
+        base_name = name.split("/")[-1]
+
+        if isinstance(node, h5py.Dataset):
+            print(f"{indent}📄 Dataset: {base_name} | Shape: {node.shape} | Type: {node.dtype}")
+        elif isinstance(node, h5py.Group):
+            print(f"{indent}📁 Group: {base_name}")
+
+        # Print attributes if they exist for the current node
+        if node.attrs:
+            for attr_name, attr_val in node.attrs.items():
+                print(f"{indent}   ↳ 🏷️ Attr: {attr_name} = {attr_val}")
+
+    if isinstance(file_or_path, str):
+        with h5py.File(file_or_path, "r") as f:
+            print(f"Inspecting HDF5 file: {file_or_path}\n")
+            f.visititems(_visitor)
+    else:
+        print(f"Inspecting opened HDF5 file object\n")
+        file_or_path.visititems(_visitor)
+
+
+# Example usage:
+# inspect_hdf5("path/to/your/file.h5")
 
 
 def get_simulation_by_id(h5_path, sim_id, add_fields=None):
