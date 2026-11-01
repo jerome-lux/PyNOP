@@ -1128,3 +1128,23 @@ logger Lightning) ; section optionnelle `"aim": {"experiment", "home"}` (défaut
 - Import des **runs réels** SwinNO + MSSwinNO (300 époques chacun) : 33 084 points/run, valeurs
   RMSE_epoch / val_RMSE_step / lr-AdamW identiques au CSV source (premier+dernier point), params cohérents
   (SwinNO 1.19 M / MSSwinNO 3.55 M). Sidecars de vérification supprimés des run dirs réels.
+
+**Ajout (oct. 2026) — configs complètes en paramètres imbriqués** : demande utilisateur — les params du
+modèle n'étaient pas tous visibles dans l'UI Aim (le callback live ne stockait que 8 clés plates ;
+`import_logs` stockait en plus `model_params`, d'où une incohérence live/import). Désormais, **live et
+import stockent les mêmes clés** :
+
+- `build_aim_callback` reçoit `model_cfg` + `training_cfg` (dicts JSON bruts) et les stocke **verbatim**
+  sous `model_config` / `training_config`, en plus des clés plates de confort (`lr`, `seed`, ...).
+- `_load_params` (import) : idem — lit `model_config.json` + `training_config.json` du run dir ; la clé
+  partielle `model_params` est **supprimée** (sous-ensemble strict de `model_config.params`). Run dirs sans
+  ces fichiers (anciens) → simplement pas de clé correspondante.
+
+Comportement Aim vérifié (v3.29.1, source + empirique) : `run["key"] = dict` stocke un **arbre** —
+l'onglet "Parameters" du détail d'un run le rend en **arborescence dépliable** (`DictVisualizer`), et les
+requêtes de recherche adressent les feuilles par chemin (`run.model_config.params.modes == 8`, via
+`RunView.__getattr__` → `AimObjectProxy`). Lecture SDK : `run.get("model_config")` (dict entier) ou
+`run.get(("model_config", "params"))` (chemin tuple — la clé pointée `"a.b"` ne marche **pas**).
+
+Vérifié : suite complète **298 passed** ; smoke end-to-end TinyFNO 2 époques `["csv","aim"]` → les deux
+configs lues back du repo Aim, identiques aux fichiers JSON source.
