@@ -33,10 +33,14 @@ dependencies = [
     "tqdm>=4.65",           # pynop/dataloader/h5_dataloader.py
 ]
 
-# CLI entry points (equivalent to `python -m pynop.training.train|eval`).
+# Optional dependencies (not required for training / CLI evaluation).
+[project.optional-dependencies]
+viz = ["plotly>=5.0"]  # pynop/eval/visualisation.py: interactive figures
+
+# CLI entry points (equivalent to `python -m pynop.training.train` / `pynop.eval.eval`).
 [project.scripts]
 pynop-train = "pynop.training.train:main"
-pynop-eval = "pynop.training.eval:main"
+pynop-eval = "pynop.eval.eval:main"
 
 # Explicit package discovery: only the `pynop` tree (the repo root also holds
 # tests/, notebooks/, configs/, docs/ which must not be packaged).

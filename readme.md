@@ -83,7 +83,7 @@ curriculum ramp). `--resume` and `--init-from` allow continuing or warm-starting
 ## Evaluation
 
 ```bash
-python -m pynop.training.eval configs/model_FNOvanilla.json configs/training_PDEBench.json \
+python -m pynop.eval.eval configs/model_FNOvanilla.json configs/training_PDEBench.json \
     --checkpoint /path/to/run/last.ckpt [--split val|test] [--pretrain] [--no-plots]
 ```
 
@@ -94,8 +94,11 @@ teacher-forced on the ground-truth window, the rest consume the previous predict
 
 * **Evaluation sets**: `--split val` (default) uses the validation split of the training
   protocol (IDs read from `run_info.json` next to the checkpoint when available);
-  `--split test` draws simulations that were never used in any training phase, falling back
-  to val with a warning if none remain. Overlap with training raises an error.
+  `--split test` first honors an explicit `"test_path"` in the dataset config (e.g. TheWell's
+  separate `data/test/` file, kept structurally disjoint from train and val), otherwise draws
+  simulations that were never used in any training phase, falling back to val with a warning if
+  none remain. Overlap with training raises an error. Works for every dataset type; models
+  trained with a `cond=` input receive their conditioning field during the rollout as well.
 * **Metrics** (`pynop/training/metrics.py`): field-level MSE / RMSE / MAE / max error,
   **nRMSE = relative L2** (scale-invariant PDEBench "normalized RMSE") and R² (invariant to
   any affine rescaling; `R² = 1 − nRMSE²` per sample on zero-mean data), plus PDEBench-style
@@ -104,3 +107,17 @@ teacher-forced on the ground-truth window, the rest consume the previous predict
 * **Outputs**: a formatted table on stdout, a self-contained `eval_results_<split>.json`
   (all scalars + full per-step error curves with timestamps), and two English-labelled PNGs —
   error evolution vs time step (`RMSE / nRMSE / MAE / R²`) and spectral-band evolution.
+
+### Interactive visualisation
+
+`pynop/eval/visualisation.py::plot_interactive(pred, gt, ...)` renders an **animated plotly figure**
+(one frame per predicted step) with three panels — *Ground Truth*, *Prediction* and *Abs Error* —
+plus the per-step RMSE / MAE / nRMSE in the title. The data (GT/Pred) and error color scales are
+independent: each is `"fixed"` (default, one range over all displayed steps so changes are
+comparable in time) or `"adaptive"` (each frame auto-scales), with optional explicit `vmin`/`vmax`.
+Plotly is an optional dependency (`pip install pynop[viz]`).
+
+`notebooks/interactive_error_viz.ipynb` demonstrates the full workflow on a trained run: it loads
+the model from a run directory (configs + checkpoint), rolls out the validation trajectories with
+the same protocol as `pynop-eval`, and provides an interactive explorer (simulation / channel /
+scale-mode dropdowns) over the per-step error curves and the animated figure.

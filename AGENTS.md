@@ -37,7 +37,8 @@ itérative, sur la branche `dev`.
 | **Dataloaders unifiés** | `pynop/dataloader/dataloader.py` | ✅ Réécrit : classe de base `TemporalWindowDataset` (fenêtres, normalisation, RAM/disk, contrat batch `(fields, t0[, cond])`) + 5 sous-classes par format — `PDEBenchDataSet`, `CustomDataset` (data+porosity, split natif par attribut), `Ayz2Dataset` (ex-NSH5 : fichiers séparés train/val, coefficients scalaires **et** champ spatial `a` → cond toujours renvoyé si présent), `TheWellDataSet` (+indexes/+shift/scale), `npyPDEDataset` ; protocole de split unifié `resolve_split_ids` (IDs explicites → splits natifs avec `n_train_samples`/`n_val_samples` → protocole PDEBench bit-identique) + `build_dataloaders` partagé train/eval (§23) |
 | **Training (Lightning)** | `pynop/training/lightning_model.py` | ✅ Réécrit : `predict_derivative` (sortie dérivée **ou** absolue), derivative-loss configurable, base unique `MultiStepLightningBase`, compat. tous les modèles du dépôt, `DeepONetModel` dédié ; wrappers AE/`CausalNO` supprimés (§15) |
 | **Driver CLI d'entraînement** | `pynop/training/train.py`, `configs/` | ✅ Réécrit : driver config-driven (`ModelConfig.json` + `TrainingConfig.json`, flag `--pretrain`) reproduisant le protocole 2 phases des notebooks PDEBench ; **tous les types de dataset** via `build_dataloaders` (pdebench/custom/ayz2/thewell/npy) (§18, §23) ; checkpoints `last` (chaque époque) / best (dès max pas AR atteint) ; `--resume`/`--init-from`. **Configs complètes** : un `model_<name>.json` par modèle des notebooks (10 fichiers) + 1 `training_PDEBench.json` partagé, tous validés build+forward+backward (§20) |
-| **Eval CLI + métriques** | `pynop/training/eval.py`, `pynop/training/metrics.py` | ✅ Nouveau : évaluation d'un checkpoint par **rollout autorégressif de la trajectoire complète** (protocole notebooks PDEBench) sur des simulations **non utilisées en entraînement** (split val par défaut, ou split test = pool inutilisé) ; métriques de champ MSE/RMSE/**nRMSE = relative L2**/MAE/max-err/**R²** + bandes spectrales radiales style PDEBench (unités d'index bin FFT), **courbes d'erreur par pas de temps** (RMSE/MAE/R²/nRMSE + spectre) et graphiques PNG en anglais ; `eval_results_<split>.json` auto-contenu (§19) |
+| **Eval CLI + métriques** | `pynop/eval/eval.py`, `pynop/training/metrics.py` | ✅ Nouveau : évaluation d'un checkpoint par **rollout autorégressif de la trajectoire complète** (protocole notebooks PDEBench) sur des simulations **non utilisées en entraînement** ; **tous les types de dataset** — split val, ou test = `test_path` explicite (ex. TheWell `data/test/`, disjoint par construction) sinon pool inutilisé ; lecture des trajectoires via la classe du format (+ cond renvoyé aux modèles `cond=`) (§19, §23) ; métriques de champ MSE/RMSE/**nRMSE = relative L2**/MAE/max-err/**R²** + bandes spectrales radiales style PDEBench (unités d'index bin FFT), **courbes d'erreur par pas de temps** et graphiques PNG en anglais ; `eval_results_<split>.json` auto-contenu. **Déplacé dans le package `pynop/eval`** (§24) — shim déprécié à l'ancienne location |
+| **Visualisation interactive** | `pynop/eval/visualisation.py`, `notebooks/interactive_error_viz.ipynb` | ✅ Nouveau : figure plotly animée GT/Pred/Abs Error (play + scrub), **échelles de couleur indépendantes data/erreur**, chacune `"fixed"` (défaut = min/max sur tous les pas) ou `"adaptive"`, vmin/vmax explicites ; courbes RMSE/MAE/nRMSE par pas ; notebook explorateur (dropdowns sim/canal/échelles, rollouts mis en cache) — testé SwinNOx4 + PDEBench 2d_reaction_diffusion (§24) |
 | **Aim (logging)** | `pynop/training/aim_logger.py`, `pynop/training/import_logs.py` | ✅ Nouveau : `AimCallback` (métriques live → run Aim, mêmes noms/axes que le CSV) + CLI d'**import des logs CSV/TB existants** dans le même experiment pour comparer modèles anciens/nouveaux dans l'UI (`aim up --repo ~/.aim`) ; home par défaut `~/.aim` (le défaut CWD d'aim 3.x polluerait le repo git) ; **configs complètes stockées en params imbriqués** `model_config`/`training_config` (live + import, mêmes clés) (§21) |
 
 ---
@@ -188,14 +189,27 @@ itérative, sur la branche `dev`.
   `save_on_train_epoch_end=False`. Ne pas régresser vers un override de hook unique.
 - Scheduler : tokens `"$total_steps"`/`"$steps_per_epoch"` ; OneCycleLR sans `max_lr` → lr de la
   phase. ⚠️ Resume OneCycleLR = **même total de pas** (on ne change pas `max_epochs` après coup).
- - Split train/val sur les IDs de simulation (shuffle seedé + troncature `n_samples`) : identique aux
-   notebooks → phases cohérentes entre elles.
- - **Loggers** : `"loggers": ["csv", "aim"]` dans la config partagée PDEBench (TensorBoard remplacé par
-   Aim, §21). L'entrée `aim` installe un *callback* (pas un logger Lightning) ; section optionnelle
-   `"aim": {"experiment", "home"}`. Les runs importés (`import_logs`) et les runs live partagent la même
-   convention d'axes x — ne pas la changer sans resynchroniser les deux.
+  - Split train/val via le protocole unifié du dataloader (§23) : pour PDEBench = shuffle seedé +
+    troncature `n_samples` (identique aux notebooks → phases cohérentes) ; splits natifs ou IDs
+    explicites pour les autres formats.
+  - **Loggers** : `"loggers": ["csv", "aim"]` dans la config partagée PDEBench (TensorBoard remplacé par
+    Aim, §21). L'entrée `aim` installe un *callback* (pas un logger Lightning) ; section optionnelle
+    `"aim": {"experiment", "home"}`. Les runs importés (`import_logs`) et les runs live partagent la même
+    convention d'axes x — ne pas la changer sans resynchroniser les deux.
+  - **Aim : `experiment` ≠ dossier** (§21) : tout est stocké dans `<home>/.aim` (dossier *caché* —
+    invisible au `ls` simple), un seul stockage pour tous les experiments ; `experiment` n'est qu'un
+    label de regroupement dans l'UI (`aim up --repo <home>`). Il n'existe pas de `<home>/<experiment>/`.
+    `"aim": {"home"}` absent/null → repli sur `~/.aim` (les runs y restent, les repos Aim ne se fusionnent
+    pas — re-importer via `import_logs` si besoin).
+  - **Aim : configs complètes en params imbriqués** (§21) : live (`build_aim_callback`) et import
+    (`_load_params`) stockent les dicts JSON bruts verbatim sous `model_config` / `training_config`, en
+    plus des clés plates de confort (`lr`, `seed`, ...) — mêmes clés des deux côtés, runs comparables.
+    Aim stocke un dict comme **arbre** : arborescence dépliable dans l'onglet "Parameters" du détail run ;
+    recherche par chemin feuille à feuille (`run.model_config.params.modes == 8`). Lecture SDK :
+    `run.get("model_config")` ou chemin tuple `run.get(("model_config", "params"))` — la clé pointée
+    `"a.b"` ne marche pas. L'ancienne clé partielle `model_params` (import) est supprimée.
 
-### Évaluation (`pynop/training/eval.py`, `metrics.py`) (§19)
+### Évaluation (`pynop/eval/eval.py`, `pynop/training/metrics.py`) (§19, §24)
 - **Protocole = rollout autorégressif de la trajectoire complète** (cellules `## Multi-step model eval`
   des notebooks PDEBench) : pour chaque simulation, les `input_steps` premiers snapshots en entrée, puis
   prédiction de **tous** les pas suivants jusqu'à la fin (`S = T_avail − input_steps` prédictions ; la
@@ -211,17 +225,32 @@ itérative, sur la branche `dev`.
   iLow=4/iHigh=12), dépendantes de la résolution comme chez PDEBench ; relatives par défaut
   (invariantes d'échelle), mode absolu via `"eval": {"spectral_relative": false}`.
 - Jeu d'évaluation : split **val** par défaut — IDs pris dans le `run_info.json` à côté du checkpoint
-  s'il existe, sinon re-déduits de la config ; `--split test` = pool inutilisé (au-delà de
+  s'il existe, sinon re-déduits de la config ; `--split test` = `test_path` explicite si présent
+  (ex. TheWell `data/test/`, disjoint par construction), sinon pool inutilisé (au-delà de
   `n_samples`, même shuffle seedé que l'entraînement) avec repli sur val si vide ; chevauchement
-  eval/train → `RuntimeError`.
+  eval/train → `RuntimeError`. Sélection d'IDs via le protocole unifié du dataloader (§23) — tous les
+  formats supportés ; trajectoires lues via la classe du format (`load_trajectory`), et le **cond** est
+  renvoyé au rollout pour les modèles `cond=` (sinon métriques silencieusement fausses).
 - **Mémoire constante** : chaque prédiction est consommée via le callback `_rollout(on_step=...)` +
   `FieldMetricAccumulator.update_per_step(p, t, step)` (index explicite — appeler `update([p],[t])` par
   pas écraserait tout au pas 0). Batchs groupés par longueur égale (`_group_by_length`) ;
   `_rollout.num_predictions` est **par trajectoire** (× B pour le total). L'optimizer du wrapper
   Lightning est optionnel (inférence).
-- **Sortie** : table stdout + `eval_results_<split>.json` (courbes complètes par pas avec `time`) +
-  graphiques PNG en anglais (`eval_error_evolution_*.png` : RMSE/nRMSE/MAE log + R² ;
-  `eval_spectral_evolution_*.png` : bandes radiales) via matplotlib Agg, désactivables par `--no-plots`.
+ - **Sortie** : table stdout + `eval_results_<split>.json` (courbes complètes par pas avec `time`) +
+   graphiques PNG en anglais (`eval_error_evolution_*.png` : RMSE/nRMSE/MAE log + R² ;
+   `eval_spectral_evolution_*.png` : bandes radiales) via matplotlib Agg, désactivables par `--no-plots`.
+ - **Package `pynop/eval`** (§24) : le driver a été déplacé dans `pynop/eval/eval.py` (usage
+   `python -m pynop.eval.eval ...`, entry point `pynop-eval`) ; un shim déprécié re-exporte l'API à
+   l'ancienne location (`pynop/training/eval.py`). Le même package contient `visualisation.py` :
+   `plot_interactive(pred, gt, channel_idx, data_scale, error_scale, *_vmin/vmax, step_labels)` —
+   figure animée 3 panneaux (GT/Pred sur l'échelle **data**, Abs Error sur l'échelle **error**),
+   chaque échelle `"fixed"` (défaut : min/max de la quantité affichée sur tous les pas) ou
+   `"adaptive"` (auto par frame), bornes explicites en override ; `compute_step_errors` renvoie
+   RMSE/MAE/nRMSE (relative L2, même définition que §19) + champ d'erreur. Plotly = dépendance
+   **optionnelle** (`pip install pynop[viz]`), importée paresseusement. ⚠️ Pitfalls plotly 7.x :
+   `Figure.add_frame(s)` supprimé (assignation `fig.frames = [...]`), frames non auto-nommées
+   (`name=str(i)` explicite), bouton play via `method="animate"` (pas `"extend"`) ; et les bounds
+   zmin/zmax doivent être répétés **sur chaque frame** (un frame affiché remplace la trace de base).
 
 ---
 

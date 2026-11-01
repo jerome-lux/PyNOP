@@ -1,4 +1,4 @@
-"""Tests for the evaluation driver :mod:`pynop.training.eval` and its metrics.
+"""Tests for the evaluation driver :mod:`pynop.eval.eval` and its metrics.
 
 Covers:
 
@@ -7,13 +7,13 @@ Covers:
 * :class:`~pynop.training.metrics.FieldMetricAccumulator` — one-shot vs
   incremental equivalence, per-step curve (RMSE/MAE/R²/nRMSE + optional
   per-band spectral), window bookkeeping;
-* :func:`pynop.training.eval.select_eval_ids` — val/test split selection from
+* :func:`pynop.eval.eval.select_eval_ids` — val/test split selection from
   the training config or a stored ``run_info.json``, test -> val fallback and
   overlap protection;
-* full-trajectory loading (:func:`scan_trajectories`, ``_load_trajectory``,
-  ``_group_by_length``) — time-range cropping, normalization, batching by equal
-  trajectory length;
-* :func:`pynop.training.eval.plot_error_evolution` — figure generation from a
+* full-trajectory loading (dataset-class reader via :func:`_make_reader`,
+  :func:`scan_trajectories`, ``load_trajectory``, ``_group_by_length``) —
+  time-range cropping, normalization, batching by equal trajectory length;
+* :func:`pynop.eval.eval.plot_error_evolution` — figure generation from a
   synthetic results dict (skipped when matplotlib is unavailable);
 * a tiny end-to-end CPU run: one pretraining epoch (shared fixture) followed by
   full-trajectory evaluation on the validation split, on an unused-simulations
@@ -29,9 +29,9 @@ import numpy as np
 import pytest
 import torch
 
-from pynop.training.eval import (
+from pynop.eval.eval import (
     _group_by_length,
-    _load_trajectory,
+    _make_reader,
     format_results_table,
     main,
     parse_args,
@@ -400,6 +400,29 @@ def test_select_eval_ids_test_fallback_to_val(pdebench_h5):
     assert info["eval_ids"] == info["val_ids"]
 
 
+def test_select_eval_ids_explicit_test_path(pdebench_h5, tmp_path):
+    """An explicit 'test_path' (e.g. TheWell data/test/) is used verbatim and stays
+    disjoint from train/val by construction."""
+    # A separate "test" file with its own ID namespace (int-like keys, like a
+    # different split directory would provide).
+    test_file = tmp_path / "test.hdf5"
+    rng = np.random.default_rng(9)
+    with h5py.File(str(test_file), "w") as f:
+        for sid in range(3):
+            grp = f.create_group(f"t{sid}")
+            grp.create_dataset("data", data=rng.standard_normal((T_STEPS, H, W, C)).astype(np.float32))
+
+    ds_cfg = _ds_cfg(pdebench_h5)
+    ds_cfg["test_path"] = str(test_file)
+    phase = {"n_samples": N_SAMPLES, "max_AR_steps": 2}
+    info = select_eval_ids(ds_cfg, phase, split="test", n_test=2)
+
+    assert info["effective_split"] == "test"
+    assert info["eval_ids"] == ["t0", "t1"]  # first n_test IDs of the test file
+    assert Path(info["load_path"]) == test_file  # trajectories are read from the test file
+    # No overlap check against train/val: different files are distinct namespaces.
+
+
 def test_select_eval_ids_run_info_ground_truth(pdebench_h5):
     """Stored train/val IDs from run_info.json take precedence over the config."""
     ds_cfg = _ds_cfg(pdebench_h5)
@@ -426,22 +449,27 @@ def test_select_eval_ids_unknown_split_raises(pdebench_h5):
 # ---------------------------------------------------------------------------
 
 
+def _pdebench_reader(pdebench_h5, ids=("0", "1"), min_id=0, max_id=None):
+    """A disk-mode PDEBench reader over the given IDs (the eval code path)."""
+    return _make_reader("pdebench", pdebench_h5, None, list(ids), {"type": "pdebench"}, min_id=min_id, max_id=max_id)
+
+
 def test_scan_trajectories_lengths_and_cropping(pdebench_h5):
-    lengths = scan_trajectories(str(pdebench_h5), ["0", "1"], min_id=0, max_id=None)
+    lengths = scan_trajectories(_pdebench_reader(pdebench_h5, ["0", "1"]), ["0", "1"], min_id=0, max_id=None)
     assert lengths == {"0": T_STEPS, "1": T_STEPS}
 
     # Cropping the time range shortens the available trajectories.
-    cropped = scan_trajectories(str(pdebench_h5), ["0"], min_id=5, max_id=20)
+    cropped = scan_trajectories(_pdebench_reader(pdebench_h5, ["0"], min_id=5, max_id=20), ["0"], min_id=5, max_id=20)
     assert cropped["0"] == 15
 
     with pytest.raises(KeyError):
-        scan_trajectories(str(pdebench_h5), ["999"])
+        scan_trajectories(_pdebench_reader(pdebench_h5, ["999"]), ["999"])
 
 
 def test_load_trajectory_shape_normalization_and_crop(pdebench_h5):
     shift, scale = 3.0, 2.0
-    with h5py.File(str(pdebench_h5), "r") as f:
-        fields = _load_trajectory(f, "0", min_id=4, max_id=None, shift=shift, scale=scale)
+    reader = _make_reader("pdebench", pdebench_h5, None, ["0"], {"type": "pdebench"}, min_id=4, max_id=None, shift=shift, scale=scale)
+    fields = reader.load_trajectory("0", min_id=4, max_id=None)
 
     assert fields.shape == (T_STEPS - 4, C, H, W)
     # The transform is exactly (x + shift) * scale on the cropped frames.
@@ -468,15 +496,15 @@ def test_group_by_length_batches_and_order():
     assert _group_by_length(["a", "b", "c"], lengths, batch_size=1) == [["a"], ["b"], ["c"]]
 
 
-def test_run_evaluation_rejects_other_dataset_types(trained_run):
-    """The driver only supports the PDEBench HDF5 layout."""
+def test_run_evaluation_rejects_unknown_dataset_types(trained_run):
+    """Unknown dataset types are rejected (the four known formats are supported)."""
     cfg = json.loads(trained_run["train_cfg"].read_text())
-    cfg["dataset"]["type"] = "thewell"
+    cfg["dataset"]["type"] = "bogus_format"
     bad_cfg = trained_run["train_cfg"].parent / "training_bad_type.json"
     with open(bad_cfg, "w") as f:
         json.dump(cfg, f)
 
-    with pytest.raises(ValueError, match="only 'pdebench'"):
+    with pytest.raises(ValueError, match="Unsupported dataset type"):
         run_evaluation(
             model_config_path=trained_run["model_cfg"],
             training_config_path=bad_cfg,

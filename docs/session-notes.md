@@ -1280,3 +1280,109 @@ Burgers (qui ont des coefficients scalaires), présent dans les fichiers NS. La 
 shift/scale/random_seed/split_ratio/n_train_samples/n_val_samples/train_ids/val_ids/split/val_split` + extras
 format (`fields_list`, `coefficients`). Ne pas « corriger » une config ayz2 qui pointe vers des fichiers séparés :
 c'est le layout réel du dataset.
+
+### 24. Package `pynop/eval` — déplacement du driver d'évaluation + visualisation interactive (`pynop/eval/`, `notebooks/interactive_error_viz.ipynb`)
+
+**Contexte** : demande utilisateur (nov. 2026) — intégrer `plot_interactive` de
+`notebooks/utils.py` dans le module sous la forme d'un fichier `visualisation.py`, avec échelle des
+erreurs configurable (**fixe par défaut = min/max de l'erreur**, ou **adaptative**) et échelle des data
+indépendante (également fixe/adaptive) ; créer un dossier `eval` contenant à la fois `eval.py` et
+`visualisation.py` ; puis un notebook pour visualiser les erreurs en conservant le côté interactif,
+testé sur le modèle SwinNOx4 (`/run/media/jlux/SSD2/PDETraining/PDEBENCH/pretraining/SwinNOx4`) avec le
+dataset PDEBench `2d_reaction_diffusion` (`133017.hdf5`).
+
+**Package `pynop/eval`** :
+- `pynop/training/eval.py` → **`pynop/eval/eval.py`** (git mv) : imports relatifs mis à jour
+  (`..training.lightning_model/metrics/train`), shim d'exécution directe avec `__package__ = "pynop.eval"`,
+  docstrings/usage mis à jour. Entrées : `python -m pynop.eval.eval ...` et entry point
+  `pynop-eval = "pynop.eval.eval:main"` (pyproject). ⚠️ Le warning runpy « found in sys.modules after import
+  of package » sur `-m pkg.module` est **pré-existant** (le star-import du `__init__` charge le module avant
+  l'exécution) — comportement identique à l'ancienne location, pas une régression.
+- **Shim déprécié** à l'ancienne location (`pynop/training/eval.py`) : re-export de l'API publique + des
+  helpers utilisés par tests/notebooks (`build_eval_module`, `scan_trajectories`, `_make_reader`,
+  `_group_by_length`) ; `python -m pynop.training.eval` et l'exécution directe continuent de fonctionner.
+- `__init__.py` : star-imports driver + visualisation ; `build_eval_module`/`scan_trajectories` ajoutés au
+  `__all__` du driver (API semi-publique utilisée par le notebook).
+
+**`visualisation.py` — `plot_interactive` corrigée et améliorée** :
+- **Échelles de couleur indépendantes par panneau** (défaut de l'original) : la version notebook empilait
+  GT/Pred/erreur dans un seul `px.imshow` → une seule gamme partagée ; comme erreur ≪ data, le panneau
+  d'erreur était quasi uniformément sombre. Maintenant 3 `go.Heatmap` via `make_subplots(1×3)`, chacun avec
+  sa colorbar : Viridis pour GT/Pred (échelle **data** commune), Reds pour l'erreur (échelle **error**).
+- Modes d'échelle par quantité, indépendants : `"fixed"` (défaut — une gamme sur tous les pas ; défaut =
+  min/max de la quantité affichée sur tous les pas) ou `"adaptive"` (auto par frame) ; overrides explicites
+  `data_vmin/data_vmax` et `error_vmin/error_vmax`.
+- **Colorbars sans superposition** (demande utilisateur, 2 itérations) : GT/Pred partagent une **seule**
+  colorbar data (tracé GT `showscale=False`, la colorbar est portée par le panneau Prediction) ; l'erreur
+  garde sa propre. Layout final : *GT | Pred | colorbar data | Error | colorbar error*. ⚠️ **Pitfall plotly.js**
+  (vérifié par rendu kaleido, pas seulement par inspection JSON) : les colorbars de **tous** les tracés des
+  subplots sont placées par défaut au **même** position paper (près du bord droit, x≈0.95-0.97) — elles se
+  superposent entre elles ET recouvrent le dernier panneau ; retirer la colorbar GT ne suffit pas. Solution :
+  domaines de panneaux explicites (`xaxis[23].domain` = [0,.25]/[.29,.54]/[.64,.89] — les colonnes par défaut
+  finissent à x=1.0, sans place pour une colorbar à droite) + positions paper explicites des colorbars
+  (`colorbar=dict(x=0.55/0.90, xanchor="left")` dans leurs zones réservées) + annotations de titres re-centrées
+  sur les nouveaux domaines (make_subplots les centre sur les colonnes par défaut). ⚠️ Le flag `showscale` et
+  la spec complète `colorbar` doivent être répétés **sur chaque frame** comme les bornes (remplacement des
+  traces de base à l'affichage d'un frame).
+- Bugs de l'original corrigés : le titre du layout initial imprimait la MAE du **dernier** pas au pas 0
+  (`current_mae` = variable de boucle) ; facet titles via `make_subplots(subplot_titles=...)` au lieu du
+  patch d'annotations par index (fragile avec wrap) ; la figure est **retournée** sans `.show()` auto
+  (idiome plotly, testable — rendu automatique en notebook).
+- Entrées : torch/np, `(T,C,H,W)` ou `(T,H,W)` ; validation stricte (shapes → `ValueError`, canal →
+  `IndexError`) ; `step_labels` optionnel pour l'heure absolue dans les titres.
+- **Pitfalls plotly 7.x** (env. à 7.1) : `Figure.add_frame(s)` supprimé → assignation
+  `fig.frames = [...]` ; frames non auto-nommées à l'assignation → `name=str(i)` explicite ; bouton play via
+  `method="animate"` (`args=[None, {"frame": {...}, "fromcurrent": True}]`, pause `["stop"]`) — `"extend"`
+  n'est plus une méthode valide.
+- **Slider de scrubbing** (demande utilisateur) : l'original `px.imshow(animation_frame=...)` générait un
+  slider draggable automatiquement ; la construction manuelle des frames ne le fait **pas** → ajouté via
+  `layout.sliders=[dict(steps=[...])]`, un step par frame (`method="animate"`,
+  `args=[[name], {"mode": "immediate", "frame": {"duration": 0, "redraw": True}}]`), label = index ou
+  `step_labels[i]`. Le titre de chaque frame (RMSE/MAE/nRMSE du pas) se met à jour au scrub comme au play.
+- ⚠️ **Critique** : à l'affichage d'un frame, Plotly *remplace* les traces de base par celles du frame — un
+  attribut absent sur le frame retombe sur la valeur par défaut, PAS sur la trace de base → zmin/zmax sont
+  répétés **sur chaque frame** (None = adaptatif).
+- `compute_step_errors(pred, gt, channel_idx)` → RMSE/MAE/**nRMSE (relative L2)** par pas + champ d'erreur
+  (réutilisé par le notebook pour les courbes ; même définition de nRMSE que §19).
+- Plotly = dépendance **optionnelle** (`[project.optional-dependencies] viz = ["plotly>=5.0"]`), importée
+  paresseusement dans les fonctions → `import pynop` fonctionne sans plotly.
+
+**Notebook `notebooks/interactive_error_viz.ipynb`** :
+- Charge le run dir (détection auto du sous-dossier `10steps_*`, lecture de `model_config.json` /
+  `training_config.json` / `run_info.json`) → `build_eval_module` + `_load_weights_only` ; phase prise dans
+  `run_info["phase"]`. Pointable sur n'importe quel run en changeant `RUN_DIR`.
+- Trajectoires = **split val du run** (`run_info["val_ids"]`, disjoint de train par construction), lues via le
+  dataloader unifié (disk mode, crop `[min_id, max_id]` de la phase). ⚠️ `sample_lengths` donne la longueur
+  **totale** — il faut appliquer le crop phase soi-même pour afficher la bonne longueur effective.
+- `rollout(sid)` = protocole eval (§19) : `_rollout(training=False, store_fields=True)`, B=1 ; la k-ième
+  prédiction cible le frame `min_id + input_steps + k`. ⚠️ `store_fields` stocke des listes de `(B,C,H,W)` —
+  après `torch.stack` le batch est en dim **1** (pas 0) : reshape explicite, pas `.squeeze(0)`.
+- Courbes RMSE/MAE/nRMSE par pas et canal (matplotlib log, **titres de sous-plots** RMSE/MAE/nRMSE) +
+  figure interactive (`plot_interactive`) + explorateur ipywidgets (dropdowns simulation/canal/data_scale/
+  error_scale, rollouts mis en cache). L'explorateur n'affiche que la figure interactive à chaque changement
+  (les courbes ne sont pas redessinées « en même temps » — demande utilisateur) ; les courbes restent dans
+  leur cellule dédiée pour la simulation par défaut.
+- **Redessin in-place de l'explorateur** (demande utilisateur : les figures ne devaient plus s'empiler sous
+  les contrôles à chaque changement de simulation) : `clear_output(wait=True)` + re-display des contrôles et
+  de la figure — le widget ipywidgets est un objet en mémoire, il survit au clear et se redessine tel quel.
+  Un `Label` de statut (« Rolling out simulation X ... ») affiche la progression pendant le rollout (display
+  avant le blocage). ⚠️ L'alternative `ipywidgets.Output` n'est **pas** persistée en exécution headless
+  (nbconvert) — le buffer vit côté frontend ; clear_output + display direct est capturé statiquement
+  (état final = contrôles + dernière figure), ce que l'on a vérifié.
+
+**Vérifié** (env. conda `pytorch`, torch 2.14 / plotly 7.1) :
+- `tests/test_visualisation.py` : **23 tests** (structure 3 panneaux + frames, échelles fixed/adaptive par
+  panneau et indépendance data/erreur, bornes explicites, propagation des bounds aux frames, régression du
+  titre pas 0, erreurs de validation, **slider de scrubbing** — un step par frame, labels index ou temps,
+  **colorbar data unique sur Prediction + colorbar erreur dédiée**, flags `showscale` portés sur les frames)
+  — tous OK.
+- `tests/test_eval_cli.py` re-pointé sur `pynop.eval.eval` : **25/25 OK** (le driver déplacé est intact).
+- Notebook exécuté de bout en bout (`jupyter nbconvert --execute`) : SwinNOx4 (SwinNO 2.25 M params,
+  `last.ckpt`) sur PDEBench `133017.hdf5` — phase pretraining t∈[0,50), 4 sims val × 40 prédictions ; RMSE
+  moyen ch0 = 4.9e-4 / ch1 = 1.8e-4 ; figures plotly à 40 frames **avec slider (40 steps)** et colorbars
+  non superposées + courbes sauvegardées dans le notebook (~22 MB) ; cellule explorateur capturée statiquement
+  avec contrôles + **une seule** figure (redessin in-place vérifié).
+- Position des colorbars vérifiée par **rendu kaleido** (`fig.write_image` + détection des pixels marqueurs
+  en haut de palette Viridis/Reds) : colorbar data à x≈0.56 (entre Pred et Error), colorbar erreur à
+  x≈0.90 (à droite du panneau Error, qui finit à 0.89) — aucune superposition. ⚠️ L'inspection JSON seule ne
+  suffit pas : les positions par défaut de plotly.js ne sont résolues que côté JS.
